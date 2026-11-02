@@ -1,6 +1,8 @@
 # Copyright (c) 2023, Tri Dao.
 
 
+import os
+
 import torch
 
 # isort: off
@@ -77,6 +79,9 @@ def _require_fa_version(fa_version: int) -> None:
 def _is_fa2_supported(device=None) -> tuple[bool, str | None]:
     if not FA2_AVAILABLE:
         return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
+    # SAIL capability/is_available probes may enter the driver even when all devices are hidden.
+    if os.environ.get("CUDA_VISIBLE_DEVICES") in ("", "-1"):
+        return False, "CUDA_VISIBLE_DEVICES hides all devices"
     if torch.cuda.get_device_capability(device)[0] < 8:
         return False, "FA2 is only supported on devices with compute capability >= 8"
     return True, None
@@ -85,6 +90,8 @@ def _is_fa2_supported(device=None) -> tuple[bool, str | None]:
 def _is_fa3_supported(device=None) -> tuple[bool, str | None]:
     if not FA3_AVAILABLE:
         return False, f"FA3 is unavaible due to: {FA3_UNAVAILABLE_REASON}"
+    if os.environ.get("CUDA_VISIBLE_DEVICES") in ("", "-1"):
+        return False, "CUDA_VISIBLE_DEVICES hides all devices"
     if (
         torch.cuda.get_device_capability(device)[0] < 8
         or torch.cuda.get_device_capability(device)[0] >= 10

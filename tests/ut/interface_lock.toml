@@ -11,7 +11,7 @@
 schema = 1
 vllm_version_range = ">=0.31.0,<0.32.0"
 key_interface_count = 10
-target_count = 261
+target_count = 283
 
 [[key_interface]]
 symbol = "vllm.platforms.interface.PlatformEnum"
@@ -98,6 +98,22 @@ present = true
 fingerprint = "sha256:f5637596191349ab986e9f06b1b069de4fcddf69626e79ed1ef5ace2312a6056"
 
 [[patch_target]]
+name = "vllm.distributed.device_communicators.pynccl.PyNcclCommunicator.suspend"
+kind = "class"
+module = "vllm/distributed/device_communicators/pynccl.py"
+symbol = "PyNcclCommunicator.suspend"
+present = true
+fingerprint = "sha256:260b1dc983572fc87c137c4789a21f6ea447ba93001f75bcf04affa1503a6ddb"
+
+[[patch_target]]
+name = "vllm.distributed.device_communicators.pynccl_wrapper.NCCLLibrary.__init__"
+kind = "class"
+module = "vllm/distributed/device_communicators/pynccl_wrapper.py"
+symbol = "NCCLLibrary.__init__"
+present = true
+fingerprint = "sha256:2234125a1666659a33efb04a16c7aac30027d490fc66d32d4dde4e4abb205f2c"
+
+[[patch_target]]
 name = "vllm.envs.environment_variables"
 kind = "module"
 module = "vllm/envs.py"
@@ -136,6 +152,22 @@ module = "vllm/model_executor/kernels/mhc/tilelang.py"
 symbol = "_hc_prenorm_gemm_outputs"
 present = true
 fingerprint = "sha256:99d79181417220d87f6a377fe74dc2434bd369b0a167db1b9ca36d9e680e439b"
+
+[[patch_target]]
+name = "vllm.model_executor.kernels.mhc.tilelang.mhc_fused_post_pre_delayed_tilelang"
+kind = "module"
+module = "vllm/model_executor/kernels/mhc/tilelang.py"
+symbol = "mhc_fused_post_pre_delayed_tilelang"
+present = true
+fingerprint = "sha256:bcd2729a1a6236c27f8822054d974f00dca3630ff558ac037ff4cd1c89817f95"
+
+[[patch_target]]
+name = "vllm.model_executor.kernels.mhc.tilelang.mhc_pre_delayed_tilelang"
+kind = "module"
+module = "vllm/model_executor/kernels/mhc/tilelang.py"
+symbol = "mhc_pre_delayed_tilelang"
+present = true
+fingerprint = "sha256:d14fb46dcb9865a290c9b81628b8874a55e55d184503fa0774b2c12f6fc8ea94"
 
 [[patch_target]]
 name = "vllm.model_executor.layers.attention.mla_attention.MLAAttention.forward_impl"
@@ -1594,6 +1626,142 @@ present = true
 fingerprint = "sha256:cd9f420e339d3b9ab68d87165c2a97f241aedc28639e1be8e2606fdd8a69cbdb"
 
 [[patch_target]]
+name = "vllm.models.deepseek_v41.attention.DeepseekV4IndexerCache.get_kv_cache_spec"
+kind = "class"
+module = "vllm/models/deepseek_v41/attention.py"
+symbol = "DeepseekV4IndexerCache.get_kv_cache_spec"
+present = true
+fingerprint = "sha256:92c586db8d0f5a8f373e49becd3e61e002d83219f0a623fdce6f580689e677a6"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.attention.fused_indexer_q_rope_quant"
+kind = "module"
+module = "vllm/models/deepseek_v41/attention.py"
+symbol = "fused_indexer_q_rope_quant"
+present = true
+fingerprint = "sha256:d1013a40ac0cd18effb1c7b0df9049cd2d0710bdebc923e941b7a19b0f6b78c1"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.attention.indexer_k_norm_rope_store"
+kind = "module"
+module = "vllm/models/deepseek_v41/attention.py"
+symbol = "indexer_k_norm_rope_store"
+present = true
+fingerprint = "sha256:d1013a40ac0cd18effb1c7b0df9049cd2d0710bdebc923e941b7a19b0f6b78c1"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.engram.ParallelEngramEmbedding.lookup"
+kind = "class"
+module = "vllm/models/deepseek_v41/common/engram.py"
+symbol = "ParallelEngramEmbedding.lookup"
+present = true
+fingerprint = "sha256:3b6b9bb2fe84c843a03700b129fad0fba2e6a429eb7c3008fa43f7236f94c44c"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.ops.cache_utils.dequantize_and_gather_k_cache"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/ops/cache_utils.py"
+symbol = "dequantize_and_gather_k_cache"
+present = true
+fingerprint = "sha256:336553041aa2e659f2698a157bec6cd393e405fe2eaa80ccd39c3b445ee7db77"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.ops.dequantize_and_gather_k_cache"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/ops/__init__.py"
+symbol = "dequantize_and_gather_k_cache"
+present = true
+fingerprint = "sha256:ed22bfa90c7271b064e2e5c71a17b903fc2abc873a1ac4df486187d0936aaf78"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache.rope_quant_insert"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py"
+symbol = "rope_quant_insert"
+present = true
+fingerprint = "sha256:0ce6a060e5de140167dcb250301c6329a5e2da012691eaffb569cc709e085115"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.ops.fused_indexer_q_rope_quant"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/ops/__init__.py"
+symbol = "fused_indexer_q_rope_quant"
+present = true
+fingerprint = "sha256:5e7226276844e7a07b70013715262c6b698ae2e994933f693839f149589905ce"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.ops.indexer_k_norm_rope_store"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/ops/__init__.py"
+symbol = "indexer_k_norm_rope_store"
+present = true
+fingerprint = "sha256:998375533eb1210e43b858b33db686ae56983d89b75812dc805d9d26e4891bdb"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.common.ops.indexer_k_store.indexer_k_norm_rope_store"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/ops/indexer_k_store.py"
+symbol = "indexer_k_norm_rope_store"
+present = true
+fingerprint = "sha256:dd37c0d73f7b98bbd8f144b9f0b47a03d6bf99fcc2ac11ea9f3ec9e501f9ab8b"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.compressor.rope_quant_insert"
+kind = "module"
+module = "vllm/models/deepseek_v41/compressor.py"
+symbol = "rope_quant_insert"
+present = true
+fingerprint = "sha256:c5668183fc9d6f30db5871fbcf59f0a7ea02e4b481091011c060900f2307fceb"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.engram.Engram._create_embedding"
+kind = "class"
+module = "vllm/models/deepseek_v41/nvidia/engram.py"
+symbol = "Engram._create_embedding"
+present = true
+fingerprint = "sha256:a6e0b910fddc9e8cb5ff9c0346bf4fd6a1772b22146b49d6a254489873f4ef3f"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.engram.can_share_engram_tables"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/engram.py"
+symbol = "can_share_engram_tables"
+present = true
+fingerprint = "sha256:c414433259bd4ec517b19f191acbf4d9ffccd0702f37bfec42cbc3f5bfb22ef9"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn.dequantize_and_gather_k_cache"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py"
+symbol = "dequantize_and_gather_k_cache"
+present = true
+fingerprint = "sha256:97c115636af979ea978c8689cc23873be9299b9099fe6555041a72629063102e"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.flashmla.dequantize_and_gather_k_cache"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/flashmla.py"
+symbol = "dequantize_and_gather_k_cache"
+present = true
+fingerprint = "sha256:97c115636af979ea978c8689cc23873be9299b9099fe6555041a72629063102e"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.model._select_dsv4_attn_cls"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/model.py"
+symbol = "_select_dsv4_attn_cls"
+present = true
+fingerprint = "sha256:cd9f420e339d3b9ab68d87165c2a97f241aedc28639e1be8e2606fdd8a69cbdb"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.model.can_share_engram_tables"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/model.py"
+symbol = "can_share_engram_tables"
+present = true
+fingerprint = "sha256:d981fad5901903a5d8d85c61d2729033ce8d6cb0af543e2c4a4585e62f8f2baf"
+
+[[patch_target]]
 name = "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention.__init__"
 kind = "class"
 module = "vllm/models/kimi_k3/nvidia/kda.py"
@@ -1952,6 +2120,14 @@ module = "vllm/v1/attention/backends/mla/indexer.py"
 symbol = "DeepseekV32IndexerMetadataBuilder.build"
 present = true
 fingerprint = "sha256:9e7510f9467fba674d61c89a1a1f2709e29ae4e3ed394f5078358d5059f33db4"
+
+[[patch_target]]
+name = "vllm.v1.attention.backends.mla.indexer.DeepseekV41IndexerBackend.get_supported_kernel_block_sizes"
+kind = "class"
+module = "vllm/v1/attention/backends/mla/indexer.py"
+symbol = "DeepseekV41IndexerBackend.get_supported_kernel_block_sizes"
+present = true
+fingerprint = "sha256:dfa214107fb3e4c6a79392e8c241489be9d1b68280a59cd6b74e4b08e36a6c80"
 
 [[patch_target]]
 name = "vllm.v1.attention.backends.mla.indexer.PPU_DEEP_GEMM_TB_PER_CU"

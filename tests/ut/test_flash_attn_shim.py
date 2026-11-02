@@ -149,6 +149,43 @@ def test_broken_sdk_wheels_do_not_block_import_and_keep_the_real_error(run_shim)
     """)
 
 
+@pytest.mark.parametrize("hidden", ["", "-1"])
+@pytest.mark.parametrize("version", [2, 3])
+def test_hidden_devices_reject_fa_without_driver_probe(run_shim, hidden, version):
+    run_shim(f"""
+        import importlib
+        import os
+        import types
+        torch = types.ModuleType('torch')
+        torch.Tensor = type('Tensor', (), {{}})
+        torch.bfloat16 = object()
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Driver probing is forbidden when devices are hidden')
+        torch.cuda = types.SimpleNamespace(
+            get_device_capability=forbidden, is_available=forbidden,
+            device_count=forbidden, _lazy_init=forbidden,
+        )
+        sys.modules['torch'] = torch
+        for name in ('flash_attn', 'flash_attn_3', 'flash_attn_3._C'):
+            sys.modules[name] = types.ModuleType(name)
+        os.environ['CUDA_VISIBLE_DEVICES'] = {hidden!r}
+        kernels = importlib.import_module('vllm_sail.attention.flash_attn._kernels')
+        assert kernels.FA2_AVAILABLE and kernels.FA3_AVAILABLE
+        assert not kernels.is_fa_version_supported({version})
+        assert 'hides all devices' in kernels.fa_version_unsupported_reason({version})
+        os.environ.pop('CUDA_VISIBLE_DEVICES')
+        for capability in ((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0)):
+            torch.cuda.get_device_capability = lambda device=None: capability
+            expected = capability[0] >= 8 and (
+                {version} == 2 or (capability[0] < 10 and capability != (8, 6))
+            )
+            assert kernels.is_fa_version_supported({version}) is expected
+        os.environ['CUDA_VISIBLE_DEVICES'] = {hidden!r}
+        torch.cuda.get_device_capability = forbidden
+        assert not kernels.is_fa_version_supported({version})
+    """)
+
+
 @pytest.mark.parametrize(
     ("sail", "ppu", "expected"),
     [(None, "1", True), ("0", "1", False), ("", "1", False), ("yes", "0", True)],
