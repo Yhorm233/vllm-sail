@@ -225,12 +225,24 @@ def _dequantize_and_gather_k_cache_triton(
 ) -> None:
     """SM80 Triton dispatch — uses _decode_e4m3fn instead of the
     fp8e4nv bitcast that Triton refuses to compile on SM80."""
-    TOKEN_FP8_DIM = 448
-    TOKEN_BF16_DIM = 64
-    TOKEN_SCALE_DIM = 8
-    QUANT_BLOCK_SIZE = 64
+    # PPU MODIFICATION: begin
+    # Main-cache E4M3/UE8M0 decoding is independent of the DSA INT8 contract.
+    # Reuse the paged kernel, preserving the MXFP8 and FP8/BF16 planar layouts.
+    if k_cache.shape[-1] == 528:
+        TOKEN_FP8_DIM = 512
+        TOKEN_BF16_DIM = 0
+        TOKEN_SCALE_DIM = 16
+        QUANT_BLOCK_SIZE = 32
+    elif k_cache.shape[-1] == 584:
+        TOKEN_FP8_DIM = 448
+        TOKEN_BF16_DIM = 64
+        TOKEN_SCALE_DIM = 8
+        QUANT_BLOCK_SIZE = 64
+    else:
+        raise ValueError("PPU software FP8 gather requires a 528- or 584-byte record")
     FP8_MAX = 448.0
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+    # PPU MODIFICATION: end
 
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
@@ -253,7 +265,9 @@ def _dequantize_and_gather_k_cache_triton(
         block_stride=k_cache.stride(0),
         output_dim=512,
         fp8_max=FP8_MAX,
-        n_quant_blocks=7,
+        # PPU MODIFICATION: begin
+        n_quant_blocks=TOKEN_FP8_DIM // QUANT_BLOCK_SIZE,
+        # PPU MODIFICATION: end
     )
 
 

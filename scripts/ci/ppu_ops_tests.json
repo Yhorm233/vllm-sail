@@ -7,7 +7,10 @@
         "pyproject.toml", "setup.py", "tests/conftest.py", "tools/port_upstream_kernels.py",
         "vllm_sail/__init__.py", "vllm_sail/compat.py", "vllm_sail/envs.py",
         "vllm_sail/patch/__init__.py", "vllm_sail/patch/bodies.py",
-        "vllm_sail/patch/utils.py", "vllm_sail/platform.py"
+        "vllm_sail/patch/utils.py", "vllm_sail/platform.py",
+        "vllm_sail/attention/ops/mla_sparse.py", "vllm_sail/utils/deep_gemm.py",
+        "vllm_sail/patch/enhancement/attention/sparse_attn_indexer.py",
+        "vllm_sail/patch/enhancement/attention/mla_indexer.py"
       ],
       "prefixes": [".github/workflows/", "cmake/", "csrc/", "requirements/", "scripts/ci/", "tests/support/", "vllm_sail/native/"],
       "globs": ["vllm_sail/patch/*/__init__.py"]
@@ -18,6 +21,16 @@
       "globs": ["docs/*.md"]
     },
     "source_to_tests": [
+      {
+        "id": "deepseek-v41-mhc-python",
+        "paths": ["vllm_sail/patch/enhancement/attention/mhc_delayed.py", "vllm_sail/patch/enhancement/attention/mhc_tilelang.py"],
+        "test_ids": ["deepseek-v41-mhc"]
+      },
+      {
+        "id": "deepseek-v41-python",
+        "paths": ["vllm_sail/models/deepseek_v41/ops/indexer_tilelang.py", "vllm_sail/models/deepseek_v41/ops/latent_store.py", "vllm_sail/models/deepseek_v41/ops/engram_lookup.py", "vllm_sail/models/deepseek_v41/flashmla.py", "vllm_sail/models/deepseek_v41/ppu_model.py", "vllm_sail/models/deepseek_v41/engram.py", "vllm_sail/patch/enhancement/models/deepseek_v41.py"],
+        "test_ids": ["deepseek-v41-indexer-int8", "deepseek-v41-fp8", "deepseek-v41-dsa"]
+      },
       {
         "id": "fp8-linear-python",
         "paths": ["vllm_sail/model_executor/kernels/linear/scaled_mm/ppu.py"],
@@ -71,6 +84,10 @@
     ]
   },
   "test_catalog": [
+    {"id": "deepseek-v41-mhc", "test": "tests/e2e/test_deepseek_v41_mhc.py", "boards": ["ppu10"], "requires": ["deep_gemm", "tilelang", "torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},
+    {"id": "deepseek-v41-dsa", "test": "tests/e2e/test_deepseek_v41_dsa.py", "boards": ["ppu10"], "requires": ["deep_gemm", "torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},
+    {"id": "deepseek-v41-indexer-int8", "test": "tests/e2e/test_deepseek_v41_indexer_int8.py", "boards": ["ppu10"], "requires": ["tilelang", "torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},
+    {"id": "deepseek-v41-fp8", "test": "tests/e2e/test_deepseek_v41_fp8.py", "boards": ["ppu10"], "requires": ["torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},
     {"id": "activation", "test": "tests/e2e/test_native_activation.py", "boards": ["ppu10", "ppu15"], "requires": ["torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},
     {"id": "deepseek-indexer-int8", "test": "tests/e2e/test_deepseek_v4_indexer_int8.py", "boards": ["ppu10"], "requires": ["torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},
     {"id": "deepseek-native", "test": "tests/e2e/test_deepseek_v4_native.py", "boards": ["ppu10", "ppu15"], "requires": ["torch", "triton", "vllm", "vllm_sail"], "board_overrides": {}},

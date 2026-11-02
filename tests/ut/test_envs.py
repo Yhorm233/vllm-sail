@@ -44,9 +44,10 @@ def test_defaults_and_canonical_snapshot() -> None:
     expected["VLLM_DEEPEPLL_RECV_HOOK"] = True
     expected["PPU_SDK"] = "/usr/local/PPU_SDK"
     expected["VLLM_GDN_DECODE_KERNEL"] = "auto"
+    expected["VLLM_SAIL_V41_AUDIT_DIR"] = ""
     assert envs.snapshot() == expected
     assert set(envs.environment_variables) == set(expected)
-    for suffix in (*BOOL_DEFAULTS, *BACKENDS):
+    for suffix in (*BOOL_DEFAULTS, *BACKENDS, "V41_AUDIT_DIR"):
         assert getattr(envs, f"VLLM_PPU_{suffix}") == expected[f"VLLM_SAIL_{suffix}"]
 
 
@@ -122,7 +123,7 @@ def test_oldest_nvtx_alias_has_lowest_precedence(
     assert envs.VLLM_PPU_NVTX_PROFILE is True
 
 
-@pytest.mark.parametrize("suffix", ["USE_PLA", "MOE_BACKEND"])
+@pytest.mark.parametrize("suffix", ["USE_PLA", "MOE_BACKEND", "V41_AUDIT_DIR"])
 @pytest.mark.parametrize("prefix", ["VLLM_SAIL", "VLLM_PPU"])
 def test_is_set_recognizes_either_name_even_when_empty(
     monkeypatch: pytest.MonkeyPatch, suffix: str, prefix: str
@@ -133,6 +134,21 @@ def test_is_set_recognizes_either_name_even_when_empty(
     monkeypatch.setenv(f"{prefix}_{suffix}", "")
     assert envs.is_set(sail) is True
     assert envs.is_set(ppu) is True
+
+
+def test_audit_directory_is_lazy_with_explicit_empty_precedence(monkeypatch):
+    sail, ppu = "VLLM_SAIL_V41_AUDIT_DIR", "VLLM_PPU_V41_AUDIT_DIR"
+    assert getattr(envs, sail) == getattr(envs, ppu) == ""
+    monkeypatch.setenv(ppu, "/tmp/audit-ppu")
+    assert getattr(envs, sail) == getattr(envs, ppu) == "/tmp/audit-ppu"
+    for value in ("/tmp/audit-sail", ""):
+        monkeypatch.setenv(sail, value)
+        assert getattr(envs, sail) == getattr(envs, ppu) == value
+        assert envs.snapshot()[sail] == value
+    monkeypatch.delenv(sail)
+    assert getattr(envs, sail) == "/tmp/audit-ppu"
+    monkeypatch.setenv(ppu, "/tmp/changed-after-import")
+    assert getattr(envs, sail) == "/tmp/changed-after-import"
 
 
 def test_sdk_path_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:

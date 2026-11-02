@@ -428,7 +428,16 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
     )
     modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=object)
-    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: True))
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=object)
+    modules("torch", int8="int8")
+    modules("vllm.config", get_current_vllm_config=lambda: None)
+    modules("vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=lambda config: False)
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: True, is_device_capability=lambda cap: False
+        ),
+    )
     module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
     attn = module.DeepseekV41FlashMLAAttention()
     attn.__dict__.update(
@@ -450,6 +459,113 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
     assert attn.wo_a.weight is loaded
     assert attn.forward_mqa is Upstream.forward_mqa
     assert attn._forward_prefill is Upstream._forward_prefill
+
+
+@pytest.mark.parametrize(
+    "ppu,capability,contract",
+    [
+        (True, (8, 0), True),
+        (True, (8, 0), False),
+        (True, (8, 9), True),
+        (False, (8, 0), True),
+    ],
+)
+def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, contract):
+    calls = []
+
+    class Upstream:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return 64
+
+        def _o_proj(self, *args):
+            calls.append(("upstream", args, {}))
+            return "upstream"
+
+    class Backend:
+        @classmethod
+        def supports_compute_capability(cls, cap):
+            return cap.major in (9, 10)
+
+    class PPUV4:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return heads
+
+        def _o_proj(self, *args):
+            calls.append(("ppuv4", args, {}))
+            return "ppuv4"
+
+    class Output:
+        def __getitem__(self, slices):
+            assert slices == (slice(None), slice(None, 8))
+            return "actual_heads"
+
+    def int8(*args, **kw):
+        calls.append(("int8", args, kw))
+        return "int8"
+
+    modules("torch", int8="int8")
+    modules("vllm.config", get_current_vllm_config=lambda: object())
+    modules(
+        "vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=lambda config: contract
+    )
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: ppu, is_device_capability=lambda cap: cap == capability
+        ),
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
+        dequant_mxfp8_to_bf16=lambda *args: None,
+    )
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.o_proj",
+        deep_gemm_fp8_o_proj=lambda *args: None,
+    )
+    modules("vllm_sail.models.deepseek_v4.ops.o_proj", deep_gemm_int8_o_proj=int8)
+    modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=PPUV4)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
+    )
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=Backend)
+    module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
+    cls = module.DeepseekV41FlashMLAAttention
+    attn = cls()
+    attn.__dict__.update(
+        _o_proj_block_size=128,
+        wo_a=SimpleNamespace(weight=SimpleNamespace(dtype="int8")),
+        _wo_b_proj=object(),
+        rotary_emb=SimpleNamespace(cos_sin_cache=object()),
+        n_local_groups=2,
+        n_local_heads=8,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        o_lora_rank=1024,
+    )
+    expected = (
+        "int8"
+        if ppu and capability == (8, 0) and contract
+        else "ppuv4"
+        if ppu
+        else "upstream"
+    )
+    assert attn._o_proj(Output(), object()) == expected
+    if expected == "int8":
+        _, args, kw = calls[-1]
+        assert (
+            args[0] == "actual_heads"
+            and args[3] is attn.wo_a
+            and args[4] is attn._wo_b_proj
+        )
+        assert kw["einsum_recipe"] == (1, 1, 128) and kw["heads_per_group"] == 4
+        with pytest.raises(ValueError, match="actual head count"):
+            cls.get_padded_num_q_heads(16)
+    assert cls.get_padded_num_q_heads(8) == (8 if ppu else 64)
+    backend = module.PPUDeepseekV41FlashMLABackend
+    assert backend.supports_compute_capability(SimpleNamespace(major=8, minor=0)) is ppu
+    assert backend.supports_compute_capability(SimpleNamespace(major=9, minor=0))
 
 
 def test_v41_draft_inherits_its_own_loader_and_execution(modules):

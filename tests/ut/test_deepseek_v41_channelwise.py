@@ -134,3 +134,126 @@ def test_export_dispatch_preserves_bf16_and_per_layer_precision(
     config.fp8_channelwise_layers.remove("layers.0.attn.wkv")
     with pytest.raises(ValueError, match="some but not all shards"):
         dispatch(config, Linear(), "language_model.model.layers.0.attn.fused_wqa_wkv")
+
+
+@pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
+@pytest.mark.parametrize("bias", [False, True])
+def test_fp8_linear_810e_scale_axes_and_delegation(ppu, cap, bias):
+    class Tensor:
+        def __init__(self, label, shape=(2, 3), count=1):
+            self.label, self.shape, self.count = label, shape, count
+
+        def numel(self):
+            return self.count
+
+        def float(self):
+            return self
+
+        def reshape(self, *shape):
+            return Tensor(("reshape", self.label, shape))
+
+        def __mul__(self, other):
+            return Tensor(("mul", self.label, other.label))
+
+        def __add__(self, other):
+            return Tensor(("add", self.label, other.label))
+
+        def to(self, dtype):
+            return Tensor(("to", self.label, dtype))
+
+        def view(self, *shape):
+            return ("view", self.label, shape)
+
+    calls = []
+
+    def mm(a, b):
+        calls.append(("mm", a.label, b.label))
+        return Tensor("product")
+
+    def native(a, b, **kwargs):
+        calls.append(("native", a, b, kwargs))
+        return Tensor("native")
+
+    apply = function(
+        "vllm_sail/model_executor/kernels/linear/scaled_mm/ppu.py",
+        "PPUCutlassFP8ScaledMMLinearKernel.apply_scaled_mm",
+        {
+            "torch": SimpleNamespace(mm=mm),
+            "ops": SimpleNamespace(cutlass_scaled_mm=native),
+            "current_platform": SimpleNamespace(
+                is_ppu=lambda: ppu,
+                is_device_capability=lambda expected: cap == expected,
+            ),
+        },
+    )
+    a, b = Tensor("a", (2, 4)), Tensor("b", (4, 3))
+    as_, bs = Tensor("as", count=2), Tensor("bs", count=3)
+    bias_tensor = Tensor("bias") if bias else None
+    kwargs = dict(
+        A=a,
+        B=b,
+        As=as_,
+        Bs=bs,
+        bias=bias_tensor,
+        out_dtype="bf16",
+        output_shape=[1, 2, 3],
+    )
+    result = apply(None, **kwargs)
+    if ppu and cap == (8, 0):
+        assert calls == [("mm", "a", "b")]
+        scaled = (
+            "mul",
+            ("mul", "product", ("reshape", "as", (-1, 1))),
+            ("reshape", "bs", (1, -1)),
+        )
+        expected = ("add", scaled, "bias") if bias else scaled
+        assert result == ("view", ("to", expected, "bf16"), (1, 2, 3))
+        kwargs["As"] = Tensor("blockscale", count=4)
+        with pytest.raises(ValueError, match="tensor/token"):
+            apply(None, **kwargs)
+        assert len(calls) == 1
+    else:
+        assert calls == [
+            (
+                "native",
+                a,
+                b,
+                dict(out_dtype="bf16", scale_a=as_, scale_b=bs, bias=bias_tensor),
+            )
+        ]
+        assert result == ("view", "native", (1, 2, 3))
+
+
+@pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
+@pytest.mark.parametrize("clean", [False, True])
+def test_fp8_paged_logits_keeps_sdk_route_outside_810e(ppu, cap, clean):
+    calls = []
+
+    def software(*args):
+        calls.append(("software", args))
+        return "software"
+
+    def sdk(*args, **kwargs):
+        calls.append(("sdk", args, kwargs))
+        return "sdk"
+
+    wrapper = function(
+        "vllm_sail/utils/deep_gemm.py",
+        "fp8_paged_mqa_logits",
+        {
+            "current_platform": SimpleNamespace(
+                is_ppu=lambda: ppu,
+                is_device_capability=lambda expected: cap == expected,
+            ),
+            "_fp8_paged_mqa_logits_ppu10": software,
+            "_lazy_init": lambda: calls.append(("lazy",)),
+            "_fp8_paged_mqa_logits_impl": sdk,
+        },
+    )
+    args = tuple(range(7))
+    if ppu and cap == (8, 0):
+        assert wrapper(*args, clean) == "software"
+        assert calls == [("software", args[:5] + (args[6],))]
+    else:
+        assert wrapper(*args, clean) == "sdk"
+        assert calls == [("lazy",), ("sdk", args, dict(clean_logits=clean))]

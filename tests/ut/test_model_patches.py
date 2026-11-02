@@ -42,6 +42,7 @@ EXPECTED_MODULES = {
     "deepseek_v41",
     "deepseek_v41_engram",
     "deepseek_v41_indexer",
+    "deepseek_v41_int8",
     "glm5_next",
     "kimi_k3",
     "llama4",
@@ -230,10 +231,7 @@ _EXPECTED_TARGETS = {
         "vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner."
         "_overlap_allreduce_tail"
     ),
-    (
-        "vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner."
-        "_select_tail_tier"
-    ),
+    ("vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner._select_tail_tier"),
     "vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner.__init__",
     "vllm.models.kimi_k3.nvidia.model.KimiRoutedOutputTransform.forward",
     "vllm.model_executor.models.llama4.Llama4MoE.custom_routing_function",

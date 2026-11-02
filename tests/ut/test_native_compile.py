@@ -970,13 +970,17 @@ def test_bf16_register_loads_do_not_require_conversion_operators(
     # BF16 interface, and check both template branches including partial rows.
     # This is a host-side contract test, not an emulation of the device kernel.
     prelude = r"""
-#include <bit>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 struct BFloat16 { uint16_t bits; };  // deliberately no operator float()
 float __bfloat162float(BFloat16 value) {
-  return std::bit_cast<float>(uint32_t(value.bits) << 16);
+  uint32_t bits = uint32_t(value.bits) << 16;
+  float result;
+  static_assert(sizeof(result) == sizeof(bits));
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
 }
 constexpr int kBF16VecsPerThread = 4;
 constexpr int kBF16BlockSize = 1024;

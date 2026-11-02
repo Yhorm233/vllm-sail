@@ -130,7 +130,9 @@ class PPUPlatform(NvmlCudaPlatform):
         with no patching. See ``docs/developer_guide/kernels.md``.
         """
         from vllm_sail import native
+        from vllm_sail.utils.cudart import load_sdk_cudart
 
+        load_sdk_cudart()
         native.install()
         super().import_kernels()
 

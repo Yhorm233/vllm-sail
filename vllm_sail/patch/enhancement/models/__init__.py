@@ -26,6 +26,8 @@ Modules, and why each is import-on-install like the rest of the framework:
 * ``moe_marlin_gate`` — VLLM_PPU_ENABLE_MOE_MARLIN default-off gate.
 """
 
+# Capture the shared Q alias for V4.1 before V4 patches it to avoid duplicate registration.
+from vllm_sail.patch.enhancement.models import deepseek_v41_int8  # noqa: F401, I001
 from vllm_sail.patch.enhancement.models import (
     deepseek_mtp,  # noqa: F401
     deepseek_v2,  # noqa: F401

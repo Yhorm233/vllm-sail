@@ -58,6 +58,7 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> _RecordingRegistry:
 
 
 EXPECTED_ARCHITECTURES = {
+    "DeepseekV41ForCausalLM",
     "DeepseekV4ForCausalLM",
     "DeepSeekV4MTPModel",
     "DSparkDraftModel",

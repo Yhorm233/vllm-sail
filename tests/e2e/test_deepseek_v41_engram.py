@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real PPU lookup checks for per-row FP32 Engram scales, including UVA."""
 
+from types import SimpleNamespace
+
 import pytest
 
 pytestmark = pytest.mark.ppu
@@ -14,7 +16,7 @@ def test_channelwise_engram_lookup_preserves_fp32_scales(cpu_offload):
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
-    from vllm.models.deepseek_v41.common.engram import _engram_lookup_kernel
+    from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
 
     placement = (
         {"device": "cpu", "pin_memory": True} if cpu_offload else {"device": "cuda"}
@@ -31,23 +33,20 @@ def test_channelwise_engram_lookup_preserves_fp32_scales(cpu_offload):
         [[0, 4, 8, 999], [0, 4, 11, -1]], dtype=torch.int64, device="cuda"
     )
     out = torch.empty(2, 3, 256, dtype=torch.bfloat16, device="cuda")
-    _engram_lookup_kernel[(1,)](
-        *views,
-        ids,
-        out,
-        8,
-        16,
-        6,
-        ids.stride(0),
-        ids.stride(1),
-        HEAD_START=2,
-        LOCAL_HEADS=3,
-        TOTAL_HEADS=4,
-        DIM=256,
-        QUANT_BLOCK=256,
-        BLOCK_R=16,
-        GRID=1,
+    # Use the installed model entry point to select 810E software or native FP8 decoding.
+    owner = SimpleNamespace(
+        weight=weight,
+        _storage=lambda: views,
+        vocab_start_idx=8,
+        vocab_end_idx=16,
+        head_start=2,
+        part_n_hash_cols=3,
+        n_hash_cols=4,
+        dim=256,
+        block_size=256,
+        _num_sms=torch.cuda.get_device_properties(0).multi_processor_count,
     )
+    ParallelEngramEmbedding.lookup(owner, ids, out)
     torch.cuda.synchronize()
     expected = torch.zeros(2, 3, 256, dtype=torch.bfloat16)
     expected[0, 0] = (2.0 * scales[0, 0].cpu()).to(torch.bfloat16)

@@ -3,6 +3,8 @@
 
 from types import SimpleNamespace
 
+import torch
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
@@ -10,25 +12,66 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
 from vllm.models.deepseek_v41.nvidia.flashmla import (
     DeepseekV4FlashMLAAttention as UpstreamFlashMLAAttention,
 )
+from vllm.models.deepseek_v41.sparse_mla import DeepseekV4FlashMLABackend
 from vllm.platforms import current_platform
 
 from vllm_sail.models.deepseek_v4.flashmla import (
     DeepseekV4FlashMLAAttention as PPUV4FlashMLAAttention,
 )
+from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
+
+
+class PPUDeepseekV41FlashMLABackend(DeepseekV4FlashMLABackend):
+    @classmethod
+    def supports_compute_capability(cls, capability):
+        if current_platform.is_ppu() and (capability.major, capability.minor) == (8, 0):
+            return True
+        return super().supports_compute_capability(capability)
 
 
 class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
     """Upstream V4.1 metadata/forward, PPU head count and dense fallback."""
 
+    backend_cls = PPUDeepseekV41FlashMLABackend
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         if current_platform.is_ppu():
+            if current_platform.is_device_capability((8, 0)) and uses_int8_w8a8(
+                get_current_vllm_config()
+            ):
+                if num_heads not in (8, 64):
+                    raise ValueError(
+                        "810E V4.1 INT8 is validated only for TP8/TP1; "
+                        f"actual head count is {num_heads}"
+                    )
+                return num_heads
             return PPUV4FlashMLAAttention.get_padded_num_q_heads(num_heads)
         return super().get_padded_num_q_heads(num_heads)
 
     def _o_proj(self, o, positions):
         if not current_platform.is_ppu():
             return super()._o_proj(o, positions)
+        if (
+            current_platform.is_device_capability((8, 0))
+            and uses_int8_w8a8(get_current_vllm_config())
+            and self.wo_a.weight.dtype == torch.int8
+        ):
+            from vllm_sail.models.deepseek_v4.ops.o_proj import deep_gemm_int8_o_proj
+
+            return deep_gemm_int8_o_proj(
+                o[:, : self.n_local_heads],
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self._wo_b_proj,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+                einsum_recipe=(1, 1, 128),
+            )
         if self._o_proj_block_size != 32:
             return PPUV4FlashMLAAttention._o_proj(self, o, positions)
 

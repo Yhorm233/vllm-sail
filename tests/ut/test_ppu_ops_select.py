@@ -352,6 +352,19 @@ def test_resource_exclusions_survive_selection_protocol(
         ),
         (["vllm_sail/registry/linear_kernels/__init__.py"], "full", None),
         (["vllm_sail/utils/deep_gemm.py"], "full", None),
+        (["vllm_sail/attention/ops/mla_sparse.py"], "full", None),
+        (["vllm_sail/patch/enhancement/attention/mla_indexer.py"], "full", None),
+        (
+            ["vllm_sail/patch/enhancement/attention/sparse_attn_indexer.py"],
+            "full",
+            None,
+        ),
+        (
+            ["vllm_sail/models/deepseek_v41/ops/indexer_tilelang.py"],
+            "subset",
+            ["deepseek-v41-dsa", "deepseek-v41-fp8", "deepseek-v41-indexer-int8"],
+        ),
+        (["tests/e2e/test_deepseek_v41_dsa.py"], "subset", ["deepseek-v41-dsa"]),
         (["vllm_sail/patch/enhancement/fp8_quant.py"], "full", None),
         (
             ["vllm_sail/models/deepseek_v4/ops/indexer.py"],

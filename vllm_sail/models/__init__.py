@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 
 #: Required PPU overrides. Failure must not silently retain upstream classes.
 _REQUIRED_PPU_MODELS: dict[str, str] = {
+    "DeepseekV41ForCausalLM": (
+        "vllm_sail.models.deepseek_v41.ppu_model:DeepseekV41ForCausalLM"
+    ),
     "DeepseekV4ForCausalLM": "vllm_sail.models.deepseek_v4.model:DeepseekV4ForCausalLM",
     "DeepSeekV4MTPModel": "vllm_sail.models.deepseek_v4.mtp:DeepSeekV4MTP",
     "DSparkDraftModel": (
