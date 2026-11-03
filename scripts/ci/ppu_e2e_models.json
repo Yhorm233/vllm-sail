@@ -1,18 +1,56 @@
 [
   {
     "key": "qwen3.8-27b",
-    "checkpoint": "/nas_aisw/datasets/checkpoints/LLM/Qwen/v3.8/Qwen3.8-27B",
+    "category": "smoke",
     "served_name": "qwen3.8-27b",
     "board": "OAM-810E",
     "tp": 2,
-    "extra_serve_flags": "--trust-remote-code"
+    "extra_serve_flags": "--trust-remote-code",
+    "model_id": "Qwen/Qwen3.8-27B"
   },
   {
     "key": "qwen3.8-27b-m890p",
-    "checkpoint": "/nas_aisw/datasets/checkpoints/LLM/Qwen/v3.8/Qwen3.8-27B",
+    "category": "smoke",
     "served_name": "qwen3.8-27b",
     "board": "ZW-M890P",
     "tp": 2,
+    "extra_serve_flags": "--trust-remote-code",
+    "model_id": "Qwen/Qwen3.8-27B"
+  },
+  {
+    "key": "qwen3.8-flash-next",
+    "category": "accuracy",
+    "model_id": "Qwen/Qwen3.8-Flash-Next",
+    "served_name": "Qwen3.8-Flash-Next",
+    "board": "ZW-M890P",
+    "tp": 8,
+    "extra_serve_flags": "--trust-remote-code"
+  },
+  {
+    "key": "deepseek-v4-int8",
+    "category": "accuracy",
+    "model_id": "T-HEAD/DeepSeek-V4-Flash-0731-Quant-W-INT8-PerChannel-A-INT8-PerToken",
+    "served_name": "deepseek-v4-int8",
+    "board": "OAM-810E",
+    "tp": 8,
+    "extra_serve_flags": "--trust-remote-code"
+  },
+  {
+    "key": "deepseek-v4-mxfp4",
+    "category": "accuracy",
+    "model_id": "T-HEAD/DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    "served_name": "deepseek-v4-mxfp4",
+    "board": "ZW-M890P",
+    "tp": 8,
+    "extra_serve_flags": "--trust-remote-code"
+  },
+  {
+    "key": "minimax-m3-fp8",
+    "category": "accuracy",
+    "model_id": "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    "served_name": "MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    "board": "ZW-M890P",
+    "tp": 8,
     "extra_serve_flags": "--trust-remote-code"
   }
 ]

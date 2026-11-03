@@ -45,6 +45,10 @@ See [Architecture](docs/developer_guide/architecture.md) for module boundaries.
 
 ## Checks before review
 
+Install the pre-commit and commit-msg hooks once with `pre-commit install`.
+Every commit requires a `Signed-off-by` trailer; use `git commit -s` to add it
+with your configured Git name and email.
+
 Run the CPU tests and formatting checks:
 
 ```bash

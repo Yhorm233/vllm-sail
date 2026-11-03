@@ -27,7 +27,7 @@ Modules, and why each is import-on-install like the rest of the framework:
 """
 
 # Capture the shared Q alias for V4.1 before V4 patches it to avoid duplicate registration.
-from vllm_sail.patch.enhancement.models import deepseek_v41  # noqa: F401, I001
+from vllm_sail.patch.enhancement.models import deepseek_v41_int8  # noqa: F401, I001
 from vllm_sail.patch.enhancement.models import (
     deepseek_mtp,  # noqa: F401
     deepseek_v2,  # noqa: F401
@@ -35,6 +35,9 @@ from vllm_sail.patch.enhancement.models import (
     deepseek_v4_cache,  # noqa: F401
     deepseek_v4_compressor,  # noqa: F401
     deepseek_v4_metadata,  # noqa: F401
+    deepseek_v41,  # noqa: F401
+    deepseek_v41_engram,  # noqa: F401
+    deepseek_v41_indexer,  # noqa: F401
     kimi_k3,  # noqa: F401
     llama4,  # noqa: F401
     moe_marlin_gate,  # noqa: F401

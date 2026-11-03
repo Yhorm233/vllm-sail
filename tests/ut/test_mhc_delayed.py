@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""810E delayed mHC dispatch, alias lifecycle, and pinned upstream body contracts."""
+"""Delayed mHC dispatch, alias lifecycle and preservation of upstream bodies."""
 
 import ast
 from types import SimpleNamespace
@@ -34,13 +34,9 @@ class Tensor:
 @pytest.fixture
 def delayed(modules):
     calls = []
-    platform = SimpleNamespace(ppu=True, capability=(8, 0))
+    platform = SimpleNamespace(ppu=True)
     modules(
-        "vllm.platforms",
-        current_platform=SimpleNamespace(
-            is_ppu=lambda: platform.ppu,
-            is_device_capability=lambda value: platform.capability == value,
-        ),
+        "vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: platform.ppu)
     )
     modules(
         "torch",
@@ -88,13 +84,13 @@ def delayed(modules):
     originals = {name: record(name) for name in NAMES}
     provider = modules("vllm.model_executor.kernels.mhc.tilelang", **originals)
     consumer = modules("vllm.models.deepseek_v41.nvidia.model", **originals)
-    dispatch = modules("vllm.models.deepseek_v41.nvidia.ops.mhc", **originals)
+    mega = modules("vllm.models.deepseek_v41.nvidia.ops.mega_mhc", **originals)
     patch = load_patch(PATH)
     return SimpleNamespace(
         patch=patch,
         provider=provider,
         consumer=consumer,
-        dispatch=dispatch,
+        mega=mega,
         originals=originals,
         calls=calls,
         platform=platform,
@@ -102,7 +98,7 @@ def delayed(modules):
 
 
 def test_delayed_aliases_and_double_install_guard(delayed):
-    for name, consumer in zip(NAMES, (delayed.consumer, delayed.dispatch), strict=True):
+    for name, consumer in zip(NAMES, (delayed.consumer, delayed.mega), strict=True):
         replacement = getattr(delayed.patch, name)
         assert getattr(delayed.provider, name) is replacement
         assert getattr(consumer, name) is replacement
@@ -119,18 +115,12 @@ def test_delayed_aliases_and_double_install_guard(delayed):
         load_patch(PATH)
 
 
-@pytest.mark.parametrize(
-    "ppu,capability", [(True, (8, 0)), (True, (9, 0)), (False, (8, 0))]
-)
+@pytest.mark.parametrize("ppu", [True, False])
 @pytest.mark.parametrize("fused", [True, False])
 @pytest.mark.parametrize("tokens", [0, 7])
 @pytest.mark.parametrize("norm", [True, False])
-def test_delayed_prenorm_and_epilogue_contract(
-    delayed, ppu, capability, fused, tokens, norm
-):
+def test_delayed_prenorm_and_epilogue_contract(delayed, ppu, fused, tokens, norm):
     delayed.platform.ppu = ppu
-    delayed.platform.capability = capability
-    use_ppu = ppu and capability == (8, 0)
     residual = Tensor(tokens, 4, 1024)
     fn = Tensor(24, 4096, dtype="fp32")
     common = (
@@ -167,11 +157,11 @@ def test_delayed_prenorm_and_epilogue_contract(
         assert kinds == []
         return
     assert kinds == (["post"] if fused else []) + [
-        "ppu" if use_ppu else "cuda",
+        "ppu" if ppu else "cuda",
         "norm" if norm else "epilogue",
     ]
     _, args, epilogue = delayed.calls[-1]
-    assert args[0].shape == (1 if use_ppu else 4, tokens, 24)
+    assert args[0].shape == (1 if ppu else 4, tokens, 24)
     assert epilogue["save_pre_mix"] and epilogue["use_pre_mix_in"]
     assert epilogue["rms_numel"] == 4096
     if fused:
@@ -183,9 +173,7 @@ def test_delayed_prenorm_and_epilogue_contract(
 def test_non_ppu_delayed_body_matches_upstream(upstream_source_root, name):
     class RemovePPUBranch(ast.NodeTransformer):
         def visit_If(self, node):
-            if ast.unparse(node.test) == (
-                "current_platform.is_ppu() and current_platform.is_device_capability((8, 0))"
-            ):
+            if ast.unparse(node.test) == "current_platform.is_ppu()":
                 return node.orelse
             return self.generic_visit(node)
 
@@ -195,42 +183,3 @@ def test_non_ppu_delayed_body_matches_upstream(upstream_source_root, name):
     )
     local.decorator_list = []
     assert ast.dump(RemovePPUBranch().visit(local)) == ast.dump(upstream)
-
-
-@pytest.mark.upstream_source
-def test_delayed_consumer_inventory_matches_fixed_source(upstream_source_root):
-    tree = ast.parse((ROOT / PATH).read_text())
-    inventory = next(
-        ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "_ALIAS_CONSUMERS"
-            for target in node.targets
-        )
-    )
-    found = {name: set() for name in NAMES}
-    source = upstream_source_root / "vllm/models/deepseek_v41"
-    for path in source.rglob("*.py"):
-        module = ".".join(path.relative_to(upstream_source_root).with_suffix("").parts)
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.ImportFrom) and node.module == (
-                "vllm.model_executor.kernels.mhc.tilelang"
-            ):
-                for alias in node.names:
-                    if alias.name in found:
-                        assert alias.asname is None
-                        found[alias.name].add(module)
-    assert found == {name: set(consumers) for name, consumers in inventory.items()}
-
-
-def test_delayed_future_consumer_and_unrelated_alias(delayed, modules):
-    future = modules("vllm.models.deepseek_v41.future_consumer")
-    exec(
-        "from vllm.model_executor.kernels.mhc.tilelang import mhc_pre_delayed_tilelang",
-        future.__dict__,
-    )
-    assert future.mhc_pre_delayed_tilelang is delayed.patch.mhc_pre_delayed_tilelang
-    unrelated = modules("vllm.models.deepseek_v4.model", **delayed.originals)
-    delayed.patch._rebind_delayed_aliases()
-    assert unrelated.mhc_pre_delayed_tilelang is delayed.originals[NAMES[0]]

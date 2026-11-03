@@ -19,7 +19,7 @@ BOOL_DEFAULTS = {
     "USE_OPT_TOKEN_GROUP_QUANT": False,
     "DENSE_BF16_DEEPGEMM": False,
     "USE_PLA": True,
-    "DEEPGEMM_MOE_TP_FUSED": True,
+    "DEEPGEMM_MOE_TP_FUSED": False,
     "FUSED_GDN_DECODE": True,
     "DISABLE_MOE_WNA16_CUDA": False,
     "FORCE_MOE_WNA16_CUDA": False,

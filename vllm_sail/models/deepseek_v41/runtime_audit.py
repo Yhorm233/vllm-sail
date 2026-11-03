@@ -113,12 +113,17 @@ def native_mapping_identity(parts):
             with mapped_path.open("rb") as mapped:
                 mapped_file = opened_file_identity(mapped)
             if mapped_file != file:
-                raise RuntimeError("Mapped operator binary and disk file are different objects: " + path)
+                raise RuntimeError(
+                    "Mapped operator binary and disk file are different objects: "
+                    + path
+                )
             record.update(identity_method="proc_map_files", mapped_file=mapped_file)
         current = Path(path).stat()
         opened = os.fstat(handle.fileno())
         if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-            raise RuntimeError("Operator binary path was replaced during sampling: " + path)
+            raise RuntimeError(
+                "Operator binary path was replaced during sampling: " + path
+            )
     return record
 
 
@@ -152,7 +157,9 @@ def loaded_runtime():
         record = native_mapping_identity(parts)
         resolved = str(Path(path).resolve())
         if resolved in files and files[resolved] != record["file"]["sha256"]:
-            raise RuntimeError("Operator binary changed between module and mapping sampling: " + path)
+            raise RuntimeError(
+                "Operator binary changed between module and mapping sampling: " + path
+            )
         files[resolved] = record["file"]["sha256"]
         native.append(record)
         seen.add(key)
@@ -279,7 +286,9 @@ def worker_identity(model, config):
     device = torch.cuda.current_device()
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     if device >= len(visible) or not visible[device].isdigit():
-        raise RuntimeError("Runtime auditing requires an explicit numeric physical-device mapping")
+        raise RuntimeError(
+            "Runtime auditing requires an explicit numeric physical-device mapping"
+        )
     classes = {}
     for obj in (model, model.language_model):
         cls = type(obj)
@@ -463,7 +472,9 @@ class ForwardTrace:
 
 def execute_traced(fn, args, kwargs, synchronize):
     if sys.getprofile() is not None or sys.gettrace() is not None:
-        raise RuntimeError("V4.1 runtime auditing cannot run with another profiler/trace")
+        raise RuntimeError(
+            "V4.1 runtime auditing cannot run with another profiler/trace"
+        )
     trace = ForwardTrace()
     try:
         sys.setprofile(trace)
@@ -486,7 +497,9 @@ def forward_token_counts(metadata, padding):
         return None
     # The pinned GPUModelRunner provides this mask for both real and dummy forwards.
     if padding is None or padding.ndim != 1 or str(padding.dtype) != "torch.bool":
-        raise RuntimeError("Runtime auditing requires the runner's 1D bool padding mask")
+        raise RuntimeError(
+            "Runtime auditing requires the runner's 1D bool padding mask"
+        )
     padded_tokens = padding.numel()
     if padded_tokens < metadata_tokens:
         raise RuntimeError("Padding mask is shorter than attention metadata")
@@ -509,7 +522,9 @@ class RuntimeAudit:
     def __init__(self, directory, model, config):
         self.root = Path(directory)
         if not self.root.is_absolute() or not self.root.is_dir():
-            raise ValueError("The runtime audit directory must be absolute and created before startup")
+            raise ValueError(
+                "The runtime audit directory must be absolute and created before startup"
+            )
         self.pid = os.getpid()
         self.start = process_start()
         self.config = config
@@ -579,7 +594,9 @@ class RuntimeAudit:
                 # Refresh loaded-file identities on the first forward or a new decode/delayed path.
                 identity = worker_identity(self.model, self.config)
                 if identity["groups"] != self.identity["groups"]:
-                    raise RuntimeError("Worker parallel groups changed during forward execution")
+                    raise RuntimeError(
+                        "Worker parallel groups changed during forward execution"
+                    )
                 with self.log.open("a") as handle:
                     handle.write(
                         json.dumps(

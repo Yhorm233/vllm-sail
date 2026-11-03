@@ -26,10 +26,7 @@ vllm_sail_resolve_cmake_hgcc()
 # ---------------------------------------------------------------------------
 # HG language configuration. MUST precede project().
 # ---------------------------------------------------------------------------
-# Compile `.cu` sources with hgcc directly, so the ported corpus keeps upstream's
-# file names and a vLLM bump stays a mechanical diff. Do NOT also enable CMake's
-# built-in CUDA language: the extension mapping conflicts.
-set(CMAKE_HG_ENABLE_CU_EXTENSION ON)
+# Compile the ported corpus with HGGC's .hg source extension.
 
 if(NOT CMAKE_HG_ARCHITECTURES)
   if(PYTORCH_SAIL_ARCH)
@@ -58,17 +55,6 @@ endif()
 set(CMAKE_HG_STANDARD_REQUIRED ON)
 
 project(vllm_sail_native LANGUAGES CXX HG)
-
-# cmake-hgcc v1.0.0 sets `hg` extensions in CMakeHGCompiler.cmake.in and only
-# re-adds `cu` afterwards in CMakeHGInformation.cmake. Assert rather than
-# discover a silent "no rule to make target" much later.
-if(NOT "cu" IN_LIST CMAKE_HG_SOURCE_FILE_EXTENSIONS)
-  message(FATAL_ERROR
-    "cmake-hgcc did not register the 'cu' source extension "
-    "(CMAKE_HG_SOURCE_FILE_EXTENSIONS=${CMAKE_HG_SOURCE_FILE_EXTENSIONS}). "
-    "CMAKE_HG_ENABLE_CU_EXTENSION support is required; check the cmake-hgcc "
-    "version at ${CMAKE_MODULE_PATH}.")
-endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -101,14 +87,6 @@ set(PPU_DEFINES
   USE_CUDA=1
   USE_DISTRIBUTED=1)
 
-if(NOT PPU_COMPAT_DIR)
-  message(FATAL_ERROR
-    "PPU_COMPAT_DIR is not set. The vendored kernels use COMPATIBLE_ARCH and "
-    "COMPATIBLE_VERSION, which only a USE_SAIL torch's "
-    "<torch>/.ppu_compat/compatible_wrapper.h defines. setup.py normally "
-    "supplies this; see vllm_sail/native/toolchain.py.")
-endif()
-
 # ---------------------------------------------------------------------------
 # Source lists come from the upstream and plugin manifests through setup.py.
 # CMake never globs.
@@ -128,17 +106,11 @@ function(ppu_add_extension target)
   endif()
   target_include_directories(${target} PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/csrc/upstream"
-      "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
-      "${PPU_COMPAT_DIR}")
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc")
   target_compile_definitions(${target} PRIVATE ${PPU_DEFINES})
-  # Force-included rather than #include'd: sailify only text-substitutes, so the
-  # translated sources reference COMPATIBLE_* without ever including the header
-  # that defines them. torch's CUDAExtension path does exactly this.
-  # SHELL: is required, not cosmetic: the PPU torch fork's CMake config already
-  # force-includes this header by absolute path, and CMake de-duplicates the
-  # repeated `-include`, leaving the bare filename behind as a second input file.
+  # Supply sailify compatibility gates; SHELL: keeps the -include operand paired.
   target_compile_options(${target} PRIVATE
-    "SHELL:-include compatible_wrapper.h")
+    "SHELL:-include ppu_compat.h")
   # cmake-hgcc emits the standard in CMAKE_HG_FLAGS during project(), but the
   # SAIL TorchConfig can append its own -std=c++17 afterwards. Target options
   # follow global flags, so keep the requested HG standard authoritative here.
@@ -158,6 +130,9 @@ function(ppu_add_extension target)
     "$<$<COMPILE_LANGUAGE:HG>:-U__HGGC_NO_HALF_CONVERSIONS__>"
     "$<$<COMPILE_LANGUAGE:HG>:-U__HGGC_NO_HALF2_OPERATORS__>"
     "$<$<COMPILE_LANGUAGE:HG>:-U__HGGC_NO_BFLOAT16_CONVERSIONS__>")
+  # Avoid the extended-lambda device builtin during host compilation.
+  target_compile_options(${target} PRIVATE
+    "$<$<COMPILE_LANGUAGE:HG>:-U__HGGCCC_EXTENDED_LAMBDA__>")
   target_link_libraries(${target} PRIVATE
     torch
     HGGC::toolkit)

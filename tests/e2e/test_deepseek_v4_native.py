@@ -83,6 +83,10 @@ def test_topk_softplus_sqrt(runtime, dtype_name, shape, routing, renormalize):
     if renormalize:
         expected /= expected.sum(-1, keepdim=True)
     expected *= 1.5
+    # Keep oracle masking independent of torch's device-side nonzero kernel.
+    padding = padding.cpu()
+    indices, weights = indices.cpu(), weights.cpu()
+    expected_ids, expected = expected_ids.cpu(), expected.cpu()
     torch.testing.assert_close(indices[~padding].long(), expected_ids[~padding])
     torch.testing.assert_close(
         weights[~padding], expected[~padding], rtol=2e-5, atol=2e-6
@@ -162,8 +166,10 @@ def test_qnorm_rope_cache_insert(runtime, mode, tokens):
     if tokens > 1:
         slots = slots[:-1]
     blocks = (tokens + 7 + block_size - 1) // block_size + 1
-    valid = slots >= 0
-    block_ids, offsets = slots[valid] // block_size, slots[valid] % block_size
+    # Integer indices preserve the oracle rows without device-side nonzero.
+    valid_rows = (slots.cpu() >= 0).nonzero(as_tuple=True)[0].to(slots.device)
+    block_ids = slots[valid_rows] // block_size
+    offsets = slots[valid_rows] % block_size
     q_float = q.float()
     q_norm = q_float * torch.rsqrt(q_float.square().mean(-1, keepdim=True) + eps)
     q_ref = _rope(
@@ -187,7 +193,7 @@ def test_qnorm_rope_cache_insert(runtime, mode, tokens):
 
         # Decode the documented 576-byte token payload and separate 8-byte
         # scale tail, independently of vLLM's Triton cache helpers.
-        rounded_kv = kv_ref.to(kv.dtype)[: slots.numel()][valid]
+        rounded_kv = kv_ref.to(kv.dtype)[: slots.numel()][valid_rows]
         groups = rounded_kv[:, :448].float().reshape(-1, 7, 64)
         exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448))
         quantized = (groups * torch.exp2(-exponent[..., None])).clamp(-448, 448)
@@ -243,7 +249,7 @@ def test_qnorm_rope_cache_insert(runtime, mode, tokens):
             kv_encoded = (kv_ref / kv_scale).clamp(-448, 448).to(dtype)
             torch.testing.assert_close(q, q_original, rtol=0, atol=0)
         torch.cuda.synchronize()
-        expected[block_ids, offsets] = kv_encoded.float()[: slots.numel()][valid]
+        expected[block_ids, offsets] = kv_encoded.float()[: slots.numel()][valid_rows]
         _assert_ulp(torch, output, output_ref)
         _assert_ulp(torch, cache, expected.to(dtype))
         torch.testing.assert_close(

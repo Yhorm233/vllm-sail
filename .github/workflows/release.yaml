@@ -1,85 +1,181 @@
-name: Release Pypi
+name: Release wheels
 
-# Use the standalone ppu-release-action template repository; uses and template_ref must reference the same version.
-# Configure RELEASE_USERNAME, RELEASE_TOKEN, and DATA_TOKEN as repository Actions secrets or organization Actions secrets accessible to the calling repository.
-# Save Release wheel artifacts when triggered by a tag.
 on:
-  # Trigger automatically only on tag pushes, or manually with the specified inputs.
   push:
     tags:
       - '**'
   workflow_dispatch:
     inputs:
-      package_name:
-        description: 'Name of the package to build and publish'
-        required: true
-        type: string
-        default: vllm_sail
-      framework:
-        description: 'Name of the required framework, e.g. torch'
-        required: true
-        type: string
-        default: torch
       python_versions:
-        description: 'JSON array; available values: 38, 310, 312'
-        required: true
+        description: 'JSON array; currently select one Python version'
         type: string
         default: '["312"]'
       os_versions:
-        description: 'JSON array; available values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
-        required: true
+        description: 'JSON array; currently select one OS version'
         type: string
         default: '["ubuntu2404"]'
       runtime_versions:
-        description: 'JSON array; available values: 2, 3'
-        required: true
+        description: 'JSON array; currently select one runtime version'
         type: string
         default: '["3"]'
       torch_versions:
-        description: 'JSON array; available values: 2.8.0, 2.10.0, 2.13.0; [""] omits the Torch version'
-        required: true
+        description: 'JSON array; currently select one Torch version'
         type: string
         default: '["2.13.0"]'
       sdk_versions:
-        description: 'JSON array; available values: 2.1.0, 2.2.0'
-        required: true
+        description: 'JSON array; currently select one SDK version'
         type: string
         default: '["2.2.0"]'
       tag_version:
-        description: 'Code version; manually specify a tag when building and publishing multiple wheel packages'
-        required: false
+        description: 'Existing tag on the selected source commit; blank uses the triggering tag or a release tag on HEAD'
         type: string
+        required: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ inputs.tag_version || github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    uses: t-head/ppu-release-action/.github/workflows/matrix-release.yml@master
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      configuration: ${{ steps.plan.outputs.configuration }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the existing PTG matrix tools
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/ci-infra
+          ref: main
+          path: ci-template
+          token: ${{ secrets.TEMPLATE_TOKEN || github.token }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging
+      - name: Resolve the unchanged PTG matrix
+        id: matrix
+        env:
+          SOURCE_DIR: .
+          INPUTS_JSON: >-
+            {"package_name":"vllm_sail","tag_version":${{ toJSON(inputs.tag_version || '') }},"python_versions":${{ toJSON(inputs.python_versions || '["312"]') }},"os_versions":${{ toJSON(inputs.os_versions || '["ubuntu2404"]') }},"runtime_versions":${{ toJSON(inputs.runtime_versions || '["3"]') }},"torch_versions":${{ toJSON(inputs.torch_versions || '["2.13.0"]') }},"sdk_versions":${{ toJSON(inputs.sdk_versions || '["2.2.0"]') }}}
+        run: python ci-template/ci-workflows/release-pypi/scripts/prepare_matrix.py
+      - name: Validate the release source and single build configuration
+        id: plan
+        env:
+          MATRIX_JSON: ${{ steps.matrix.outputs.matrix }}
+          TAG_VERSION: ${{ inputs.tag_version }}
+        run: python scripts/ci/release_wheels.py plan
+
+  build-wheels:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    container:
+      image: ${{ needs.prepare.outputs.image }}
+    outputs:
+      manifest_sha256: ${{ steps.stage.outputs.manifest_sha256 }}
+    env:
+      VLLM_SAIL_BUILD_IMAGE: ${{ needs.prepare.outputs.image }}
+      RELEASE_CONFIGURATION: ${{ needs.prepare.outputs.configuration }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Build both wheels through the public entry point
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /usr/local/PPU_SDK/envsetup.sh
+          export PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+          export PIP_EXTRA_INDEX_URL=""
+          python -c 'import json, os, sys, torch; c = json.loads(os.environ["RELEASE_CONFIGURATION"]); assert f"{sys.version_info.major}{sys.version_info.minor}" == c["python_version"]; assert torch.__version__.split("+", 1)[0] == c["torch_version"], torch.__version__'
+          bash scripts/build_wheels.sh --output-dir "$PWD/artifacts/release-build"
+      - name: Verify and stage original release wheels
+        id: stage
+        run: python scripts/ci/release_wheels.py stage --wheels artifacts/release-build/wheels --output release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheels-${{ github.run_id }}
+          path: release-assets/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          overwrite: true
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/release-build/logs/
+            artifacts/release-build/build-manifest.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish-github-release:
+    needs: [prepare, build-wheels]
+    if: needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      ptg_command: ${{ steps.publish.outputs.ptg_command }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-wheels-${{ github.run_id }}
+          path: release-assets
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging
+      - name: Publish both wheels to the exact tag
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_CONFIGURATION: ${{ needs.prepare.outputs.configuration }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.build-wheels.outputs.manifest_sha256 }}
+        run: python scripts/ci/release_wheels.py publish --directory release-assets
+
+  publish-ptg:
+    needs: publish-github-release
+    uses: t-head/ci-infra/.github/workflows/matrix-release.yml@main
+    permissions:
+      contents: read
     secrets:
       template_token: ${{ secrets.TEMPLATE_TOKEN }}
       release_username: ${{ secrets.RELEASE_USERNAME }}
       release_token: ${{ secrets.RELEASE_TOKEN }}
       data_token: ${{ secrets.DATA_TOKEN }}
     with:
-      # Manual runs use the provided inputs; tag pushes have no inputs and use the same defaults as manual runs.
-      package_name: ${{ inputs.package_name || 'vllm_sail' }}
-      framework: ${{ inputs.framework || 'torch' }}
-      template_repository: t-head/ppu-release-action
-      template_ref: master
+      package_name: vllm_sail
+      framework: torch
+      template_repository: t-head/ci-infra
+      template_ref: main
       python_versions: ${{ inputs.python_versions || '["312"]' }}
       os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
       runtime_versions: ${{ inputs.runtime_versions || '["3"]' }}
       torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
       sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
-      tag_version: ${{ inputs.tag_version || ''}}
-      build_command: |
-        unset PIP_INDEX_URL
-        source /usr/local/PPU_SDK/envsetup.sh || true
-        which hgcc || true
-        python3 -m pip install -r requirements/build.txt
-        python3 -m pip install -r requirements/ppu.txt
-        PYTORCH_SAIL_ARCH="${PYTORCH_SAIL_ARCH:ppu_15;ppu_10}"
-        python3 setup.py bdist_wheel
+      tag_version: ${{ inputs.tag_version || '' }}
+      build_command: ${{ needs.publish-github-release.outputs.ptg_command }}

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Build the ``e2e-ppu`` job matrix from the checked-in model catalog.
+"""Build smoke and accuracy matrices from the checked-in model catalog.
 
-The catalog (``scripts/ci/ppu_e2e_models.json``) lists every model the PPU E2E
-smoke workflow knows how to run. This helper turns it into a GitHub Actions
-``strategy.matrix`` payload, optionally narrowed to a caller-supplied subset so a
-manual dispatch can target a single model without editing the catalog.
+Catalog entries are partitioned by ``category``. Missing categories retain the
+legacy ``smoke`` meaning. A requested subset is validated against the complete
+catalog, then each output contains only entries belonging to its own category.
 
 Usage:
     ppu_e2e_select.py [MODELS]
 
-``MODELS`` is a comma-separated list of catalog keys. An empty value selects
-every model. Unknown keys are rejected so a typo fails fast instead of silently
-running nothing. The resulting matrix is printed as ``matrix=<json>`` so a
-workflow step can append it to ``$GITHUB_OUTPUT``.
+``MODELS`` is a comma-separated list of catalog keys. An empty value selects all
+models in each category. Unknown keys are rejected so a typo fails fast. The
+script emits ``matrix=<json>`` for smoke and ``accuracy_matrix=<json>`` for the
+GSM8K accuracy workflow.
 """
 
 from __future__ import annotations
@@ -24,31 +23,75 @@ from pathlib import Path
 
 CATALOG = Path(__file__).resolve().parent / "ppu_e2e_models.json"
 
+# Catalog keys are CLI-facing and use hyphens; the evaluator historically uses
+# underscores for the two DeepSeek variants. Keep the translation explicit so
+# workflow filtering cannot silently dispatch the wrong accuracy model.
+ACCURACY_MODEL_KEYS = {
+    "deepseek-v4-int8": "deepseek_v4_int8",
+    "deepseek-v4-mxfp4": "deepseek_v4_mxfp4",
+    "minimax-m3-fp8": "minimax-m3-fp8",
+    "qwen3.8-flash-next": "qwen3.8-flash-next",
+}
 
-def build_matrix(catalog: list[dict], models: str) -> dict:
-    """Return a ``{"include": [...]}`` matrix filtered by ``models``.
 
-    ``models`` is a comma-separated list of catalog keys; blank selects all.
-    Requested keys preserve the caller's order. Unknown keys raise ``ValueError``.
-    """
+def _category(entry: dict) -> str:
+    return entry.get("category", "smoke")
+
+
+def _select(catalog: list[dict], models: str, category: str) -> list[dict]:
     by_key = {entry["key"]: entry for entry in catalog}
     requested = [item.strip() for item in models.split(",") if item.strip()]
-    if not requested:
-        return {"include": list(catalog)}
     unknown = [key for key in requested if key not in by_key]
     if unknown:
         available = ", ".join(by_key)
         raise ValueError(
             f"unknown model key(s): {', '.join(unknown)}; available: {available}"
         )
-    return {"include": [by_key[key] for key in requested]}
+    entries = [by_key[key] for key in requested] if requested else list(catalog)
+    return [entry for entry in entries if _category(entry) == category]
+
+
+def build_matrix(catalog: list[dict], models: str) -> dict:
+    """Return smoke entries plus a legacy checkpoint alias for old callers."""
+    include = []
+    for entry in _select(catalog, models, "smoke"):
+        selected = dict(entry)
+        # Default-branch workflow_dispatch callers may still read `checkpoint`.
+        # Its value is a model ID, never a runner-specific filesystem path.
+        if "model_id" in selected:
+            selected.setdefault("checkpoint", selected["model_id"])
+        include.append(selected)
+    return {"include": include}
+
+
+def build_accuracy_matrix(catalog: list[dict], models: str) -> dict:
+    """Return the evaluator matrix for accuracy catalog entries only."""
+    include = []
+    for entry in _select(catalog, models, "accuracy"):
+        catalog_key = entry["key"]
+        try:
+            model_key = ACCURACY_MODEL_KEYS[catalog_key]
+        except KeyError as error:
+            raise ValueError(
+                f"missing accuracy model-key mapping for {catalog_key!r}"
+            ) from error
+        include.append(
+            {
+                "model_key": model_key,
+                "board": entry["board"],
+                "ppu_count": int(entry["tp"]),
+            }
+        )
+    return {"include": include}
 
 
 def main(argv: list[str]) -> int:
     models = argv[0] if argv else ""
     catalog = json.loads(CATALOG.read_text())
     matrix = build_matrix(catalog, models)
+    accuracy_matrix = build_accuracy_matrix(catalog, models)
     print(f"matrix={json.dumps(matrix, separators=(',', ':'))}")
+    print(f"accuracy_matrix={json.dumps(accuracy_matrix, separators=(',', ':'))}")
     return 0
 
 

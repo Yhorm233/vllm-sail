@@ -1,0 +1,214 @@
+name: PPU accuracy nightly
+
+# Nightly GSM8K accuracy regression for the model-precision E2E gate
+# (CI plan category 3). Accuracy stays outside the per-PR gate: this entry
+# point reuses the wheels of the newest successful PPU CI build and calls
+# _ppu-accuracy-tests.yaml once per accuracy entry in the checked-in catalog.
+#
+#   resolve  -- pick the build run together with the SAIL commit it was built
+#               from, so the source checkout and the downloaded wheels always
+#               describe the same tree (the accuracy wrapper verifies the wheel
+#               manifest against that commit).
+#   accuracy -- one reusable call per model. A single model already needs all
+#               eight devices and ppu_runtime_container.sh takes an exclusive
+#               flock on the runner, so max-parallel stays at 1; four models
+#               therefore need roughly four to six hours end to end.
+#
+# What the lane gates on
+#   * score >= threshold (0.9) for every model;
+#   * the reviewed golden under tests/e2e/models/_golden when one exists.
+#     ppu_e2e_accuracy.sh seeds that read-only directory into the writable
+#     results tree before evaluating, and a model without a golden only
+#     reports "created" and uploads a *.pending-review.json artifact for a
+#     human to promote into the repository.
+#
+# Chip coverage: the lane runs on the self-hosted 8-ppu-m890p runner and uses
+# whatever devices that host exposes, so deepseek-v4-int8 (catalog board
+# OAM-810E) exercises the ZW-M890P int8 path here and its golden is bound to
+# that chip. A true 810E lane needs the ppu-scheduler-action route the kernel
+# and perf lanes use, which the local Docker wrapper cannot provide.
+#
+# Schedule: 12:00 UTC = 20:00 CST, ahead of the 18:30 UTC upstream-reuse and
+# 20:00 UTC perf lanes, so the four serial models finish before they start.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "PPU CI build run to reuse (blank = resolve the newest successful one)"
+        required: false
+        default: ""
+        type: string
+      models:
+        description: "Comma-separated accuracy catalog keys (blank = every accuracy entry)"
+        required: false
+        default: ""
+        type: string
+
+  schedule:
+    - cron: "0 12 * * *"
+
+permissions:
+  contents: read
+  # Reading the reused build run, its commit, and its artifacts needs this.
+  actions: read
+
+concurrency:
+  group: accuracy-nightly-${{ github.ref }}-${{ inputs.build_run_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve nightly build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build_run_id: ${{ steps.resolve.outputs.build_run_id }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve the build run and its SAIL commit
+        id: resolve
+        env:
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          api = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}"
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+
+          def get(path):
+              request = urllib.request.Request(api + path, headers=headers)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+
+          def with_wheels(candidates):
+              """Return the first run that actually uploaded a ppu-wheels artifact.
+
+              A PPU CI run can succeed while reporting "skipped" (no
+              PPU-impacting change), and those runs carry no wheels, so the
+              newest success alone is not enough.
+              """
+              for run in candidates:
+                  artifacts = get(f"/actions/runs/{run['id']}/artifacts?per_page=100")
+                  names = {item["name"] for item in artifacts.get("artifacts", [])}
+                  if f"ppu-wheels-{run['id']}" in names:
+                      return run
+              return None
+
+
+          supplied = os.environ.get("INPUT_BUILD_RUN_ID", "").strip()
+          if supplied:
+              run = get(f"/actions/runs/{supplied}")
+              if run.get("conclusion") != "success":
+                  sys.exit(f"build run {supplied} did not succeed: {run.get('conclusion')}")
+              if with_wheels([run]) is None:
+                  sys.exit(f"build run {supplied} has no ppu-wheels-{supplied} artifact")
+          else:
+              run = None
+              for branch in ("&branch=main", ""):
+                  listing = (
+                      "/actions/workflows/ppu-build-and-test.yaml/runs"
+                      f"?status=success&per_page=20{branch}"
+                  )
+                  run = with_wheels(get(listing).get("workflow_runs", []))
+                  if run is not None:
+                      break
+
+          if run is None:
+              sys.exit("no successful PPU CI build carries a ppu-wheels artifact")
+
+          source_sha = run.get("head_sha") or ""
+          if re.fullmatch(r"[0-9a-f]{40}", source_sha) is None:
+              sys.exit(f"build run {run['id']} reports no usable head_sha: {source_sha!r}")
+
+          print(f"build_run_id={run['id']}")
+          print(f"source_sha={source_sha}")
+          print(f"head_branch={run.get('head_branch')}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"build_run_id={run['id']}\n")
+              handle.write(f"source_sha={source_sha}\n")
+          PY
+
+      - name: Select accuracy models
+        id: select
+        env:
+          MODELS: ${{ inputs.models }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location(
+              "ppu_e2e_select", Path("scripts/ci/ppu_e2e_select.py")
+          )
+          select = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(select)
+
+          catalog = json.loads(select.CATALOG.read_text())
+          # The matrix drives the reusable call, which takes catalog keys;
+          # build_accuracy_matrix works in evaluator keys.
+          catalog_key = {
+              select.ACCURACY_MODEL_KEYS[entry["key"]]: entry["key"]
+              for entry in catalog
+              if entry.get("category") == "accuracy"
+          }
+          requested = os.environ.get("MODELS", "")
+          try:
+              selected = select.build_accuracy_matrix(catalog, requested)["include"]
+          except ValueError as error:
+              # A typo in the dispatch input must fail the run, not crash it.
+              sys.exit(str(error))
+          include = [
+              {"model": catalog_key[entry["model_key"]]} for entry in selected
+          ]
+          if not include:
+              sys.exit(f"no accuracy model selected by MODELS={requested!r}")
+
+          matrix = json.dumps({"include": include}, separators=(",", ":"))
+          print(f"accuracy matrix: {matrix}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"matrix={matrix}\n")
+          PY
+
+  accuracy:
+    name: Accuracy ${{ matrix.model }}
+    needs: resolve
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      # Every model needs all eight devices and the runtime wrapper holds an
+      # exclusive flock on the runner, so a second concurrent lane aborts.
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    uses: ./.github/workflows/_ppu-accuracy-tests.yaml
+    with:
+      pr_mode: false
+      # Reuse the exact SAIL commit the wheels were built from; the wrapper
+      # refuses a checkout that disagrees with the wheel manifest.
+      pr_head_sha: ${{ needs.resolve.outputs.source_sha }}
+      wheel_source_sha: ${{ needs.resolve.outputs.source_sha }}
+      build_run_id: ${{ needs.resolve.outputs.build_run_id }}
+      models: ${{ matrix.model }}

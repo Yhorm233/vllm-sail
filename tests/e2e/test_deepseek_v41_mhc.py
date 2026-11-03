@@ -1,23 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare 810E delayed mHC against the upstream Torch reference."""
+"""Compare the V4.1 delayed prenorm path with upstream's torch reference."""
 
 import pytest
 
 pytestmark = pytest.mark.ppu
-
-
-@pytest.fixture(scope="module", autouse=True)
-def require_810e():
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("An 810E device is required")
-    import vllm_sail
-
-    vllm_sail.register_out_of_tree()
-    from vllm.platforms import current_platform
-
-    if not current_platform.is_ppu() or torch.cuda.get_device_capability() != (8, 0):
-        pytest.skip("This test supports only 810E")
 
 
 @pytest.mark.parametrize("tokens", [1, 33])

@@ -28,7 +28,6 @@ __all__ = [
     "find_cmake",
     "find_hgcc",
     "find_ninja",
-    "find_ppu_compat",
     "probe",
     "skip_requested",
 ]
@@ -54,7 +53,6 @@ class Probe:
 
     skip_requested: bool
     have_torch: bool
-    ppu_compat: str | None
     hgcc: str | None
     cmake: str | None
 
@@ -89,12 +87,6 @@ def decide(p: Probe) -> Decision:
         return Decision(False, "VLLM_SAIL_SKIP_EXT requests a Python-only build")
     if not p.have_torch:
         raise _missing_prerequisite("torch is not importable in the build environment")
-    if not p.ppu_compat:
-        raise _missing_prerequisite(
-            "torch has no .ppu_compat/compatible_wrapper.h, so it is not a "
-            "USE_SAIL build; the vendored kernels need the COMPATIBLE_ARCH and "
-            "COMPATIBLE_VERSION it defines"
-        )
     if not p.hgcc:
         raise _missing_prerequisite(
             "hgcc was not found (set HGCC, or PPU_SDK with bin/hgcc, or put it on PATH)"
@@ -163,44 +155,18 @@ def find_ninja(env: Mapping[str, str] | None = None) -> str | None:
     return shutil.which("ninja", path=env.get("PATH"))
 
 
-def find_ppu_compat(torch_dir: str | Path | None = None) -> str | None:
-    """Locate a SAIL torch's ``.ppu_compat`` header directory.
-
-    sailify rewrites ``__CUDA_ARCH__`` and ``CUDA_VERSION`` into
-    ``COMPATIBLE_ARCH`` and ``COMPATIBLE_VERSION``, which nothing in the
-    translated corpus defines -- they come from ``compatible_wrapper.h``, shipped
-    inside the torch wheel by a ``USE_SAIL`` build. torch's own ``CUDAExtension``
-    path adds this directory and force-includes that header; a CMake build gets
-    neither for free, and every ``#if defined(COMPATIBLE_ARCH)`` would silently
-    take its else-branch. See ``docs/developer_guide/kernels.md``.
-    """
-    if torch_dir is None:
-        try:
-            import torch
-        except ImportError:
-            return None
-        torch_dir = Path(torch.__file__).parent
-    candidate = Path(torch_dir) / ".ppu_compat"
-    if (candidate / "compatible_wrapper.h").is_file():
-        return str(candidate)
-    return None
-
-
 def probe(env: Mapping[str, str] | None = None) -> Probe:
     """Gather the environment facts. The only impure part of this module."""
     env = os.environ if env is None else env
     try:
-        import torch
-
-        have_torch = True
-        ppu_compat = find_ppu_compat(Path(torch.__file__).parent)
+        import torch  # noqa: F401 - importability is the only fact probed
     except ImportError:
         have_torch = False
-        ppu_compat = None
+    else:
+        have_torch = True
     return Probe(
         skip_requested=skip_requested(env),
         have_torch=have_torch,
-        ppu_compat=ppu_compat,
         hgcc=find_hgcc(env),
         cmake=find_cmake(env),
     )
@@ -231,9 +197,6 @@ def cmake_defines(
     hgcc = find_hgcc(env)
     if hgcc:
         defines["CMAKE_HG_COMPILER"] = hgcc
-    ppu_compat = find_ppu_compat()
-    if ppu_compat:
-        defines["PPU_COMPAT_DIR"] = ppu_compat
     extra = env.get("VLLM_SAIL_HG_FLAGS", "").strip()
     if extra:
         defines["CMAKE_HG_FLAGS"] = extra

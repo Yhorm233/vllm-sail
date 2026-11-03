@@ -45,6 +45,7 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     INT8_TABLE: tl.constexpr,
+    FP32_SCALES: tl.constexpr,
     GRID,
 ):
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
@@ -74,7 +75,7 @@ def _engram_lookup_kernel(
         )
         if not INT8_TABLE:
             values = _decode_engram_e4m3fn(values)
-        if INT8_TABLE:
+        if FP32_SCALES:
             scale = tl.load(scales + local, mask=owned, other=0.0)[:, None]
         else:
             scale = tl.load(
@@ -118,7 +119,9 @@ def lookup(
         or indices.device != out.device
         or out.device.type != "cuda"
     ):
-        raise ValueError("Engram indices and output must share a device, and output must be contiguous")
+        raise ValueError(
+            "Engram indices and output must share a device, and output must be contiguous"
+        )
     rows = indices.shape[0] * self.part_n_hash_cols
     if not rows:
         return
@@ -129,15 +132,25 @@ def lookup(
     ):
         raise ValueError("Engram table shape does not match the current head shard")
     if weight.device != out.device or scales.device != out.device:
-        raise ValueError("Engram tables must be tensors or UVA views on the output device")
+        raise ValueError(
+            "Engram tables must be tensors or UVA views on the output device"
+        )
     int8_table = weight.dtype == torch.int8
     if int8_table:
         if scales.dtype != torch.float32 or scales.shape != (weight.shape[0], 1):
             raise ValueError("1017 INT8 Engram requires FP32 per-row scales")
-    elif weight.dtype == torch.float8_e4m3fn and scales.dtype == torch.uint8:
+    elif weight.dtype == torch.float8_e4m3fn:
         weight = weight.view(torch.uint8)
-        if scales.shape != (weight.shape[0], self.dim // self.block_size):
-            raise ValueError("FP8 Engram requires UE8M0 block scales")
+        if scales.dtype == torch.float32:
+            if scales.shape != (weight.shape[0], 1) or self.block_size != self.dim:
+                raise ValueError(
+                    "Channelwise FP8 Engram requires one FP32 scale per row"
+                )
+        elif scales.dtype == torch.uint8:
+            if scales.shape != (weight.shape[0], self.dim // self.block_size):
+                raise ValueError("FP8 Engram requires UE8M0 block scales")
+        else:
+            raise ValueError("Unsupported FP8 Engram scale dtype")
     else:
         raise ValueError("Unsupported Engram weight/scale dtype combination")
     if (
@@ -167,5 +180,6 @@ def lookup(
         QUANT_BLOCK=self.block_size,
         BLOCK_R=16,
         INT8_TABLE=int8_table,
+        FP32_SCALES=scales.dtype == torch.float32,
         GRID=grid,
     )

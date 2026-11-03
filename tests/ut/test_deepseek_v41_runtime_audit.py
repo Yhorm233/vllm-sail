@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import types
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -509,23 +510,45 @@ def test_existing_worker_file_rejected(audit, tmp_path, monkeypatch):
     "enabled,ppu,cap,eager",
     [
         (False, False, (8, 9), False),
+        (False, True, (8, 0), True),
+        (False, True, (8, 9), True),
         (True, True, (8, 0), True),
         (True, False, (8, 0), True),
         (True, True, (8, 9), True),
         (True, True, (8, 0), False),
     ],
 )
+@pytest.mark.parametrize(
+    "int8,fail_forward", [(False, False), (True, False), (True, True)]
+)
 def test_wrapper_audit_guard_and_forward_delegation(
-    monkeypatch, enabled, ppu, cap, eager
+    monkeypatch, enabled, ppu, cap, eager, int8, fail_forward
 ):
     calls = []
+    outer_config = object()
+    current = [outer_config]
+    selected = ppu and cap == (8, 0) and int8
+
+    @contextmanager
+    def configuration(value):
+        previous = current[0]
+        current[0] = value
+        calls.append(("configure", value))
+        try:
+            yield
+        finally:
+            current[0] = previous
 
     class Base:
         def __init__(self, **kwargs):
+            self.hf_to_vllm_mapper = object()
             calls.append(("construct", kwargs))
 
         def forward(self, *args, **kwargs):
+            assert current[0] is (config if selected else outer_config)
             calls.append(("forward", args, kwargs))
+            if fail_forward:
+                raise RuntimeError("forward failed")
             return 17
 
     class Audit:
@@ -545,6 +568,10 @@ def test_wrapper_audit_guard_and_forward_delegation(
         __name__="v41_wrapper_fixture.ppu_model",
         __package__="v41_wrapper_fixture",
         UpstreamDeepseekV41ForCausalLM=Base,
+        uses_int8_w8a8=lambda config: int8,
+        int8_weights_mapper=lambda mapper: mapper,
+        set_current_vllm_config=configuration,
+        nullcontext=nullcontext,
         envs=types.SimpleNamespace(VLLM_SAIL_V41_AUDIT_DIR="/audit" if enabled else ""),
         current_platform=types.SimpleNamespace(
             is_ppu=lambda: ppu, is_device_capability=lambda value: value == cap
@@ -568,8 +595,15 @@ def test_wrapper_audit_guard_and_forward_delegation(
         assert calls == []
         return
     model = cls(vllm_config=config, prefix="model")
-    assert model.forward(1, 2, 3, 4, lookback_token_ids=5, extra=6) == 17
+    assert model._v41_int8_config is (config if selected else None)
+    if fail_forward:
+        with pytest.raises(RuntimeError, match="forward failed"):
+            model.forward(1, 2, 3, 4, lookback_token_ids=5, extra=6)
+    else:
+        assert model.forward(1, 2, 3, 4, lookback_token_ids=5, extra=6) == 17
     assert calls[-1] == ("forward", (1, 2, 3, 4), dict(lookback_token_ids=5, extra=6))
+    assert current[0] is outer_config
+    assert any(call[0] == "configure" for call in calls) == selected
     assert any(call[0] == "trace" for call in calls) == enabled
 
 

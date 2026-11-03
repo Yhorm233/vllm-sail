@@ -1,0 +1,3 @@
+# Placeholder so the golden directory is tracked before any baseline is captured.
+# Real golden files (<model_key>_<chip>.json) are produced on PPU hardware via
+# `pytest tests/e2e/models --update-golden`. See README.md for the schema.

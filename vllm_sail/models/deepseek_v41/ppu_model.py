@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Preserve the V4.1 VL wrapper and adjust weight-scale mapping only for 810E W8A8 instances."""
 
+from contextlib import nullcontext
 from copy import deepcopy
 
+from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v41.nvidia.vl_model import (
     DeepseekV41ForCausalLM as UpstreamDeepseekV41ForCausalLM,
 )
 from vllm.platforms import current_platform
 
 from vllm_sail import envs
+from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
 
 
 def int8_weights_mapper(mapper):
@@ -33,15 +36,14 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         ):
             raise ValueError("V4.1 runtime auditing requires an 810E PPU eager service")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        quant = vllm_config.quant_config
+        self._v41_int8_config = None
         if (
             current_platform.is_ppu()
             and current_platform.is_device_capability((8, 0))
-            and quant is not None
-            and quant.get_name() == "compressed-tensors"
-            and getattr(self.language_model.config, "expert_dtype", None) == "int8"
+            and uses_int8_w8a8(vllm_config)
         ):
             self.hf_to_vllm_mapper = int8_weights_mapper(self.hf_to_vllm_mapper)
+            self._v41_int8_config = vllm_config
         self._v41_audit = None
         if directory:
             from .runtime_audit import RuntimeAudit
@@ -60,6 +62,14 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         forward = super().forward
         args = (input_ids, positions, intermediate_tensors, inputs_embeds)
         kwargs["lookback_token_ids"] = lookback_token_ids
-        if self._v41_audit is None:
-            return forward(*args, **kwargs)
-        return self._v41_audit.run(forward, *args, **kwargs)
+        # profiling 和常规 forward 不保证有初始化配置上下文。
+        # 仅为构造时核验过的 810E W8A8 实例提供作用域配置，退出或异常时恢复。
+        context = (
+            set_current_vllm_config(self._v41_int8_config)
+            if self._v41_int8_config is not None
+            else nullcontext()
+        )
+        with context:
+            if self._v41_audit is None:
+                return forward(*args, **kwargs)
+            return self._v41_audit.run(forward, *args, **kwargs)

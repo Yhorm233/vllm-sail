@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bare-Python regression for a copied constructor using super()."""
+"""Bare-Python regressions for indexer initialization and adaptive dispatch."""
 
 from __future__ import annotations
 
@@ -10,11 +10,91 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.source import assert_accepts_upstream_keywords
+from tests.support.source import assert_accepts_upstream_keywords, function
+from tests.ut import test_ppu_kernel_capabilities as harness
+
+modules = harness.modules
 
 PATCH_PATH = (
     Path(__file__).parents[2] / "vllm_sail/patch/enhancement/attention/mla_indexer.py"
 )
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "ppu,capability,deep_gemm,expected",
+    [
+        (True, 89, True, True),
+        (True, 89, False, False),
+        (False, 90, True, True),
+        (False, 80, True, False),
+    ],
+)
+def test_adaptive_indexer_gate_and_flattening(
+    modules,
+    patch_utils_module,
+    upstream_source_root,
+    ppu,
+    capability,
+    deep_gemm,
+    expected,
+):
+    platform = types.SimpleNamespace(
+        is_ppu=lambda: ppu,
+        is_cuda=lambda: True,
+        is_rocm=lambda: False,
+        is_device_capability_family=lambda value: capability == value,
+    )
+    modules("vllm.platforms", current_platform=platform)
+    modules("torch", float32=object())
+    modules("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: deep_gemm)
+    modules("vllm_sail.patch.utils", patch_value=patch_utils_module.patch_value)
+    builder = type(
+        "DeepseekV32IndexerMetadataBuilder",
+        (),
+        {
+            "__init__": lambda *a, **kw: None,
+            "build": lambda *a, **kw: None,
+            "_split_indexer_prefill_chunks": staticmethod(lambda *a, **kw: None),
+        },
+    )
+    target = modules(
+        "vllm.v1.attention.backends.mla.indexer",
+        DeepseekV32IndexerMetadataBuilder=builder,
+        current_platform=platform,
+        has_deep_gemm=lambda: deep_gemm,
+        get_paged_mqa_logits_metadata=lambda *a, **kw: None,
+        dsa_indexer_uses_fp4=lambda *a: False,
+        native_next_n_supported=lambda n: n in (1, 2),
+    )
+    source = upstream_source_root / "vllm/v1/attention/backends/mla/indexer.py"
+    for name in (
+        "_supports_varlen_paged_mqa_logits",
+        "_supports_flattened_device_query_lens",
+        "_rocm_supports_flattened_device_query_lens",
+        "_supports_native_decode",
+        "_use_flattening",
+    ):
+        function(source, name, target.__dict__)
+    capability_fn = function(
+        source,
+        "DeepseekV32IndexerBackend.supports_device_cpu_query_lens_mismatch",
+        target.__dict__,
+    )
+    harness.load_patch("vllm_sail/patch/enhancement/attention/mla_indexer.py")
+    assert capability_fn(None) is expected
+    # Even next_n=2, normally native, must flatten with adaptive trimming.
+    config = types.SimpleNamespace(
+        num_speculative_tokens=1,
+        model_config=None,
+        speculative_config=types.SimpleNamespace(enable_adaptive_verification=True),
+    )
+    assert target._use_flattening(config) is expected
+    # Ordinary next_n=2 decode must keep its native upstream behavior.
+    config.speculative_config.enable_adaptive_verification = False
+    assert target._use_flattening(config) is False
+    # SAIL does not implement Blackwell's varlen paged-logits interface.
+    assert target._supports_varlen_paged_mqa_logits() is False
 
 
 @pytest.mark.parametrize("subclass", [False, True])

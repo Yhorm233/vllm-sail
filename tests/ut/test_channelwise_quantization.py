@@ -46,8 +46,11 @@ def test_channelwise_matching_with_upstream_fused_layers(
         and isinstance(n.func, ast.Name)
         and n.func.id == "is_layer_skipped"
         and any(
-            isinstance(kw.value, ast.Attribute)
-            and kw.value.attr == "fp8_channelwise_layers"
+            (
+                isinstance(kw.value, ast.Attribute)
+                and kw.value.attr == "fp8_channelwise_layers"
+            )
+            or (isinstance(kw.value, ast.Name) and kw.value.id == "patterns")
             for kw in n.keywords
         )
     )
@@ -56,7 +59,12 @@ def test_channelwise_matching_with_upstream_fused_layers(
         fp8_channelwise_layers=["attn.wq_a", "attn.wkv"],
         packed_modules_mapping={"fused_wqa_wkv": ["wq_a", "wkv"]},
     )
-    namespace = {"self": config, "is_layer_skipped": matcher}
+    namespace = {
+        "self": config,
+        "is_layer_skipped": matcher,
+        "match_mode": "substring",
+        "patterns": config.fp8_channelwise_layers,
+    }
     for prefix in (
         "model.layers.0.attn.fused_wqa_wkv",
         "model.mtp.1.attn.fused_wqa_wkv",
@@ -64,7 +72,9 @@ def test_channelwise_matching_with_upstream_fused_layers(
         namespace.update(prefix=prefix, layer_name=prefix)
         assert eval(expression, namespace)
     config.fp8_channelwise_layers = ["attn.unrelated"]
+    namespace["patterns"] = config.fp8_channelwise_layers
     assert not eval(expression, namespace)
     config.fp8_channelwise_layers = ["attn.wq_a"]
+    namespace["patterns"] = config.fp8_channelwise_layers
     with pytest.raises(ValueError, match="some but not all shards"):
         eval(expression, namespace)

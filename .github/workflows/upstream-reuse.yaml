@@ -16,13 +16,11 @@ name: Upstream test reuse gate
 #
 # 2. nightly-ppu-reuse (schedule / manual): runs the FULL reuse set
 #    (-m upstream_source, which also includes the `ppu`-marked device-only
-#    entries) on real ZW-810E and ZW-890P lanes via ppu-scheduler-action.
+#    entries) on real ZW-810E and ZW-M890P lanes via ppu-scheduler-action.
 #
-# Runner label assumption (MUST confirm with infra), mirroring e2e-ppu.yaml:
-#   810E: board-type=OAM-810E  (existing label)
-#   890P: board-type=OAM-890P  (PLACEHOLDER -- the 890P label must be registered
-#         on the k8s PPU node pool before nightly can schedule; if the real
-#         label differs, update the matrix include entry for 890p.)
+# Runner labels (confirmed with infra), shared with the PR49 PPU workflows:
+#   810E: board-type=OAM-810E
+#   M890P: board-type=ZW-M890P
 
 on:
   pull_request:
@@ -170,9 +168,8 @@ jobs:
           - chip: 810e
             board: OAM-810E
             nproc: 1
-          # 890P board label is a PLACEHOLDER -- see header comment.
           - chip: 890p
-            board: OAM-890P
+            board: ZW-M890P
             nproc: 1
     steps:
       - name: Disable internal GitHub mirror rewrite
@@ -222,7 +219,6 @@ jobs:
           nnodes: 0
           nproc_per_node: ${{ matrix.nproc }}
           namespace: ppu-sched
-          # 890P board label is a PLACEHOLDER -- see header comment.
           node_selector: board-type=${{ matrix.board }}
           timeout_minutes: 60
           cleanup_policy: always

@@ -22,8 +22,9 @@ Plugin headers resolve within that directory before searching upstream headers.
 
 The upstream generator uses [sailify](https://github.com/t-head/sailify) and
 declared transformations to produce HGGC build inputs. Upstream source
-filenames are retained for traceability; CMake assigns device sources to the HG
-language. Edit upstream inputs or transformations, then regenerate. Never
+filenames are retained except that compiled `.cu` sources become `.hg`, so
+CMake's HG language compiles every translation unit directly. Edit upstream
+inputs or transformations, then regenerate. Never
 hand-edit the generated upstream corpus or `excluded_ops.toml`; its manifest
 is the editable file inside `csrc/upstream/`.
 
@@ -58,19 +59,22 @@ only after regeneration, compilation and device correctness checks pass.
 | Variable | Meaning |
 | --- | --- |
 | `PPU_SDK` | SDK root, including HGGC headers, runtime libraries and `bin/hgcc` |
-| `HGCC` | Explicit compiler path; takes precedence over SDK and `PATH` discovery |
+| `HGCC` | Explicit compiler path; takes precedence over SDK and `PATH` discovery. A path that is not a file fails the build gate instead of falling back |
 | `CMAKE_HGCC_DIR` | Optional path to a cmake-hgcc checkout; without usable local modules or an installed package, CMake fetches the pinned upstream revision |
 | `PYTORCH_SAIL_ARCH` | Architecture list; default `ppu_15;ppu_10` |
 | `VLLM_SAIL_HG_ARCH` | Plugin architecture list; must select the same targets as `PYTORCH_SAIL_ARCH` when both are nonempty |
 | `VLLM_SAIL_HG_STD` | HG language standard; default `20` |
 | `VLLM_SAIL_HG_FLAGS` | Extra HG compiler flags |
 | `VLLM_SAIL_SKIP_EXT` | Explicitly omit native extensions for Python-only development |
+| `VLLM_SAIL_PREBUILT_EXT_DIR` | Package already built native extensions from this directory without running CMake or `hgcc`; each extension file must appear exactly once. Mutually exclusive with `VLLM_SAIL_SKIP_EXT` |
+| `MAX_JOBS` | Native build parallelism; an explicit setuptools `-j` takes precedence, and the default is the CPU count |
+| `CMAKE_BUILD_TYPE` | CMake build type; default `Release` |
 
 An empty plugin architecture setting uses `PYTORCH_SAIL_ARCH` or the default
 list. An empty standard uses `20`, and empty flags add no options.
 
-Native extensions are enabled by default. The build gate checks for SAIL
-PyTorch's compatibility header, `hgcc` and CMake, and fails with the first
+Native extensions are enabled by default. The build gate checks that PyTorch
+is importable and that `hgcc` and CMake are available, and fails with the first
 missing prerequisite. Only `VLLM_SAIL_SKIP_EXT=1` produces a Python-only
 package. Run the preflight in the installation guide before building a package
 for inference.

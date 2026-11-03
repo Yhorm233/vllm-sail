@@ -19,7 +19,6 @@ from vllm_sail.native import toolchain
 
 HGCC = "/opt/ppu/bin/hgcc"
 CMAKE = "/usr/bin/cmake"
-PPU_COMPAT = "/opt/py/torch/.ppu_compat"
 
 
 def _probe(**overrides: object) -> toolchain.Probe:
@@ -27,7 +26,6 @@ def _probe(**overrides: object) -> toolchain.Probe:
     fields: dict[str, object] = {
         "skip_requested": False,
         "have_torch": True,
-        "ppu_compat": PPU_COMPAT,
         "hgcc": HGCC,
         "cmake": CMAKE,
     }
@@ -69,7 +67,6 @@ def test_decide(probe: toolchain.Probe, build: bool, reason: str) -> None:
     ("probe", "reason"),
     [
         pytest.param(_probe(have_torch=False), "torch", id="no-torch"),
-        pytest.param(_probe(ppu_compat=None), ".ppu_compat", id="torch-without-sail"),
         pytest.param(_probe(hgcc=None), "hgcc", id="no-hgcc"),
         pytest.param(_probe(hgcc=""), "hgcc", id="blank-hgcc"),
         pytest.param(_probe(cmake=None), "cmake", id="no-cmake"),
@@ -94,18 +91,9 @@ def test_skip_request_wins_over_a_complete_toolchain() -> None:
 
 def test_missing_torch_is_reported_before_missing_hgcc() -> None:
     with pytest.raises(toolchain.NativeBuildError) as caught:
-        toolchain.decide(
-            _probe(have_torch=False, ppu_compat=None, hgcc=None, cmake=None)
-        )
+        toolchain.decide(_probe(have_torch=False, hgcc=None, cmake=None))
     assert "torch is not importable" in str(caught.value)
     assert "hgcc" not in str(caught.value)
-
-
-def test_a_non_sail_torch_is_reported_before_missing_hgcc() -> None:
-    with pytest.raises(toolchain.NativeBuildError) as caught:
-        toolchain.decide(_probe(ppu_compat=None, hgcc=None, cmake=None))
-    assert ".ppu_compat" in str(caught.value)
-    assert "hgcc was not found" not in str(caught.value)
 
 
 def test_missing_hgcc_is_reported_before_missing_cmake() -> None:
@@ -169,23 +157,6 @@ def test_find_hgcc_searches_path_last(tmp_path: Path) -> None:
 
 def test_find_hgcc_returns_none_when_nothing_is_installed(nowhere: str) -> None:
     assert toolchain.find_hgcc({"PATH": nowhere}) is None
-
-
-def test_find_ppu_compat_accepts_a_sail_torch(tmp_path: Path) -> None:
-    compat = tmp_path / ".ppu_compat"
-    compat.mkdir()
-    (compat / "compatible_wrapper.h").write_text("#pragma once\n", encoding="utf-8")
-    assert toolchain.find_ppu_compat(tmp_path) == str(compat)
-
-
-def test_find_ppu_compat_rejects_a_torch_without_the_directory(tmp_path: Path) -> None:
-    assert toolchain.find_ppu_compat(tmp_path) is None
-
-
-def test_find_ppu_compat_rejects_a_directory_without_the_header(tmp_path: Path) -> None:
-    # The header is what supplies COMPATIBLE_ARCH; a bare directory is not enough.
-    (tmp_path / ".ppu_compat").mkdir()
-    assert toolchain.find_ppu_compat(tmp_path) is None
 
 
 @pytest.mark.parametrize(
@@ -270,10 +241,10 @@ def test_conflicting_architecture_settings_fail_instead_of_losing_a_target(nowhe
 
 def test_cmake_defines_joins_source_lists_for_cmake(nowhere: str) -> None:
     sources = (
-        "csrc/upstream/libtorch_stable/layernorm_kernels.cu",
-        "csrc/upstream/libtorch_stable/cache_kernels.cu",
+        "csrc/upstream/libtorch_stable/layernorm_kernels.hg",
+        "csrc/upstream/libtorch_stable/cache_kernels.hg",
     )
-    moe_sources = ("csrc/upstream/libtorch_stable/moe/topk_softmax_kernels.cu",)
+    moe_sources = ("csrc/upstream/libtorch_stable/moe/topk_softmax_kernels.hg",)
     defines = toolchain.cmake_defines(sources, moe_sources, {"PATH": nowhere})
     assert defines["PPU_UPSTREAM_EXT_SRC"] == ";".join(sources)
     assert defines["PPU_UPSTREAM_MOE_EXT_SRC"] == ";".join(moe_sources)

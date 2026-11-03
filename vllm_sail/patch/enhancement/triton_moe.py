@@ -879,7 +879,7 @@ def should_moe_wna16_use_cuda(num_valid_tokens, group_size, num_experts, bit):
     if not _has_native_wna16():
         if ppu_envs.VLLM_SAIL_FORCE_MOE_WNA16_CUDA:
             raise NotImplementedError(
-                "PPU moe_wna16_gemm is unavailable; unset VLLM_PPU_FORCE_MOE_WNA16_CUDA to use Triton."
+                "PPU moe_wna16_gemm is unavailable; unset VLLM_SAIL_FORCE_MOE_WNA16_CUDA to use Triton."
             )
         return False
     if ppu_envs.VLLM_SAIL_FORCE_MOE_WNA16_CUDA:

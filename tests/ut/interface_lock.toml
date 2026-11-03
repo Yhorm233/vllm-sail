@@ -11,7 +11,7 @@
 schema = 1
 vllm_version_range = ">=0.31.0,<0.32.0"
 key_interface_count = 10
-target_count = 283
+target_count = 288
 
 [[key_interface]]
 symbol = "vllm.platforms.interface.PlatformEnum"
@@ -1658,6 +1658,14 @@ present = true
 fingerprint = "sha256:3b6b9bb2fe84c843a03700b129fad0fba2e6a429eb7c3008fa43f7236f94c44c"
 
 [[patch_target]]
+name = "vllm.models.deepseek_v41.common.engram._engram_lookup_kernel"
+kind = "module"
+module = "vllm/models/deepseek_v41/common/engram.py"
+symbol = "_engram_lookup_kernel"
+present = true
+fingerprint = "sha256:43e79fb2e801185ca701fa00e89d0e2ee7f913bbcee7cc3e046e463507b685e6"
+
+[[patch_target]]
 name = "vllm.models.deepseek_v41.common.ops.cache_utils.dequantize_and_gather_k_cache"
 kind = "module"
 module = "vllm/models/deepseek_v41/common/ops/cache_utils.py"
@@ -1714,6 +1722,14 @@ present = true
 fingerprint = "sha256:c5668183fc9d6f30db5871fbcf59f0a7ea02e4b481091011c060900f2307fceb"
 
 [[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.dspark._linear_scale_param_name"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/dspark.py"
+symbol = "_linear_scale_param_name"
+present = true
+fingerprint = "sha256:bc15dc888d4f18d5a070bfd7726c770a3de019151590227c63d585a788264374"
+
+[[patch_target]]
 name = "vllm.models.deepseek_v41.nvidia.engram.Engram._create_embedding"
 kind = "class"
 module = "vllm/models/deepseek_v41/nvidia/engram.py"
@@ -1746,6 +1762,14 @@ present = true
 fingerprint = "sha256:97c115636af979ea978c8689cc23873be9299b9099fe6555041a72629063102e"
 
 [[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.model._linear_scale_param_name"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/model.py"
+symbol = "_linear_scale_param_name"
+present = true
+fingerprint = "sha256:b492a49ff768260e6c4ec3cb0b7681f3547adf975d6001efe2bb658b3a953d22"
+
+[[patch_target]]
 name = "vllm.models.deepseek_v41.nvidia.model._select_dsv4_attn_cls"
 kind = "module"
 module = "vllm/models/deepseek_v41/nvidia/model.py"
@@ -1760,6 +1784,14 @@ module = "vllm/models/deepseek_v41/nvidia/model.py"
 symbol = "can_share_engram_tables"
 present = true
 fingerprint = "sha256:d981fad5901903a5d8d85c61d2729033ce8d6cb0af543e2c4a4585e62f8f2baf"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.nvidia.vl_model._linear_scale_param_name"
+kind = "module"
+module = "vllm/models/deepseek_v41/nvidia/vl_model.py"
+symbol = "_linear_scale_param_name"
+present = true
+fingerprint = "sha256:d2312c953dfd3e886ab90b9fa7883c43d4c401d1751357bddc5a4a4d5ac92d8b"
 
 [[patch_target]]
 name = "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention.__init__"
@@ -1840,6 +1872,14 @@ module = "vllm/models/kimi_k3/nvidia/model.py"
 symbol = "KimiRoutedOutputTransform.forward"
 present = true
 fingerprint = "sha256:82d672f98450ec92117cb7a8a39de7cac5e84d99e190614319005ae41e6e7c49"
+
+[[patch_target]]
+name = "vllm.models.qwen4_exp.common.ngram_embedding.Qwen4ExpPLEEmbeddingMethod.from_quant_config"
+kind = "class"
+module = "vllm/models/qwen4_exp/common/ngram_embedding.py"
+symbol = "Qwen4ExpPLEEmbeddingMethod.from_quant_config"
+present = true
+fingerprint = "sha256:577ce4b407f95c19a4fa3d4b3ad1ccba893bf36b037a277a24de9bc70beea69d"
 
 [[patch_target]]
 name = "vllm.platforms.interface.Platform.is_ppu"
@@ -2066,14 +2106,6 @@ present = true
 fingerprint = "sha256:1c2f2ae45efc60979b7a5c7eac8699ea410c88b0a27dffe31053bae6617c53c4"
 
 [[patch_target]]
-name = "vllm.v1.attention.backends.mla.flashmla.FlashMLAImpl.forward_mqa"
-kind = "class"
-module = "vllm/v1/attention/backends/mla/flashmla.py"
-symbol = "FlashMLAImpl.forward_mqa"
-present = true
-fingerprint = "sha256:aa174c6c15259bba787767b01db2cef3c45c7fe6496abff6c1287de139111e01"
-
-[[patch_target]]
 name = "vllm.v1.attention.backends.mla.flashmla.FlashMLAMetadataBuilder.__init__"
 kind = "class"
 module = "vllm/v1/attention/backends/mla/flashmla.py"
@@ -2144,6 +2176,14 @@ module = "vllm/v1/attention/backends/mla/indexer.py"
 symbol = "PPU_FP4_INDEXER_ELEMENT_SIZE"
 present = false
 fingerprint = ""
+
+[[patch_target]]
+name = "vllm.v1.attention.backends.mla.indexer._supports_flattened_device_query_lens"
+kind = "module"
+module = "vllm/v1/attention/backends/mla/indexer.py"
+symbol = "_supports_flattened_device_query_lens"
+present = true
+fingerprint = "sha256:2301eb139f932e897f03177ee36ae5ac8ea74cf502b3bf34de360d0c0176685d"
 
 [[patch_target]]
 name = "vllm.v1.attention.backends.mla.indexer.dsa_indexer_uses_fp4"

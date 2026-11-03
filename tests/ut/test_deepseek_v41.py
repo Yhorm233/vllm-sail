@@ -1,545 +1,604 @@
 # SPDX-License-Identifier: Apache-2.0
-"""V4.1 runtime contract tests without device dependencies."""
+"""V4.1 integration contracts; CPU tests never import torch or vLLM."""
 
-import ast
-import importlib.util
-import re
-import sys
-import types
-from dataclasses import dataclass
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-ROOT = Path(__file__).parents[2]
-BASE = "vllm.models.deepseek_v41"
-PLUGIN = "vllm_sail.models.deepseek_v41"
+from tests.support.source import function
+from tests.ut import test_ppu_kernel_capabilities as harness
+
+modules = harness.modules
+load_patch = harness.load_patch
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("record_bytes", [528, 584])
+def test_cache_gather_dispatch_after_preload(
+    modules, upstream_source_root, ppu, record_bytes
+):
+    calls = []
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
+    modules(
+        "vllm.utils.import_utils", has_cutedsl=lambda: True, has_humming=lambda: True
+    )
+    provider = modules("vllm.utils.import_utils")
+    cache = modules(
+        "vllm.models.deepseek_v41.common.ops.cache_utils",
+        has_cutedsl=provider.has_cutedsl,
+        V41_BYTES_PER_TOKEN=528,
+        V41_NVFP4_BYTES_PER_TOKEN=288,
+        V41_QUANT_BLOCK=32,
+        dequantize_and_gather_k_cache_triton=lambda *a, **kw: calls.append("triton"),
+    )
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl",
+        _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL=lambda **kw: calls.append("cute"),
+    )
+    gather = function(
+        upstream_source_root / "vllm/models/deepseek_v41/common/ops/cache_utils.py",
+        "dequantize_and_gather_k_cache",
+        cache.__dict__,
+    )
+    load_patch("vllm_sail/patch/enhancement/import_gates.py")
+    gather(None, SimpleNamespace(shape=(4, 64, record_bytes)), None, None, None, 64, 3)
+    assert calls == ["triton" if ppu else "cute"]
 
 
 @pytest.fixture
-def installed(monkeypatch, patch_utils_module):
-    modules = {}
-
-    def module(name, **attrs):
-        if name not in modules:
-            obj = types.ModuleType(name)
-            obj.__path__ = []
-            modules[name] = obj
-            monkeypatch.setitem(sys.modules, name, obj)
-            parent, _, leaf = name.rpartition(".")
-            if parent:
-                setattr(module(parent), leaf, obj)
-        modules[name].__dict__.update(attrs)
-        return modules[name]
-
+def quant_module(modules):
     calls = []
 
-    def operation(name):
-        def call(*args, **kwargs):
-            calls.append((name, args, kwargs))
-            return name
+    class Upstream:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
 
-        return call
+        @classmethod
+        def override_quantization_method(cls, *args):
+            calls.append(("recognize", args))
+            return "upstream-method"
 
-    platform = types.SimpleNamespace(ppu=True, capability=(8, 0))
-    platform.is_ppu = lambda: platform.ppu
-    platform.is_device_capability = lambda cap: cap == platform.capability
-    module("vllm.platforms", current_platform=platform)
-    module(
-        "torch",
-        float32="fp32",
-        uint8="uint8",
-        ops=types.SimpleNamespace(
-            vllm=types.SimpleNamespace(
-                ppu_deepseek_v4_dequant_gather=operation("gather810")
-            )
-        ),
+        @classmethod
+        def from_config(cls, config):
+            calls.append(("config", config))
+            return cls()
+
+        def get_quant_method(self, layer, prefix):
+            calls.append(("dispatch", layer, prefix))
+            return "upstream-kernel"
+
+    modules("vllm.models.deepseek_v41.quant_config", DeepseekV4FP8Config=Upstream)
+    modules("vllm.model_executor.layers.fused_moe", RoutedExperts=type("MoE", (), {}))
+    modules(
+        "vllm.model_executor.layers.linear",
+        LinearBase=type("Linear", (), {}),
+        UnquantizedLinearMethod=object,
     )
-    module("vllm_sail.patch.utils", patch=patch_utils_module.patch)
-
-    @dataclass(frozen=True)
-    class Spec:
-        indexer_n_head: int = 64
-        indexer_q_head_dim: int = 128
-        alignment: int = 576
-        tokens_per_state: int = 2
-        block_size: int = 256
-        page_size_padded: int | None = 17280
-
-    class Cache:
-        compress_ratio = 2
-
-        def get_kv_cache_spec(self, config):
-            return Spec()
-
-    class Embedding:
-        lookup = operation("lookup_upstream")
-
-    nvidia = type("NvidiaAttention", (), {})
-    ppu = type("PPUAttention", (), {})
-    module(BASE + ".nvidia.flashmla", DeepseekV4FlashMLAAttention=nvidia)
-    sharing = types.SimpleNamespace(available=True)
-
-    def can_share(layout, block_size=32):
-        return sharing.available
-
-    class Engram:
-        _create_embedding = operation("embedding_upstream")
-
-    config = types.SimpleNamespace(
-        quant_config=types.SimpleNamespace(get_name=lambda: "compressed-tensors"),
-        model_config=types.SimpleNamespace(
-            hf_config=types.SimpleNamespace(
-                model_type="deepseek_v41",
-                quantization_config={
-                    "expert_dtype": "int8",
-                    "format": "int-quantized",
-                    "config_groups": {
-                        "W8A8": {
-                            "targets": ["Linear"],
-                            "weights": dict(
-                                type="int",
-                                num_bits=8,
-                                strategy="channel",
-                                symmetric=True,
-                                dynamic=False,
-                            ),
-                            "input_activations": dict(
-                                type="int",
-                                num_bits=8,
-                                strategy="token",
-                                symmetric=True,
-                                dynamic=True,
-                            ),
-                        },
-                    },
-                },
-            )
-        ),
-        engram_config=types.SimpleNamespace(
-            cpu_offload=True, dp_shared_memory=True, use_thp=False
-        ),
+    modules(
+        "vllm.model_executor.layers.quantization.utils.quant_utils",
+        is_layer_skipped=lambda **kwargs: False,
     )
-    module("vllm.config", get_current_vllm_config=lambda: config)
-    module(BASE + ".nvidia.engram", can_share_engram_tables=can_share, Engram=Engram)
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: True))
+    return load_patch("vllm_sail/models/deepseek_v41/quant_config.py"), calls
 
-    def strict_share(layout, block_size=32):
-        if not sharing.available:
-            raise RuntimeError("fallback to per-rank full tables is forbidden")
-        return True
 
-    module(
-        PLUGIN + ".engram",
-        can_share_engram_tables=strict_share,
-        Int8ParallelEngramEmbedding=operation("embedding810"),
-    )
-    module(
-        BASE + ".nvidia.model",
-        _select_dsv4_attn_cls=lambda config: nvidia,
-        can_share_engram_tables=can_share,
-    )
-    module(PLUGIN + ".flashmla", DeepseekV41FlashMLAAttention=ppu)
-    module(BASE + ".common.engram", ParallelEngramEmbedding=Embedding)
-    q, k, store, gather = [
-        operation(name)
-        for name in ("q_upstream", "k_upstream", "store_upstream", "gather_upstream")
+def test_standard_quantization_delegates_without_rewriting_config(quant_module):
+    module, calls = quant_module
+    cls = module.DeepseekV41FP8Config
+    checkpoint = {"quant_method": "fp8", "weight_block_size": [32, 32]}
+    hf = SimpleNamespace(model_type="deepseek_v41")
+    assert cls.override_quantization_method(checkpoint, None, hf) == "deepseek_v41_fp8"
+    config = cls.from_config(checkpoint)
+    layer = object()
+    assert config.get_quant_method(layer, "model.ffn") == "upstream-kernel"
+    assert calls == [
+        ("recognize", (checkpoint, None, hf)),
+        ("config", checkpoint),
+        ("dispatch", layer, "model.ffn"),
     ]
-    module(
-        "vllm.models.deepseek_v4.common.ops.fused_indexer_q",
-        fused_indexer_q_rope_quant=q,
-    )
-    module(
-        BASE + ".common.ops",
-        fused_indexer_q_rope_quant=q,
-        indexer_k_norm_rope_store=k,
-        dequantize_and_gather_k_cache=gather,
-    )
-    module(BASE + ".common.ops.indexer_k_store", indexer_k_norm_rope_store=k)
-    module(BASE + ".common.ops.fused_compress_quant_cache", rope_quant_insert=store)
-    module(BASE + ".common.ops.cache_utils", dequantize_and_gather_k_cache=gather)
-    module(
-        BASE + ".attention",
-        DeepseekV4IndexerCache=Cache,
-        fused_indexer_q_rope_quant=q,
-        indexer_k_norm_rope_store=k,
-    )
-    module(BASE + ".compressor", rope_quant_insert=store)
-    module(BASE + ".nvidia.prefill", dequantize_and_gather_k_cache=gather)
-    backend = type(
-        "Backend",
-        (),
-        {
-            "get_supported_kernel_block_sizes": staticmethod(
-                lambda kv_cache_spec=None: [128]
-            )
-        },
-    )
-    module("vllm.v1.attention.backends.mla.indexer", DeepseekV41IndexerBackend=backend)
-    module(
-        PLUGIN + ".ops.indexer_tilelang",
-        fused_indexer_q_rope_quant_int8=operation("q810"),
-        indexer_k_norm_rope_store_int8=operation("k810"),
-    )
-    module(PLUGIN + ".ops.latent_store", rope_quant_insert=operation("store810"))
-    module(PLUGIN + ".ops.engram_lookup", lookup=operation("lookup810"))
-    path = ROOT / "vllm_sail/patch/enhancement/models/deepseek_v41.py"
-    spec = importlib.util.spec_from_file_location("_test_v41_patch", path)
-    patched = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(patched)
-    return types.SimpleNamespace(
-        platform=platform,
-        modules=modules,
-        calls=calls,
-        patch=patched,
-        module=module,
-        original_q=q,
-        utils=patch_utils_module,
-        ppu=ppu,
-        nvidia=nvidia,
-        sharing=sharing,
-        config=config,
-    )
-
-
-@pytest.mark.parametrize("consumer", ["common.ops", "attention"])
-def test_query_aliases_and_buffers(installed, consumer):
-    state = installed
-    buffers = (object(), object())
-    fn = state.modules[BASE + "." + consumer].fused_indexer_q_rope_quant
-    assert fn(*range(6), output_buffers=buffers) == "q810"
-    assert state.calls[-1][2]["output_buffers"] is buffers
-    old = state.modules["vllm.models.deepseek_v4.common.ops.fused_indexer_q"]
-    assert old.fused_indexer_q_rope_quant is state.original_q
+    assert calls[1][1] is checkpoint
 
 
 @pytest.mark.parametrize(
-    "consumer", ["common.ops.indexer_k_store", "common.ops", "attention"]
-)
-def test_k_aliases_forward_exact_contract(installed, consumer):
-    fn = installed.modules[BASE + "." + consumer].indexer_k_norm_rope_store
-    assert fn(*range(9)) == "k810"
-    assert installed.calls[-1][1] == tuple(range(9))
-
-
-@pytest.mark.parametrize("ppu,cap", [(False, (8, 0)), (True, (8, 9))])
-def test_non_810e_delegation(installed, ppu, cap):
-    state = installed
-    state.platform.ppu, state.platform.capability = ppu, cap
-    assert state.patch.fused_indexer_q_rope_quant(*range(6)) == "q_upstream"
-    assert "output_buffers" not in state.calls[-1][2]
-    assert state.patch.indexer_k_norm_rope_store(*range(9)) == "k_upstream"
-    assert state.patch.rope_quant_insert(*range(6)) == "store_upstream"
-    assert state.patch.lookup(None, 1, 2) == "lookup_upstream"
-    assert state.patch.select_attention(None) is state.nvidia
-    with pytest.raises(ValueError, match="output_buffers"):
-        state.patch.fused_indexer_q_rope_quant(*range(6), output_buffers=(1, 2))
-
-
-def test_selector_cache_and_engram(installed):
-    state = installed
-    assert state.patch.select_attention(None) is state.ppu
-    assert (
-        state.modules[BASE + ".compressor"].rope_quant_insert(*range(6)) == "store810"
-    )
-    assert state.patch.lookup(None, 1, 2, True) == "lookup810"
-    assert state.calls[-1][1] == (None, 1, 2, True)
-    cache = types.SimpleNamespace(dtype="uint8", shape=(2, 16, 584))
-    assert (
-        state.modules[BASE + ".nvidia.prefill"].dequantize_and_gather_k_cache(
-            0, cache, 2, 3, 4, 16, 0
-        )
-        == "gather810"
-    )
-    cache.shape = (2, 16, 132)
-    with pytest.raises(ValueError, match="584"):
-        state.patch.dequantize_and_gather_k_cache(0, cache, 2, 3, 4, 16, 0)
-
-
-def test_engram_shared_failure_does_not_replicate(installed):
-    state = installed
-    fn = state.modules[BASE + ".nvidia.model"].can_share_engram_tables
-    assert fn(None) is True
-    state.sharing.available = False
-    with pytest.raises(
-        RuntimeError, match="fallback to per-rank full tables is forbidden"
-    ):
-        fn(None)
-    state.platform.ppu = False
-    assert fn(None) is False
-
-
-def test_int8_engram_factory_and_non_quant_isolation(installed):
-    state = installed
-    layout = types.SimpleNamespace(
-        num_embeddings=[123, 456], head_dim=256, primes=[[[60, 63]], [[200, 256]]]
-    )
-    assert state.patch.create_embedding(None, layout, 1) == "embedding810"
-    assert state.calls[-1][1] == (456, 256, (200, 256))
-    assert state.calls[-1][2] == dict(
-        cpu_offload=True, dp_shared_memory=True, use_thp=False
-    )
-    state.config.quant_config = None
-    assert state.patch.create_embedding(None, layout, 1) == "embedding_upstream"
-    state.sharing.available = False
-    assert state.patch.can_share_engram_tables(layout) is False
-
-
-@pytest.mark.parametrize(
-    "field,value",
+    "model_type,architectures",
     [
-        ("type", "float"),
-        ("num_bits", 4),
-        ("strategy", "tensor"),
-        ("symmetric", False),
-        ("dynamic", True),
+        ("deepseek_v41", ["DeepseekV41ForCausalLM"]),
+        ("deepseek_v41_text", []),
+        # SpeculativeConfig verifies this temporary config before rewriting
+        # it to deepseek_v41 / DSparkV41DraftModel.
+        ("deepseek_mtp", ["DeepseekV41ForCausalLM"]),
     ],
 )
-def test_other_compressed_formats_do_not_use_int8_engram(installed, field, value):
-    state = installed
-    raw = state.config.model_config.hf_config.quantization_config
-    raw["config_groups"]["W8A8"]["weights"][field] = value
-    assert state.patch._uses_int8_engram() is False
-    assert state.patch.create_embedding(None, None, 0) == "embedding_upstream"
+def test_qlean_metadata_is_translated_without_editing_checkpoint(
+    quant_module, model_type, architectures
+):
+    module, calls = quant_module
+    cls = module.DeepseekV41FP8Config
+    cls.__bases__[0].override_quantization_method = classmethod(lambda *args: None)
+    checkpoint = {
+        "quant_method": "mxfp4",
+        "expert_dtype": "mxfp4",
+        "fp8_channelwise_layers": ["layers.0.attn.wo_a"],
+        "ignore": ["layers.0.attn.compressor.wkv"],
+    }
+    assert (
+        cls.override_quantization_method(
+            checkpoint,
+            None,
+            SimpleNamespace(model_type=model_type, architectures=architectures),
+        )
+        == "deepseek_v41_fp8"
+    )
+    result = cls.from_config(checkpoint)
+    translated = calls[-1][1]
+    assert translated["quant_method"] == "fp8"
+    assert translated["activation_scheme"] == "dynamic"
+    assert translated["ignored_layers"] == checkpoint["ignore"]
+    assert result.fp8_channelwise_layers == checkpoint["fp8_channelwise_layers"]
+    assert (
+        checkpoint["quant_method"] == "mxfp4" and "activation_scheme" not in checkpoint
+    )
 
 
-def test_metadata_preserves_ratio_alignment(installed):
-    config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(
-            hf_text_config=types.SimpleNamespace(index_n_heads=32, index_head_dim=128)
+@pytest.mark.parametrize("quant_method", ["fp8", "mxfp4"])
+@pytest.mark.parametrize(
+    "ppu,model_type,architectures",
+    [
+        (False, "deepseek_v41", ["DeepseekV41ForCausalLM"]),
+        (True, "deepseek_v4", ["DeepseekV4ForCausalLM"]),
+        (True, "deepseek_v4_text", []),
+        (True, "deepseek_mtp", ["DeepSeekV4MTPModel"]),
+        (True, "deepseek_mtp", ["DeepSeekMTPModel"]),
+        (True, "other", []),
+    ],
+)
+def test_v41_quant_override_leaves_other_models_and_platforms_untouched(
+    quant_module, quant_method, ppu, model_type, architectures
+):
+    module, calls = quant_module
+    module.current_platform.is_ppu = lambda: ppu
+    assert (
+        module.DeepseekV41FP8Config.override_quantization_method(
+            {
+                "quant_method": quant_method,
+                "fp8_channelwise_layers": ["layers.0.attn.wq_a"],
+            },
+            None,
+            SimpleNamespace(model_type=model_type, architectures=architectures),
+        )
+        is None
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize("ppu", [False, True])
+def test_quant_registration_is_lazy_idempotent_and_preserves_v4(modules, ppu):
+    calls = []
+    modules("vllm.logger", init_logger=lambda _: SimpleNamespace(debug=lambda *a: None))
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
+    modules(
+        "vllm.model_executor.layers.quantization",
+        QUANTIZATION_METHODS=[],
+        register_quantization_config=lambda name: lambda cls: calls.append((name, cls)),
+    )
+    mixed = type("Mixed", (), {"get_name": staticmethod(lambda: "mixed_precision_w4")})
+    v4 = type("V4", (), {})
+    v41 = type("V41", (), {"get_name": staticmethod(lambda: "deepseek_v41_fp8")})
+    modules(
+        "vllm_sail.model_executor.layers.quantization.mixed_precision_w4",
+        MixedPrecisionW4Config=mixed,
+    )
+    modules("vllm_sail.models.deepseek_v4.quant_config", DeepseekV4FP8Config=v4)
+    modules("vllm_sail.models.deepseek_v41.quant_config", DeepseekV41FP8Config=v41)
+    registry = load_patch("vllm_sail/registry/quant_config/__init__.py")
+    assert calls == []
+    registry.register()
+    registry.register()
+    assert calls == [("mixed_precision_w4", mixed)] + (
+        [("deepseek_v4_fp8", v4), ("deepseek_v41_fp8", v41)] if ppu else []
+    )
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("quant_method", ["fp8", "deepseek_v4_fp8", "mxfp4"])
+@pytest.mark.parametrize(
+    "model_type,architectures,expected",
+    [
+        ("deepseek_v41", ["DeepseekV41ForCausalLM"], "deepseek_v41_fp8"),
+        ("deepseek_v41_text", [], "deepseek_v41_fp8"),
+        ("deepseek_mtp", ["DeepseekV41ForCausalLM"], "deepseek_v41_fp8"),
+        ("deepseek_v4", ["DeepseekV4ForCausalLM"], "deepseek_v4_fp8"),
+    ],
+)
+def test_upstream_model_config_selects_model_specific_quantization(
+    quant_module,
+    modules,
+    upstream_source_root,
+    quant_method,
+    model_type,
+    architectures,
+    expected,
+):
+    """Exercise upstream recognition and override ordering, not a reimplemented selector."""
+    from typing import Literal, cast, get_args
+
+    module, _ = quant_module
+    cls = module.DeepseekV41FP8Config
+    upstream = modules("vllm.models.deepseek_v41.quant_config").DeepseekV4FP8Config
+    assert cls.__bases__ == (upstream,)
+    upstream.override_quantization_method = classmethod(
+        function(
+            upstream_source_root / "vllm/models/deepseek_v41/quant_config.py",
+            "DeepseekV4FP8Config.override_quantization_method",
+            {},
         )
     )
-    cache = installed.modules[BASE + ".attention"].DeepseekV4IndexerCache()
-    spec = cache.get_kv_cache_spec(config)
-    assert (spec.indexer_n_head, spec.indexer_q_head_dim) == (32, 128)
-    assert (spec.alignment, spec.tokens_per_state) == (576, 2)
-    assert spec.block_size == 128 and spec.page_size_padded is None
-    installed.platform.ppu = False
-    assert cache.get_kv_cache_spec(config).indexer_n_head == 64
+
+    class UpstreamV4(upstream):
+        pass
+
+    UpstreamV4.override_quantization_method = classmethod(
+        function(
+            upstream_source_root / "vllm/models/deepseek_v4/quant_config.py",
+            "DeepseekV4FP8Config.override_quantization_method",
+            {},
+        )
+    )
+    modules("vllm.models.deepseek_v4.quant_config", DeepseekV4FP8Config=UpstreamV4)
+    v4 = load_patch("vllm_sail/models/deepseek_v4/quant_config.py").DeepseekV4FP8Config
+    assert v4.__bases__ == (UpstreamV4,)
+    platform = module.current_platform
+    platform.supported_quantization = ["fp8", "mxfp4", "deepseek_v4_fp8"]
+    verified = []
+    platform.verify_quantization = verified.append
+    registry = {}
+    names = list(platform.supported_quantization)
+    register = function(
+        upstream_source_root / "vllm/model_executor/layers/quantization/__init__.py",
+        "register_quantization_config",
+        {
+            "QUANTIZATION_METHODS": names,
+            "_CUSTOMIZED_METHOD_TO_QUANT_CONFIG": registry,
+            "QuantizationConfig": upstream,
+            "current_platform": platform,
+        },
+    )
+    register(cls.get_name())(cls)
+    assert cls.get_name() in platform.supported_quantization
+    registry["deepseek_v4_fp8"] = v4
+    no_override = SimpleNamespace(override_quantization_method=lambda *a, **kw: None)
+    quant = SimpleNamespace(
+        QUANTIZATION_METHODS=names,
+        QuantizationMethods=Literal["fp8", "mxfp4", "deepseek_v4_fp8"],
+        DEPRECATED_QUANTIZATION_METHODS=[],
+        get_quantization_config=lambda name: registry.get(name, no_override),
+    )
+    verify = function(
+        upstream_source_root / "vllm/config/model.py",
+        "ModelConfig._verify_quantization",
+        {
+            "me_quant": quant,
+            "get_args": get_args,
+            "cast": cast,
+            "current_platform": platform,
+        },
+    )
+    checkpoint = {"quant_method": quant_method}
+    if quant_method == "mxfp4":
+        checkpoint["fp8_channelwise_layers"] = ["layers.0.attn.wq_a"]
+    config = SimpleNamespace(
+        quantization=None,
+        model_arch_config=SimpleNamespace(quantization_config=checkpoint),
+        hf_config=SimpleNamespace(model_type=model_type, architectures=architectures),
+    )
+    verify(config)
+    assert config.quantization == expected
+    assert verified == [expected]
+    assert registry[config.quantization] is (cls if expected == cls.get_name() else v4)
+    assert checkpoint["quant_method"] == quant_method
 
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize(
-    "ppu,capability",
-    [(True, (8, 0)), (True, (8, 9)), (False, (9, 0)), (False, (10, 0))],
+    "model_type",
+    ["deepseek_v4", "deepseek_v4_text", "deepseek_v41", "deepseek_v41_text"],
 )
-@pytest.mark.parametrize("ratio", [1, 2])
-@pytest.mark.parametrize("manager_block", [128, 256])
-def test_real_indexer_spec_and_kernel_selection(
-    installed, upstream_source_root, ppu, capability, ratio, manager_block
-):
-    from tests.support.source import function
-
-    @dataclass(frozen=True)
-    class Spec:
-        block_size: int
-        num_kv_heads: int
-        head_size: int
-        dtype: object
-        tokens_per_state: int
-        alignment: int
-        block_stride_alignment: int | None = None
-        page_size_padded: int | None = None
-        indexer_n_head: int = 64
-        indexer_q_head_dim: int = 128
-
-        def __post_init__(self):
-            if self.page_size_padded is None:
-                size = self.block_size // self.tokens_per_state * self.head_size
-                object.__setattr__(
-                    self,
-                    "page_size_padded",
-                    -(-size // self.alignment) * self.alignment,
-                )
-
-    state = installed
-    state.platform.ppu, state.platform.capability = ppu, capability
-    state.platform.is_device_capability_family = lambda value: (
-        capability[0] * 10 == value
-    )
-    state.patch._spec = function(
-        upstream_source_root / "vllm/models/deepseek_v41/attention.py",
-        "DeepseekV4IndexerCache.get_kv_cache_spec",
-        {
-            "MLAAttentionSpec": Spec,
-            "_use_v41_mxfp8_kv_record": lambda: capability == (10, 0),
-        },
-    )
-    state.patch._kernel_sizes = function(
-        upstream_source_root / "vllm/v1/attention/backends/mla/indexer.py",
-        "DeepseekV41IndexerBackend.get_supported_kernel_block_sizes",
-        {"current_platform": state.platform},
-    )
-    cache = types.SimpleNamespace(
-        cache_config=types.SimpleNamespace(block_size=manager_block),
-        compress_ratio=ratio,
-        head_dim=132,
-        dtype="uint8",
-        sparse_logits=False,
-    )
-    config = types.SimpleNamespace(
-        cache_config=types.SimpleNamespace(cache_dtype="fp8_ds_mla"),
-        model_config=types.SimpleNamespace(
-            hf_text_config=types.SimpleNamespace(index_n_heads=32, index_head_dim=128)
-        ),
-    )
-    before = state.patch._spec(cache, config)
-    spec = state.patch.get_kv_cache_spec(cache, config)
-    backend = state.modules[
-        "vllm.v1.attention.backends.mla.indexer"
-    ].DeepseekV41IndexerBackend
-    select = function(
-        upstream_source_root / "vllm/v1/worker/utils.py",
-        "select_common_block_size",
-        {"MultipleOf": type("MultipleOf", (), {})},
-    )
-    selected = select(spec.block_size, [backend])
-    if ppu and capability == (8, 0):
-        assert selected == spec.block_size == 64 * ratio
-        assert spec.block_size // spec.tokens_per_state == 64
-        assert spec.page_size_padded == 8640
-        assert (spec.indexer_n_head, spec.indexer_q_head_dim) == (32, 128)
-    else:
-        assert spec == before
-        assert selected == (64 if capability == (9, 0) else 128)
-    assert cache.cache_config.block_size == manager_block
-
-
-def test_early_late_import_and_idempotent_rebinding(installed):
-    state = installed
-    late = state.module(BASE + ".late_consumer")
-    exec(
-        "from vllm.models.deepseek_v41.common.ops import fused_indexer_q_rope_quant",
-        late.__dict__,
-    )
-    assert late.fused_indexer_q_rope_quant is state.patch.fused_indexer_q_rope_quant
-    state.patch._rebind_aliases()
-    state.patch._rebind_aliases()
-    other = object()
-    state.modules[BASE + ".attention"].fused_indexer_q_rope_quant = other
-    state.patch._rebind_aliases()
-    assert state.modules[BASE + ".attention"].fused_indexer_q_rope_quant is other
-
-
-def test_patch_marker_metadata_and_duplicate_rejection(installed):
-    state = installed
-    fn = state.patch.fused_indexer_q_rope_quant
-    target = BASE + ".common.ops.fused_indexer_q_rope_quant"
-    assert getattr(fn, state.utils.PATCH_MARKER)[target] is state.original_q
-    records = [r for r in state.utils.PATCH_REGISTRY if r.target.startswith(BASE)]
-    assert len(records) >= 10
-    assert all(r.reason and r.affected_versions and r.remove_when for r in records)
-    with pytest.raises(RuntimeError, match="already patched"):
-        state.utils.patch(
-            BASE + ".common.ops", "fused_indexer_q_rope_quant", **state.patch._METADATA
-        )(fn)
-
-
-def test_install_order_and_lazy_registration():
-    source = (ROOT / "vllm_sail/patch/enhancement/models/__init__.py").read_text()
-    tree = ast.parse(source)
-    names = [
-        a.name
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom)
-        for a in node.names
-    ]
-    assert names.index("deepseek_v41") < names.index("deepseek_v4")
-    scope = {"__name__": "_test_v41_registry"}
-    exec(
-        compile((ROOT / "vllm_sail/models/__init__.py").read_text(), "models", "exec"),
-        scope,
+def test_upstream_recognizes_target_and_text_configs(upstream_source_root, model_type):
+    recognize = function(
+        upstream_source_root / "vllm/models/deepseek_v41/quant_config.py",
+        "DeepseekV4FP8Config.override_quantization_method",
+        {},
     )
     assert (
-        scope["_REQUIRED_PPU_MODELS"]["DeepseekV41ForCausalLM"]
-        == PLUGIN + ".ppu_model:DeepseekV41ForCausalLM"
+        recognize(
+            object,
+            {"quant_method": "fp8"},
+            None,
+            SimpleNamespace(model_type=model_type),
+        )
+        == "deepseek_v4_fp8"
     )
-    assert scope["_registered"] is False
 
 
-def test_int8_sharing_uses_actual_free_bytes_and_margin():
-    tree = ast.parse((ROOT / "vllm_sail/models/deepseek_v41/engram.py").read_text())
-    node = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "can_share_engram_tables"
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
+def test_upstream_mxfp4_dispatch_preserves_target_and_draft_moe(
+    upstream_source_root, modules, experts, topk
+):
+    class RoutedExperts:
+        moe_config = SimpleNamespace(num_experts=experts, experts_per_token=topk)
+
+    expected = object()
+    modules(
+        "vllm.model_executor.layers.quantization.mxfp4",
+        Mxfp4MoEMethod=lambda cfg: expected,
     )
-    required = (384006168 + 384016682) * 260
-    margin = max(8 * 1024**3, (required + 9) // 10)
-    available = types.SimpleNamespace(free=required + margin)
-    group = types.SimpleNamespace(size=16)
-    scope = dict(
-        os=types.SimpleNamespace(path=types.SimpleNamespace(isdir=lambda path: True)),
-        shutil=types.SimpleNamespace(disk_usage=lambda path: available),
-        get_engram_dp_size=lambda: group.size,
-        SHM_PATH="/shared",
+    dispatch = function(
+        upstream_source_root / "vllm/models/deepseek_v41/quant_config.py",
+        "DeepseekV4FP8Config.get_quant_method",
+        {
+            "LinearBase": type("Linear", (), {}),
+            "RoutedExperts": RoutedExperts,
+            "is_layer_skipped": lambda **kwargs: False,
+            "Mxfp4MoEMethod": lambda cfg: (expected, cfg),
+        },
     )
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "engram", "exec"), scope)
-    layout = types.SimpleNamespace(num_embeddings=[384006168, 384016682], head_dim=256)
-    assert scope["can_share_engram_tables"](layout)
-    available.free -= 1
-    with pytest.raises(RuntimeError, match="insufficient capacity"):
-        scope["can_share_engram_tables"](layout)
-    available.free += 1
-    group.size = 1
-    with pytest.raises(
-        RuntimeError, match="fallback to per-rank full tables is forbidden"
-    ):
-        scope["can_share_engram_tables"](layout)
-
-
-def test_int8_mapper_is_local_and_preserves_engram():
-    tree = ast.parse((ROOT / "vllm_sail/models/deepseek_v41/ppu_model.py").read_text())
-    node = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "int8_weights_mapper"
+    config = SimpleNamespace(
+        ignored_layers=[],
+        packed_modules_mapping={},
+        expert_dtype="fp4",
+        moe_quant_algo="",
     )
-    import copy
+    layer = RoutedExperts()
+    assert dispatch(config, layer, "model.ffn.experts") == (expected, layer.moe_config)
 
-    scope = {"deepcopy": copy.deepcopy}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "mapper", "exec"), scope)
-    engram = re.compile(r"engram\.embed_tokens\.scale$")
-    dense = re.compile(r"\.scale$")
-    original = types.SimpleNamespace(
-        orig_to_new_regex={
-            engram: "engram.embed_tokens.weight_scale_inv",
-            dense: ".weight_scale_inv",
-        }
+
+def test_v41_selector_preserves_cuda_and_other_backends(modules):
+    upstream, ppu, other = (type(name, (), {}) for name in ("Upstream", "PPU", "Other"))
+    platform = SimpleNamespace(ppu=True)
+    modules(
+        "vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: platform.ppu)
     )
-    mapped = scope["int8_weights_mapper"](original)
-    assert mapped is not original
-    assert mapped.orig_to_new_regex[engram] == original.orig_to_new_regex[engram]
-    assert mapped.orig_to_new_regex[dense] == ".weight_scale"
-    assert original.orig_to_new_regex[dense] == ".weight_scale_inv"
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=upstream
+    )
+    modules("vllm_sail.models.deepseek_v41.flashmla", DeepseekV41FlashMLAAttention=ppu)
+
+    def original(config):
+        return config
+
+    provider = modules(
+        "vllm.models.deepseek_v41.nvidia.model",
+        _select_dsv4_attn_cls=original,
+        _linear_scale_param_name=lambda *args: "weight_scale_inv",
+    )
+    original_scale = provider._linear_scale_param_name
+    draft = modules(
+        "vllm.models.deepseek_v41.nvidia.dspark",
+        _linear_scale_param_name=original_scale,
+    )
+    vl = modules(
+        "vllm.models.deepseek_v41.nvidia.vl_model",
+        _linear_scale_param_name=original_scale,
+    )
+    replacement = load_patch("vllm_sail/patch/enhancement/models/deepseek_v41.py")
+    assert provider._select_dsv4_attn_cls is replacement._select_dsv4_attn_cls
+    marker = getattr(provider._select_dsv4_attn_cls, replacement.PATCH_MARKER)
+    assert marker[replacement._TARGET] is original
+    assert provider._select_dsv4_attn_cls(upstream) is ppu
+    assert provider._select_dsv4_attn_cls(other) is other
+    config = SimpleNamespace(
+        quant_config=SimpleNamespace(fp8_channelwise_layers=["attn.wo_a"])
+    )
+    assert (
+        draft._linear_scale_param_name
+        is vl._linear_scale_param_name
+        is provider._linear_scale_param_name
+    )
+    assert draft._linear_scale_param_name(config, "fp4") == "weight_scale"
+    platform.ppu = False
+    assert provider._select_dsv4_attn_cls(upstream) is upstream
+    assert draft._linear_scale_param_name(config, "fp4") == "weight_scale_inv"
+    with pytest.raises(RuntimeError, match="already patched"):
+        load_patch("vllm_sail/patch/enhancement/models/deepseek_v41.py")
 
 
-def test_cudart_loading_is_lazy_and_cached_by_sdk(monkeypatch):
-    import ctypes
-
+@pytest.mark.parametrize("dequant_at_load", [True, False])
+def test_v41_projection_preserves_weights_and_uses_bf16_helper(
+    modules, dequant_at_load
+):
     calls = []
-    handles = []
-
-    def load(path, mode):
-        calls.append((path, mode))
-        handle = object()
-        handles.append(handle)
-        return handle
-
-    monkeypatch.setattr(ctypes, "CDLL", load)
-    spec = importlib.util.spec_from_file_location(
-        "_test_v41_cudart", ROOT / "vllm_sail/utils/cudart.py"
+    loaded = SimpleNamespace(element_size=lambda: 2 if dequant_at_load else 1)
+    bf16 = loaded if dequant_at_load else object()
+    modules(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
+        dequant_mxfp8_to_bf16=lambda *args: bf16,
     )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert not calls
-    monkeypatch.setenv("PPU_SDK", "/sdk/one")
-    first = module.load_sdk_cudart()
-    assert module.load_sdk_cudart() is first
-    monkeypatch.setenv("PPU_SDK", "/sdk/two")
-    second = module.load_sdk_cudart()
-    assert second is not first
-    assert module.load_sdk_cudart() is second
-    assert calls == [
-        ("/sdk/one/CUDA_SDK/lib64/libcudart.so", ctypes.RTLD_GLOBAL),
-        ("/sdk/two/CUDA_SDK/lib64/libcudart.so", ctypes.RTLD_GLOBAL),
-    ]
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.o_proj",
+        deep_gemm_fp8_o_proj=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    class Upstream:
+        forward_mqa = object()
+        _forward_prefill = object()
+
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
+    )
+    modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=object)
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=object)
+    modules("torch", int8="int8")
+    modules("vllm.config", get_current_vllm_config=lambda: None)
+    modules("vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=lambda config: False)
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: True, is_device_capability=lambda cap: False
+        ),
+    )
+    module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
+    attn = module.DeepseekV41FlashMLAAttention()
+    attn.__dict__.update(
+        _o_proj_block_size=32,
+        wo_a=SimpleNamespace(weight=loaded, weight_scale=object()),
+        wo_b=object(),
+        rotary_emb=SimpleNamespace(cos_sin_cache=object()),
+        n_local_groups=2,
+        n_local_heads=16,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        o_lora_rank=1024,
+    )
+    o, pos = object(), object()
+    attn._o_proj(o, pos)
+    args, kwargs = calls.pop()
+    assert args[:2] == (o, pos) and args[3].weight is bf16 and args[4] is attn.wo_b
+    assert kwargs["heads_per_group"] == 8 and kwargs["einsum_recipe"] == (1, 1, 32)
+    assert attn.wo_a.weight is loaded
+    assert attn.forward_mqa is Upstream.forward_mqa
+    assert attn._forward_prefill is Upstream._forward_prefill
+
+
+@pytest.mark.parametrize(
+    "ppu,capability,contract",
+    [
+        (True, (8, 0), True),
+        (True, (8, 0), False),
+        (True, (8, 9), True),
+        (False, (8, 0), True),
+    ],
+)
+def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, contract):
+    calls = []
+
+    class Upstream:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return 64
+
+        def _o_proj(self, *args):
+            calls.append(("upstream", args, {}))
+            return "upstream"
+
+    class Backend:
+        @classmethod
+        def supports_compute_capability(cls, cap):
+            return cap.major in (9, 10)
+
+    class PPUV4:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return heads
+
+        def _o_proj(self, *args):
+            calls.append(("ppuv4", args, {}))
+            return "ppuv4"
+
+    class Output:
+        def __getitem__(self, slices):
+            assert slices == (slice(None), slice(None, 8))
+            return "actual_heads"
+
+    def int8(*args, **kw):
+        calls.append(("int8", args, kw))
+        return "int8"
+
+    modules("torch", int8="int8")
+    modules("vllm.config", get_current_vllm_config=lambda: object())
+    modules(
+        "vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=lambda config: contract
+    )
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: ppu, is_device_capability=lambda cap: cap == capability
+        ),
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
+        dequant_mxfp8_to_bf16=lambda *args: None,
+    )
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.o_proj",
+        deep_gemm_fp8_o_proj=lambda *args: None,
+    )
+    modules("vllm_sail.models.deepseek_v4.ops.o_proj", deep_gemm_int8_o_proj=int8)
+    modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=PPUV4)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
+    )
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=Backend)
+    module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
+    cls = module.DeepseekV41FlashMLAAttention
+    attn = cls()
+    attn.__dict__.update(
+        _o_proj_block_size=128,
+        wo_a=SimpleNamespace(weight=SimpleNamespace(dtype="int8")),
+        _wo_b_proj=object(),
+        rotary_emb=SimpleNamespace(cos_sin_cache=object()),
+        n_local_groups=2,
+        n_local_heads=8,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        o_lora_rank=1024,
+    )
+    expected = (
+        "int8"
+        if ppu and capability == (8, 0) and contract
+        else "ppuv4"
+        if ppu
+        else "upstream"
+    )
+    assert attn._o_proj(Output(), object()) == expected
+    if expected == "int8":
+        _, args, kw = calls[-1]
+        assert (
+            args[0] == "actual_heads"
+            and args[3] is attn.wo_a
+            and args[4] is attn._wo_b_proj
+        )
+        assert kw["einsum_recipe"] == (1, 1, 128) and kw["heads_per_group"] == 4
+        with pytest.raises(ValueError, match="实际 head"):
+            cls.get_padded_num_q_heads(16)
+    assert cls.get_padded_num_q_heads(8) == (8 if ppu else 64)
+    backend = module.PPUDeepseekV41FlashMLABackend
+    assert backend.supports_compute_capability(SimpleNamespace(major=8, minor=0)) is ppu
+    assert backend.supports_compute_capability(SimpleNamespace(major=9, minor=0))
+
+
+def test_v41_draft_inherits_its_own_loader_and_execution(modules):
+    class Upstream:
+        load_weights = object()
+        forward = object()
+
+    class SupportsQuant:
+        pass
+
+    mapper_args = []
+    mapper = object()
+
+    def make_mapper(*args):
+        mapper_args.append(args)
+        return mapper
+
+    modules("vllm.model_executor.models.interfaces", SupportsQuant=SupportsQuant)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.dspark", DSparkDeepseekV4ForCausalLM=Upstream
+    )
+    modules(
+        "vllm.models.deepseek_v41.nvidia.model",
+        _make_deepseek_v4_weights_mapper=make_mapper,
+    )
+    draft = load_patch(
+        "vllm_sail/models/deepseek_v41/dspark.py"
+    ).DSparkDeepseekV41ForCausalLM
+    assert issubclass(draft, SupportsQuant)
+    assert (
+        draft.load_weights is Upstream.load_weights
+        and draft.forward is Upstream.forward
+    )
+    assert draft.hf_to_vllm_mapper is mapper
+    assert mapper_args == [("fp4", "weight_scale")]
+    assert draft.packed_modules_mapping["fused_wqa_wkv"] == ["wq_a", "wkv"]

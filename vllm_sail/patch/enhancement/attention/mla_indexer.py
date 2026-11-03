@@ -117,6 +117,39 @@ patch(
 )(_ppu_paged_metadata)
 
 
+_upstream_supports_flattened_device_query_lens = (
+    _indexer_module._supports_flattened_device_query_lens
+)
+
+
+def _supports_flattened_device_query_lens() -> bool:
+    from vllm.platforms import current_platform
+
+    if current_platform.is_ppu():
+        # Reuse the upstream device-length expansion with one query per row.
+        # This keeps SAIL on fixed-length paged logits (supports_varlen=False)
+        # while allowing adaptive verification to change request boundaries.
+        return _ppu_deep_gemm.is_deep_gemm_supported()
+    return _upstream_supports_flattened_device_query_lens()
+
+
+patch(
+    _MODULE,
+    "_supports_flattened_device_query_lens",
+    reason=(
+        "SAIL fixed-length paged logits can consume the upstream per-token "
+        "expansion, but the upstream SM90 capability gate excludes PPU. "
+        "Override the shared capability helper so adaptive backend admission "
+        "and metadata flattening use the same device-length-aware path."
+    ),
+    affected_versions=_AFFECTED,
+    remove_when=(
+        "upstream delegates flattened device-query-length support to a platform "
+        "hook that the PPU plugin can implement."
+    ),
+)(_supports_flattened_device_query_lens)
+
+
 def _split_indexer_prefill_chunks_body(
     compressed_seq_lens_cpu: torch.Tensor,
     prefill_query_lens_cpu: torch.Tensor,

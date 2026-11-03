@@ -45,27 +45,24 @@ class ChipProfile(NamedTuple):
     fp8: bool
     acext: bool
     bf16_dense_deepgemm: bool
-    tensor_parallel_size: int
 
 
 CHIP_PROFILES: dict[str, ChipProfile] = {
-    # ZW-810E (PPU 1.0): int8/acext path, no fp8, 16-card tensor parallelism.
+    # ZW-810E (PPU 1.0): int8/acext path, no fp8.
     "810e": ChipProfile(
         name="PPU-ZW810E",
         capability=DeviceCapability(8, 0),
         fp8=False,
         acext=True,
         bf16_dense_deepgemm=False,
-        tensor_parallel_size=16,
     ),
-    # ZW-890P (PPU 1.5): fp8/DeepGEMM path, no acext, 8-card tensor parallelism.
+    # ZW-890P (PPU 1.5): fp8/DeepGEMM path, no acext.
     "890p": ChipProfile(
         name="PPU-ZW890P",
         capability=DeviceCapability(8, 9),
         fp8=True,
         acext=False,
         bf16_dense_deepgemm=True,
-        tensor_parallel_size=8,
     ),
 }
 
@@ -387,7 +384,7 @@ def golden_store(request: pytest.FixtureRequest) -> GoldenStore:
 def offline_llm() -> Callable[..., Any]:
     """Thin factory delegating to ``_offline_runner.build_llm``.
 
-    Resolves the real device capability into a chip profile (TP=16 on ZW-810E,
+    Resolves the real device capability into a chip profile (TP=8 on ZW-810E,
     8 on ZW-890P) and hands it to the shared offline runner, which applies the
     fixed model-E2E parameters. Without a real device the factory skips, and
     the runner is imported lazily so collection stays CPU-only.
@@ -416,16 +413,18 @@ def offline_llm() -> Callable[..., Any]:
         capability = _real_device_capability()
         if capability is None:
             pytest.skip("cannot detect the capability of the real device")
-        profile = CHIP_PROFILES[_chip_for_capability(capability)]
+        chip = _chip_for_capability(capability)
+        profile = CHIP_PROFILES[chip]
         from tests.e2e.models._offline_runner import (
             build_llm,
             checkpoint_skip_reason,
             release_llm,
+            tensor_parallel_for_chip,
         )
 
         reason = checkpoint_skip_reason(
             model,
-            tensor_parallel_size=int(profile.tensor_parallel_size),
+            tensor_parallel_size=tensor_parallel_for_chip(chip),
             device_total_bytes=_real_device_total_bytes(),
         )
         if reason is not None:

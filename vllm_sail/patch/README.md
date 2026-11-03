@@ -38,7 +38,7 @@ from vllm_sail.patch.utils import patch
     "vllm.some_module",
     "target_function",
     reason="PPU's foo kernel needs bar; upstream hardcodes baz.",
-    affected_versions=">=0.30.0,<0.31.0",
+    affected_versions=">=0.31.0,<0.32.0",
     remove_when="upstream PR #12345 lands, which makes baz configurable.",
 )
 def target_function(arg: int) -> int:
@@ -48,9 +48,8 @@ def target_function(arg: int) -> int:
 `reason`, `affected_versions` and `remove_when` are **mandatory** and validated at
 import. The [patch manifest](manifest.md) is generated from them by
 `tools/patch_manifest.py`; run it with `--check` to detect stale output.
-`remove_when` must be a *verifiable
-condition* — "when upstream fixes it" is not acceptable; name the PR, the API, or
-the capability.
+`remove_when` must be a *verifiable condition* — "when upstream fixes it" is not
+acceptable; name the PR, the API, or the capability.
 
 ### Prefer delegation over copying a body
 

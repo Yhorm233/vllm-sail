@@ -20,7 +20,7 @@ def test_native_mtp_is_in_the_compiled_corpus_and_cuda_bindings():
 
 def test_hggc_pipeline_copy_has_no_ptx_and_retains_block_synchronization():
     source = (
-        ROOT / "csrc/upstream/libtorch_stable/gdn/fused_gdn_decode_kernel.cu"
+        ROOT / "csrc/upstream/libtorch_stable/gdn/fused_gdn_decode_kernel.hg"
     ).read_text()
     start = source.index("#if defined(__HGGCCC__)", source.index("void cp_async_16b"))
     end = source.index("#else", start)

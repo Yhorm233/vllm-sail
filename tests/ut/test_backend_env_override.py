@@ -214,11 +214,11 @@ def _should_use_fp8_linear(weight_shape=(128, 256)) -> bool:
     return bool(fn("bf16", weight_shape))
 
 
-def _should_use_bf16_linear(chip: str, *, bias: bool) -> bool:
+def _should_use_bf16_linear(chip: str, *, bias: bool, n: int = 64) -> bool:
     platform = platform_double(chip)
     x = types.SimpleNamespace(dtype="bf16", is_contiguous=lambda: True)
     weight = types.SimpleNamespace(
-        dtype="bf16", dim=lambda: 2, is_contiguous=lambda: True
+        dtype="bf16", dim=lambda: 2, shape=(n, 16), is_contiguous=lambda: True
     )
     fn = extract(
         "vllm_sail/utils/deep_gemm.py",

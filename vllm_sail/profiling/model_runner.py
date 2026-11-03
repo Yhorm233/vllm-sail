@@ -126,14 +126,7 @@ def _model_forward(self, *args, **kwargs):
     if scheduler_output is None:
         return _upstream_model_forward(self, *args, **kwargs)
 
-    spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-    total_bs = len(scheduler_output.num_scheduled_tokens)
-    p_bs = sum(
-        1
-        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
-        if num_tokens - len(spec_tokens.get(req_id, ())) > 1
-    )
-    nvtx.range_push(f"total bs={total_bs}, P bs={p_bs}")
+    nvtx.range_push(nvtx.batch_label(scheduler_output))
     try:
         return _upstream_model_forward(self, *args, **kwargs)
     finally:
@@ -159,7 +152,7 @@ def _model_forward(self, *args, **kwargs):
     ),
 )
 def execute_model(self, *args, **kwargs):
-    _instrument_compute_logits(getattr(self, "model", None))
+    nvtx.instrument_compute_logits(getattr(self, "model", None))
     scheduler_output = args[0] if args else kwargs.get("scheduler_output")
     if scheduler_output is not None:
         nvtx.sche_mark(scheduler_output)
@@ -172,24 +165,3 @@ def execute_model(self, *args, **kwargs):
     finally:
         nvtx.range_pop()
         setattr(self, _STASH, None)
-
-
-def _instrument_compute_logits(model):
-    from functools import wraps
-
-    compute_logits = getattr(model, "compute_logits", None)
-    if compute_logits is None or getattr(compute_logits, "_ppu_nvtx_logits", False):
-        return
-
-    @wraps(compute_logits)
-    def traced(hidden_states, *args, **kwargs):
-        nvtx.range_push(
-            f"[FW_GEMM] op:compute_logits,hidden_states:{hidden_states.shape}"
-        )
-        try:
-            return compute_logits(hidden_states, *args, **kwargs)
-        finally:
-            nvtx.range_pop()
-
-    traced._ppu_nvtx_logits = True
-    model.compute_logits = traced

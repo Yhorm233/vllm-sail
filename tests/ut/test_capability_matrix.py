@@ -174,20 +174,10 @@ def test_chip_profile_static_matrix() -> None:
     assert set(CHIP_PROFILES) == {"810e", "890p"}
     e = CHIP_PROFILES["810e"]
     assert (e.name, e.capability) == ("PPU-ZW810E", DeviceCapability(8, 0))
-    assert (e.fp8, e.acext, e.bf16_dense_deepgemm, e.tensor_parallel_size) == (
-        False,
-        True,
-        False,
-        16,
-    )
+    assert (e.fp8, e.acext, e.bf16_dense_deepgemm) == (False, True, False)
     p = CHIP_PROFILES["890p"]
     assert (p.name, p.capability) == ("PPU-ZW890P", DeviceCapability(8, 9))
-    assert (p.fp8, p.acext, p.bf16_dense_deepgemm, p.tensor_parallel_size) == (
-        True,
-        False,
-        True,
-        8,
-    )
+    assert (p.fp8, p.acext, p.bf16_dense_deepgemm) == (True, False, True)
 
 
 def test_device_probe_matches_profile(fake_ppu_platform: FakePPUPlatform) -> None:

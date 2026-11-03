@@ -401,11 +401,11 @@ class PPUDeepGemmFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Base class stores weight as [K, N] (col-major).
         # fp8_gemm_nt channelwise requires row-major [N, K], transpose here.
-        w = layer.weight
+        w = layer.weight.data.t().contiguous()
         replace_parameter(
             layer,
             "weight",
-            torch.nn.Parameter(w.data.t().contiguous(), requires_grad=False),
+            torch.nn.Parameter(w, requires_grad=False),
         )
 
     def apply_scaled_mm(
@@ -461,6 +461,20 @@ class PPUCutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None,
         output_shape: list,
     ) -> torch.Tensor:
+        # PPU MODIFICATION: begin
+        # 810E 的 CUTLASS op 是不支持执行的 stub。保留 FP8 量化输入，
+        # 通过 PyTorch 转换和 FP32 GEMM 计算；scale 和 bias 在最终舍入前应用。
+        if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
+            if As.numel() not in (1, A.shape[0]) or Bs.numel() not in (1, B.shape[1]):
+                raise ValueError(
+                    "810E FP8 linear requires tensor/token and tensor/channel scales"
+                )
+            output = torch.mm(A.float(), B.float())
+            output = output * As.float().reshape(-1, 1) * Bs.float().reshape(1, -1)
+            if bias is not None:
+                output = output + bias.float()
+            return output.to(out_dtype).view(*output_shape)
+        # PPU MODIFICATION: end
         # Fused GEMM_DQ
         output = ops.cutlass_scaled_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias

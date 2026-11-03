@@ -96,7 +96,9 @@ def rope_quant_insert(
         or cos_sin_cache.shape[1] != 64
         or cos_sin_cache.stride(1) != 1
     ):
-        raise ValueError("cos_sin_cache must have shape [positions, 64] with a contiguous last dimension")
+        raise ValueError(
+            "cos_sin_cache must have shape [positions, 64] with a contiguous last dimension"
+        )
     tensors = (latent, positions, cos_sin_cache, kv_cache, slot_mapping)
     if any(not t.is_cuda or t.device != latent.device for t in tensors):
         raise ValueError("All inputs must be on the same device")

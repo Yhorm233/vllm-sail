@@ -10,8 +10,8 @@ support for a specific deployment.
 | Component | Scope |
 | --- | --- |
 | Hardware | Zhenwu 810E and Zhenwu M890 AI chips |
-| Native targets | PPU 1.0 (`ppu_10`) and PPU 1.5 (`ppu_15`) |
-| Bundled tuning data | Configurations include `PPU-ZW810E` (Zhenwu 810E) and `ZW-M890P` (Zhenwu M890); coverage varies by shape and backend |
+| Native targets | PPU 1.0 (`ppu_10`, Zhenwu 810E, compute capability 8.0) and PPU 1.5 (`ppu_15`, Zhenwu M890, compute capability 8.9) |
+| Bundled tuning data | Configurations include `PPU-ZW810` and `PPU-ZW810E` (Zhenwu 810E) and `ZW-M890P` (Zhenwu M890); coverage varies by shape and backend |
 | vLLM | `>=0.31.0,<0.32.0`; generated native sources pinned to v0.31.0 |
 | Python | 3.10–3.13 for the plugin and CPU test matrix; SDK wheel availability determines runtime combinations |
 
@@ -79,6 +79,7 @@ tests do not establish device correctness or full-model support.
 | --- | --- |
 | Dense and MoE models | Upstream vLLM architectures using the applicable PPU operators and backends |
 | DeepSeek V4 | Model, MTP and DSpark registrations, with PPU attention, routing and cache paths |
+| DeepSeek V4.1 | Target and DSpark models with PPU FlashMLA, delayed mHC and mixed-precision quantization |
 | MiniMax M3 | Optional model registrations, quantization mapping and native attention-related operations |
 | Qwen hybrid models | GDN attention and selected quantization and speculative-decoding adaptations |
 | Kimi K3 | KDA attention and native MLA/cache operations |

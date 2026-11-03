@@ -141,3 +141,43 @@ def sche_mark(sche_output: Any) -> None:
     )
     if len(sche_output.finished_req_ids) > 0:
         mark(f"finish_req: {sche_output.finished_req_ids}")
+
+
+def batch_label(sche_output: Any) -> str:
+    """Label of the fork's ``total bs=..., P bs=...`` batch range.
+
+    The prefill/decode split is derived from the scheduler output alone, so
+    both model runners label their forward range identically even though they
+    hand it different arguments.
+    """
+    spec_tokens = sche_output.scheduled_spec_decode_tokens
+    total_bs = len(sche_output.num_scheduled_tokens)
+    p_bs = sum(
+        1
+        for req_id, num_tokens in sche_output.num_scheduled_tokens.items()
+        if num_tokens - len(spec_tokens.get(req_id, ())) > 1
+    )
+    return f"total bs={total_bs}, P bs={p_bs}"
+
+
+def instrument_compute_logits(model: Any) -> None:
+    """Add the fork's shape-aware ``compute_logits`` range to ``model``.
+
+    Called before every forward and idempotent per model, because the model is
+    only available after the weights are loaded. ``model`` may be ``None``
+    (early calls), which is a no-op.
+    """
+    compute_logits = getattr(model, "compute_logits", None)
+    if compute_logits is None or getattr(compute_logits, "_ppu_nvtx_logits", False):
+        return
+
+    @functools.wraps(compute_logits)
+    def traced(hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+        range_push(f"[FW_GEMM] op:compute_logits,hidden_states:{hidden_states.shape}")
+        try:
+            return compute_logits(hidden_states, *args, **kwargs)
+        finally:
+            range_pop()
+
+    traced._ppu_nvtx_logits = True
+    model.compute_logits = traced

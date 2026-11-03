@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""V4.1 delayed mHC: preserve upstream epilogues and use single-split prenorm on 810E.
-
-Function bodies are based on vLLM db9527a46873454610df6dbedf79a36d6bf1a7f6;
-rebind ops.mhc consumers for this baseline without 890P or DSpark adaptations.
-"""
+"""V4.1 delayed mHC: retain upstream epilogues, use PPU prenorm GEMM."""
 
 from __future__ import annotations
 
@@ -17,11 +13,8 @@ from vllm_sail.patch.utils import PATCH_MARKER, patch
 
 _MODULE = "vllm.model_executor.kernels.mhc.tilelang"
 _AFFECTED = ">=0.31.0,<0.32.0"
-_REASON = "810E delayed mHC bypasses shared prenorm and requires zero-initialized single-split SAIL accumulators."
-_REMOVE_WHEN = (
-    "Upstream delayed mHC launchers call a platform-dispatched prenorm helper."
-)
-
+_REASON = "Delayed mHC bypasses the PPU prenorm helper and its zeroed single-split SAIL accumulators."
+_REMOVE_WHEN = "Upstream delayed mHC launchers call a platform-dispatched prenorm helper."
 
 @patch(
     _MODULE,
@@ -117,7 +110,8 @@ def mhc_pre_delayed_tilelang(
     if num_tokens == 0:
         return outputs
 
-    if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
+    # PPU MODIFICATION: begin
+    if current_platform.is_ppu():
         from vllm_sail.patch.enhancement.attention.mhc_tilelang import (
             _hc_prenorm_gemm_outputs,
         )
@@ -127,6 +121,7 @@ def mhc_pre_delayed_tilelang(
         )
         n_splits = mixes.shape[0]
     else:
+        # PPU MODIFICATION: end
         use_deep_gemm = is_deep_gemm_supported()
         n_splits = (
             compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
@@ -350,33 +345,26 @@ def mhc_fused_post_pre_delayed_tilelang(
             hc_mult,
             hidden_size,
         )
-        if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
+        # PPU MODIFICATION: begin
+        if current_platform.is_ppu():
             from vllm_sail.patch.enhancement.attention.mhc_tilelang import (
                 _hc_prenorm_gemm_outputs,
             )
 
             mixes, sqrsum = _hc_prenorm_gemm_outputs(
-                residual_cur.view(num_tokens, input_size),
-                fn,
-                hidden_size=input_size,
-                hc_mult=1,
+                residual_cur.view(num_tokens, input_size), fn, hidden_size=input_size, hc_mult=1
             )
             n_splits = mixes.shape[0]
         else:
+            # PPU MODIFICATION: end
             # The delayed epilogue is compiled per bucketed split count, so the
             # projection has to use the same bucket rather than the raw estimate.
             use_deep_gemm = is_deep_gemm_supported()
             n_splits = (
-                compute_mhc_pre_num_splits(input_size, num_tokens)
-                if use_deep_gemm
-                else 1
+                compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
             )
             mixes = torch.empty(
-                n_splits,
-                num_tokens,
-                mix_size,
-                dtype=torch.float32,
-                device=residual.device,
+                n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
             )
             sqrsum = torch.empty(
                 n_splits, num_tokens, dtype=torch.float32, device=residual.device
@@ -463,7 +451,10 @@ def mhc_fused_post_pre_delayed_tilelang(
 # V4.1 imports these functions by value, including the Mega-mHC fallback.
 _ALIAS_CONSUMERS = {
     "mhc_pre_delayed_tilelang": ("vllm.models.deepseek_v41.nvidia.model",),
-    "mhc_fused_post_pre_delayed_tilelang": ("vllm.models.deepseek_v41.nvidia.ops.mhc",),
+    "mhc_fused_post_pre_delayed_tilelang": (
+        "vllm.models.deepseek_v41.nvidia.ops.mega_mhc",
+        "vllm.models.deepseek_v41.nvidia.ops.mhc",
+    ),
 }
 
 

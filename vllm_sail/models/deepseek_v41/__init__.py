@@ -1,4 +1,2 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PPU model implementations for DeepSeek V4.1."""
-
-__all__: list[str] = []
+"""PPU overrides for the upstream DeepSeek V4.1 CUDA implementation."""

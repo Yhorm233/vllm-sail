@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Run pin/model validation in an isolated CUDA-compatible PPU runtime container.
+# Run pin/model/accuracy validation in an isolated PPU runtime container.
 set -Eeuo pipefail
 
-mode=${1:?Usage: ppu_runtime_container.sh pin-ut|model-test}
+mode=${1:?Usage: ppu_runtime_container.sh pin-ut|model-test|model-accuracy}
 case "${mode}" in
-    pin-ut|model-test) ;;
+    pin-ut|model-test|model-accuracy) ;;
     *) printf 'Unknown runtime mode: %s\n' "${mode}" >&2; exit 2 ;;
 esac
 
@@ -105,36 +105,93 @@ create=(
 )
 create+=("${device_args[@]}")
 
-if [[ "${mode}" == pin-ut ]]; then
-    create+=(
-        --shm-size=8g
-        --env UT_RESULTS_DIR=/artifacts
-        --env VLLM_USE_RUST_FRONTEND=0
-        --env VLLM_USE_RUST_BENCH=0
-        --entrypoint bash "${image_id}"
-        /source/scripts/ci/ppu_pin_ut.sh
-    )
-else
-    : "${MODEL_PATH:?MODEL_PATH is required for model-test}"
-    : "${SERVED_NAME:?SERVED_NAME is required for model-test}"
-    : "${TP_SIZE:?TP_SIZE is required for model-test}"
-    [[ "${MODEL_PATH}" == /nas_aisw/* ]] || {
-        echo "MODEL_PATH must be under /nas_aisw" >&2
-        exit 2
-    }
-    create+=(
-        --shm-size=32g
-        --mount "type=bind,source=/nas_aisw,target=/nas_aisw,readonly"
-        --env MODEL_PATH="${MODEL_PATH}"
-        --env SERVED_NAME="${SERVED_NAME}"
-        --env TP_SIZE="${TP_SIZE}"
-        --env EXTRA_SERVE_FLAGS="${EXTRA_SERVE_FLAGS:-}"
-        --env VLLM_USE_RUST_FRONTEND=0
-        --env VLLM_USE_RUST_BENCH=0
-        --entrypoint bash "${image_id}"
-        /source/scripts/ci/ppu_e2e_smoke.sh
-    )
-fi
+case "${mode}" in
+    pin-ut)
+        create+=(
+            --shm-size=8g
+            --env UT_RESULTS_DIR=/artifacts
+            --env VLLM_USE_RUST_FRONTEND=0
+            --env VLLM_USE_RUST_BENCH=0
+            --entrypoint bash "${image_id}"
+            /source/scripts/ci/ppu_pin_ut.sh
+        )
+        ;;
+    model-test)
+        MODEL_ID=${MODEL_ID:-${MODEL_PATH:-}}
+        : "${MODEL_ID:?MODEL_ID or legacy MODEL_PATH is required for model-test}"
+        : "${HF_HOME:?HF_HOME is required for model-test}"
+        : "${SERVED_NAME:?SERVED_NAME is required for model-test}"
+        : "${TP_SIZE:?TP_SIZE is required for model-test}"
+        hf_home=$(realpath "${HF_HOME}")
+        [[ -d "${hf_home}" ]] || { echo "HF_HOME is not a directory" >&2; exit 2; }
+        [[ "${MODEL_ID}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || {
+            echo "MODEL_ID must be an owner/name Hugging Face ID" >&2
+            exit 2
+        }
+        model_cache="${hf_home}/hub/models--${MODEL_ID//\//--}"
+        [[ -f "${model_cache}/refs/main" ]] || {
+            echo "Offline cache is missing ${MODEL_ID} refs/main" >&2
+            exit 2
+        }
+        model_revision=$(<"${model_cache}/refs/main")
+        model_snapshot=$(realpath "${model_cache}/snapshots/${model_revision}")
+        [[ -d "${model_snapshot}" ]] || {
+            echo "Offline cache snapshot is missing for ${MODEL_ID}" >&2
+            exit 2
+        }
+        create+=(
+            --shm-size=32g
+            --mount "type=bind,source=${hf_home},target=${hf_home},readonly"
+            --env MODEL_ID="${MODEL_ID}"
+            --env HF_HOME="${hf_home}"
+            --env HF_HUB_OFFLINE=1
+            --env TRANSFORMERS_OFFLINE=1
+            --env SERVED_NAME="${SERVED_NAME}"
+            --env TP_SIZE="${TP_SIZE}"
+            --env EXTRA_SERVE_FLAGS="${EXTRA_SERVE_FLAGS:-}"
+            --env VLLM_USE_RUST_FRONTEND=0
+            --env VLLM_USE_RUST_BENCH=0
+        )
+        if [[ "${model_snapshot}" != "${hf_home}"/* ]]; then
+            create+=(--mount "type=bind,source=${model_snapshot},target=${model_snapshot},readonly")
+        fi
+        create+=(
+            --entrypoint bash "${image_id}"
+            /source/scripts/ci/ppu_e2e_smoke.sh
+        )
+        ;;
+    model-accuracy)
+        : "${GSM8K_DATASET_PATH:?GSM8K_DATASET_PATH is required for model-accuracy}"
+        hf_cache=${PPU_CI_HF_HOME:-${HF_HOME:-}}
+        : "${hf_cache:?HF_HOME or PPU_CI_HF_HOME is required for model-accuracy}"
+        : "${MODEL_KEY:?MODEL_KEY is required for model-accuracy}"
+        hf_home=$(realpath "${hf_cache}")
+        gsm8k_dataset=$(realpath "${GSM8K_DATASET_PATH}")
+        [[ -d "${hf_home}" ]] || { echo "HF_HOME is not a directory" >&2; exit 2; }
+        [[ -d "${gsm8k_dataset}" ]] || {
+            echo "GSM8K_DATASET_PATH is not a directory" >&2
+            exit 2
+        }
+        create+=(
+            --shm-size=32g
+            --mount "type=bind,source=${hf_home},target=${hf_home},readonly"
+            --mount "type=bind,source=${gsm8k_dataset},target=${gsm8k_dataset},readonly"
+            --env HF_HOME="${hf_home}"
+            --env HF_HUB_OFFLINE=1
+            --env TRANSFORMERS_OFFLINE=1
+            --env GSM8K_DATASET_PATH="${gsm8k_dataset}"
+            --env MODEL_KEY="${MODEL_KEY}"
+            --env RESULTS_DIR=/artifacts
+            --env UPDATE_GOLDEN="${UPDATE_GOLDEN:-0}"
+            --env THRESHOLD="${THRESHOLD:-0.9}"
+            --env VLLM_PORT="${VLLM_PORT:-9985}"
+            --env VLLM_USE_RUST_FRONTEND=0
+            --env VLLM_USE_RUST_BENCH=0
+            --entrypoint bash "${image_id}"
+            /source/scripts/ci/ppu_e2e_accuracy.sh
+        )
+        ;;
+esac
 
 "${create[@]}" 9>&- >"${artifact_dir}/container-id.txt"
 docker start --attach "${container}" 9>&- 2>&1 | tee "${artifact_dir}/runtime.log"

@@ -22,13 +22,26 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover - exercised only on 3.10
     import tomli as tomllib
 
-__all__ = ["Entry", "Manifest", "ManifestError", "default_manifest_path", "load"]
+__all__ = [
+    "Entry",
+    "Manifest",
+    "ManifestError",
+    "default_manifest_path",
+    "load",
+    "vendored_name",
+]
 
 SCHEMA = 1
 
-# Where the translated corpus lives in this repo. An upstream `csrc/a/b.cu`
-# becomes `csrc/upstream/a/b.cu`, so a vLLM bump stays a path-for-path diff.
+# Translate csrc/a/b.cu to csrc/upstream/a/b.hg.
 VENDOR_ROOT = "csrc/upstream"
+
+
+def vendored_name(upstream_rel: str) -> str:
+    """Map upstream paths to the vendor tree, replacing .cu with .hg."""
+    name = upstream_rel.removeprefix("csrc/")
+    return f"{name[:-3]}.hg" if name.endswith(".cu") else name
+
 
 # Bindings TUs never carry device code but do carry op registrations, so they
 # are compiled alongside the kernels of their own tier.
@@ -64,7 +77,7 @@ class Entry:
     @property
     def vendored(self) -> str:
         """Where the translated copy of this TU lives in this repo."""
-        return f"{VENDOR_ROOT}/{self.path.removeprefix('csrc/')}"
+        return f"{VENDOR_ROOT}/{vendored_name(self.path)}"
 
 
 @dataclass(frozen=True)

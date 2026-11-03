@@ -7,7 +7,7 @@
 # read-only NAS checkpoint mount, and verifies one chat completion end to end.
 #
 # Environment contract (injected by ppu_runtime_container.sh):
-#   MODEL_PATH          absolute checkpoint path (under the auto-mounted NAS)
+#   MODEL_ID            Hugging Face repository ID resolved from the offline cache
 #   SERVED_NAME         served-model-name exposed by vLLM
 #   TP_SIZE             tensor-parallel size (matches the pod's PPU card count)
 #   WHEELS_DIR          directory holding the downloaded *.whl artifacts
@@ -23,7 +23,8 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 unset VLLM_VERSION
 export VLLM_USE_RUST_FRONTEND=0 VLLM_USE_RUST_BENCH=0
 
-MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
+MODEL_ID="${MODEL_ID:?MODEL_ID is required}"
+HF_HOME="${HF_HOME:?HF_HOME is required}"
 WHEELS_DIR="${WHEELS_DIR:?WHEELS_DIR is required}"
 SERVED_NAME="${SERVED_NAME:-model}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -41,7 +42,8 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY || true
 log() { printf '\n=== %s ===\n' "$1"; }
 
 log "environment"
-echo "MODEL_PATH=${MODEL_PATH}"
+echo "MODEL_ID=${MODEL_ID}"
+echo "HF_HOME=${HF_HOME}"
 echo "SERVED_NAME=${SERVED_NAME} TP_SIZE=${TP_SIZE} PORT=${SERVE_PORT}"
 python -c 'import sys; print("python", sys.version)'
 
@@ -87,6 +89,18 @@ PY
 
 log "collect_env"
 python -c "from vllm_sail import collect_env; collect_env()"
+
+log "resolve model path"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+MODEL_PATH=$(python - "${MODEL_ID}" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+print(snapshot_download(repo_id=sys.argv[1], local_files_only=True))
+PY
+) || { echo "ERROR: Cannot resolve model_id '${MODEL_ID}' from HF cache"; exit 1; }
+echo "Resolved model_id '${MODEL_ID}' -> '${MODEL_PATH}'"
+export MODEL_PATH
 
 log "checkpoint"
 test -d "${MODEL_PATH}" || { echo "checkpoint dir missing: ${MODEL_PATH}"; exit 1; }

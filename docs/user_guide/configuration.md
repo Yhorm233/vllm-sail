@@ -32,7 +32,7 @@ application in the allowlist.
 | `VLLM_SAIL_MOE_BACKEND` | Automatic | `deepgemm`, `acext`, `triton` |
 | `VLLM_SAIL_DENSE_BACKEND` | Automatic | `deepgemm`, `acext`, `triton` |
 | `VLLM_SAIL_DENSE_BF16_DEEPGEMM` | `0` | Opt into the PPU 1.5 BF16 dense DeepGEMM path |
-| `VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED` | `1` | Enable the supported fused tensor-parallel MoE path |
+| `VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED` | `0` | Enable the supported fused tensor-parallel MoE path |
 | `VLLM_SAIL_USE_PLA` | `1` | Allow PLA linear-attention paths where available |
 | `VLLM_GDN_DECODE_KERNEL` | `auto` on PPU | `auto`, `cuda`, `pla`, `triton`; selects GDN decode independently of prefill and KDA |
 | `VLLM_SAIL_FUSED_RMSNORM_QUANT` | `0` | Enable supported fused RMSNorm and quantization paths |
@@ -69,7 +69,7 @@ native build and device correctness verification before deployment.
 
 | Variable | Default | Behavior |
 | --- | --- | --- |
-| `VLLM_SAIL_DISABLE_MOE_WNA16_CUDA` | `0` | Disable the native WNA16 MoE path |
+| `VLLM_SAIL_DISABLE_MOE_WNA16_CUDA` | `0` | Disable the native WNA16 MoE path; takes precedence over `VLLM_SAIL_FORCE_MOE_WNA16_CUDA` |
 | `VLLM_SAIL_FORCE_MOE_WNA16_CUDA` | `0` | Request the native WNA16 path; raises if the kernel is unavailable |
 | `VLLM_SAIL_ENABLE_MOE_MARLIN` | `0` | Legacy selection gate; does not enable excluded native Marlin kernels |
 | `VLLM_SAIL_FUSED_GDN_DECODE` | `1` | Legacy getter; dispatch now uses `VLLM_SAIL_USE_PLA` |
@@ -105,6 +105,10 @@ The report includes versions, device information, SDK package availability and
 the PPU environment-variable snapshot. Package presence is a discovery check;
 successful loading and execution require the
 [verification steps](verification_guide.md).
+
+`PPU_SDK` is also read at runtime and defaults to `/usr/local/PPU_SDK`. When
+importing ACEXT fails on an unresolved cuBLAS symbol, the plugin preloads
+`CUDA_SDK/lib64/libcublas.so` from that root and retries.
 
 Build-time settings such as `PPU_SDK`, `HGCC`, `CMAKE_HGCC_DIR` and
 `PYTORCH_SAIL_ARCH` are documented in [HGGC kernels](../developer_guide/kernels.md#build-settings).

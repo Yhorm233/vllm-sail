@@ -1,0 +1,8 @@
+# Unreviewed first-run output.
+#
+# README.md is explicit that a `*.pending-review.json` file never participates in
+# comparison: it only becomes a baseline when a human copies it to
+# `<model>_<chip>.json` or re-runs with `--update-golden`.  Committing it would
+# present raw machine output as a reviewed baseline, so it stays out of the tree
+# -- the same reasoning that makes `_reports/` ignore everything next door.
+*.pending-review.json

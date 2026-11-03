@@ -22,12 +22,20 @@ on:
         description: Exact PR head SHA under test
         type: string
         required: true
+      skip_ppu:
+        description: Report success without allocating PPU runners for non-impacting changes
+        type: boolean
+        default: false
       existing_build_run_id:
         description: Skip build and reuse wheels from this run
         type: string
         default: ""
       wheel_source_sha:
-        description: Validated SAIL source of the reused wheels
+        description: Validated SAIL source of the reused or repackaged wheels
+        type: string
+        default: ""
+      native_reuse_run_id:
+        description: Trusted donor for vLLM and native SAIL extensions
         type: string
         default: ""
   pull_request:
@@ -57,11 +65,12 @@ jobs:
   runtime-image:
     name: Resolve PPU runtime image
     if: >-
-      ${{ github.event_name != 'pull_request' ||
+      ${{ !inputs.skip_ppu &&
+      (github.event_name != 'pull_request' ||
       ((((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'ci-preview')) &&
       !github.event.pull_request.draft &&
-      contains(github.event.pull_request.labels.*.name, 'ci-preview')) }}
+      contains(github.event.pull_request.labels.*.name, 'ci-preview'))) }}
     runs-on: 8-ppu-m890p
     timeout-minutes: 10
     env:
@@ -108,6 +117,7 @@ jobs:
     uses: ./.github/workflows/_ppu-build.yaml
     with:
       pr_head_sha: ${{ inputs.pr_head_sha || github.sha }}
+      native_reuse_run_id: ${{ inputs.native_reuse_run_id || '' }}
 
   pin-unit-tests:
     name: PPU pin UT
@@ -175,6 +185,7 @@ jobs:
       - name: Require every PPU stage to succeed
         env:
           JOB_RESULTS: ${{ toJSON(needs) }}
+          SKIP_PPU: ${{ inputs.skip_ppu }}
           EXISTING_BUILD_RUN_ID: ${{ inputs.existing_build_run_id || '' }}
           WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || '' }}
         run: |
@@ -185,6 +196,16 @@ jobs:
           results = json.loads(os.environ["JOB_RESULTS"])
           for job, result in results.items():
               print(f"{job}: {result['result']}")
+          if os.environ["SKIP_PPU"] == "true":
+              unexpected = {
+                  job: result["result"]
+                  for job, result in results.items()
+                  if result["result"] != "skipped"
+              }
+              if unexpected:
+                  raise SystemExit(f"PPU skip unexpectedly ran jobs: {unexpected}")
+              print("PPU CI skipped: no PPU-impacting changes")
+              raise SystemExit(0)
           runtime_image = results.get("runtime-image", {}).get("result")
           if runtime_image != "success":
               raise SystemExit(f"runtime image preflight did not succeed: {runtime_image}")

@@ -280,9 +280,12 @@ def _fwd_kernel_ep_scatter_2_optimal(
     )
 
     if HAS_EXPERT_MAP:
-        expert_loc = tl.load(expert_map + expert_loc, mask=(expert_loc != -1)).to(
-            expert_loc.dtype
-        )
+        # The masked lanes must materialise -1: tt_mask below reads every lane
+        # of expert_loc, so a skipped lane keeping an undefined value can pass
+        # the >= 0 test and index expert_start_loc out of bounds.
+        expert_loc = tl.load(
+            expert_map + expert_loc, mask=(expert_loc != -1), other=-1
+        ).to(expert_loc.dtype)
     tt_mask = expert_mask & (expert_loc >= 0)
     if tt_mask.sum() == 0:
         return

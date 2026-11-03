@@ -54,6 +54,7 @@ from vllm_sail.utils.deep_gemm import (
     get_mk_alignment_for_contiguous_layout,
     is_deep_gemm_supported,
     m_grouped_bf16_gemm_nt_nopad,
+    m_grouped_fp4_gemm_nt_fused,
     m_grouped_fp4_gemm_nt_nopad,
     m_grouped_fp8_gemm_nt_nopad,
     m_grouped_int8_gemm_nt_nopad,
@@ -849,23 +850,79 @@ class PPUDeepGemmExpertsMXFP4(mk.FusedMoEExpertsModular):
             expert_tokens_meta=expert_tokens_meta,
         )
 
-        a1q_perm = _resize_cache(workspace13.view(dtype=quant_dtype), (M_sum, K))
-        is_block_wise_quant = is_channel_wise_quant = False
-        is_block_wise_quant = self.block_shape is not None
-        is_channel_wise_quant = not is_block_wise_quant
-
-        a1q, a1q_scale, expert_ids, inv_perm, expert_num_tokens = deepgemm_moe_permute(
-            aq=a1q,
-            aq_scale=a1q_scale,
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
-            aq_out=a1q_perm,
-            is_block_wise_quant=is_block_wise_quant,
-            is_channel_wise_quant=is_channel_wise_quant,
+        # The fused path replaces `deepgemm_moe_permute` + nopad GEMM1 by a single
+        # kernel pass (`moe_align_block_size` + gather-read fused GEMM1).
+        use_fused_path = (
+            ppu_envs.VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED
+            and expert_map is None
+            # The fused fp4 MoE kernel only implements the bias-free epilogue.
+            and self.quant_config._w1.bias is None
+            and self.quant_config._w2.bias is None
+            # Fused kernel constraints: K % 16 == 0 and N % 2 == 0.
+            and K % 16 == 0
+            and N % 2 == 0
+            and a1q.is_contiguous()
         )
-        assert a1q.size(0) == M_sum
+
+        if use_fused_path:
+            # ── fused path: moe_align + GEMM1 fused (gather read) ──
+            # The kernel writes the compact rows [0, numel), and M_sum equals
+            # numel for mxfp4 (M alignment 1) when `expert_map` is None.
+            assert M_sum == topk_ids.numel(), (
+                f"fused mxfp4 MoE expects M_sum == numel, got M_sum={M_sum} "
+                f"and numel={topk_ids.numel()}"
+            )
+            logger.info_once("Using PPU DeepGEMM fused moe (mxfp4).")
+            (
+                configs_list,
+                m_rows,
+                expert_ids_and_cumsum,
+                sorted_token_ids,
+                aligned_num_m_blocks,
+                inv_perm,
+                expert_ids,
+            ) = moe_align_block_size(
+                a1q,
+                w1,
+                topk_ids,
+                perchannel_quant=False,
+            )
+            experts_for_rows = m_rows
+            expert_num_tokens = m_rows
+            inv_perm = inv_perm.view(topk_ids.size(0), topk_ids.size(1))
+            # The fused kernel reads a plain contiguous (K-major) uint16 SFA,
+            # while the activation quant emits a column-major scale view.
+            if not a1q_scale.is_contiguous():
+                a1q_scale = a1q_scale.contiguous()
+        else:
+            # ── nopad path: deepgemm_moe_permute + GEMM1 nopad ──
+            a1q_perm = _resize_cache(workspace13.view(dtype=quant_dtype), (M_sum, K))
+            is_block_wise_quant = self.block_shape is not None
+            is_channel_wise_quant = not is_block_wise_quant
+
+            a1q, a1q_scale, expert_ids, inv_perm, expert_num_tokens = (
+                deepgemm_moe_permute(
+                    aq=a1q,
+                    aq_scale=a1q_scale,
+                    topk_ids=topk_ids,
+                    local_num_experts=local_num_experts,
+                    expert_map=expert_map,
+                    expert_tokens_meta=expert_tokens_meta,
+                    aq_out=a1q_perm,
+                    is_block_wise_quant=is_block_wise_quant,
+                    is_channel_wise_quant=is_channel_wise_quant,
+                )
+            )
+            assert a1q.size(0) == M_sum
+
+            # calculate expert_first_token_offset for deepgemm
+            experts_for_rows = torch.zeros(
+                local_num_experts, dtype=torch.int32, device="cuda"
+            )
+            counts = expert_num_tokens
+            min_n = min(counts.size(0), local_num_experts)
+            if min_n > 0:
+                experts_for_rows[:min_n] = counts[:min_n]
 
         mm1_out = _resize_cache(workspace2, (M_sum, N))
 
@@ -881,23 +938,26 @@ class PPUDeepGemmExpertsMXFP4(mk.FusedMoEExpertsModular):
                 )
                 nvtx_pushed = True
 
-        # calculate expert_first_token_offset for deepgemm
-        experts_for_rows = torch.zeros(
-            local_num_experts, dtype=torch.int32, device="cuda"
-        )
-        counts = expert_num_tokens
-        min_n = min(counts.size(0), local_num_experts)
-        if min_n > 0:
-            experts_for_rows[:min_n] = counts[:min_n]
-
-        m_grouped_fp4_gemm_nt_nopad(
-            (a1q, a1q_scale),
-            (w1, self.w1_scale),
-            self.quant_config._w1.bias,
-            mm1_out,
-            expert_ids,
-            experts_for_rows,
-        )
+        if use_fused_path:
+            m_grouped_fp4_gemm_nt_fused(
+                (a1q, a1q_scale),
+                (w1, self.w1_scale),
+                mm1_out,
+                m_rows,
+                expert_ids_and_cumsum,
+                sorted_token_ids,
+                aligned_num_m_blocks,
+                configs_list,
+            )
+        else:
+            m_grouped_fp4_gemm_nt_nopad(
+                (a1q, a1q_scale),
+                (w1, self.w1_scale),
+                self.quant_config._w1.bias,
+                mm1_out,
+                expert_ids,
+                experts_for_rows,
+            )
 
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         if self.gemm1_clamp_limit is not None and activation == MoEActivation.SILU:

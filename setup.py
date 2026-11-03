@@ -19,9 +19,10 @@ Four extensions are produced (see ``CMakeLists.txt``):
 Native extensions are the default. The only Python-only path is an explicit
 opt-out; otherwise the build validates every prerequisite before running CMake:
 
-* ``VLLM_SAIL_SKIP_EXT`` truthy -> pure-Python wheel
-* otherwise                    -> require SAIL torch, its compatibility header,
-                                  hgcc and CMake, then configure and build
+* ``VLLM_SAIL_PREBUILT_EXT_DIR`` -> package four prebuilt native extensions
+* ``VLLM_SAIL_SKIP_EXT`` truthy   -> pure-Python wheel
+* otherwise                      -> require importable torch, hgcc and CMake,
+                                    then configure and build
 
 Missing native prerequisites fail with the first actionable reason. CPU-only
 development and packaging remain available through the explicit opt-out.
@@ -32,6 +33,8 @@ Environment variables:
                           the HGGC toolkit.
 * ``HGCC``                explicit ``hgcc`` path; wins over ``PPU_SDK/bin/hgcc``.
 * ``VLLM_SAIL_SKIP_EXT``  force a pure-Python wheel.
+* ``VLLM_SAIL_PREBUILT_EXT_DIR`` directory containing the four extension files
+                                  to package without invoking CMake/HGCC.
 * ``PYTORCH_SAIL_ARCH``  -> HG and Torch architecture lists (default ``ppu_15;ppu_10``).
 * ``VLLM_SAIL_HG_ARCH``   plugin architecture list; must match ``PYTORCH_SAIL_ARCH``
                          when both are nonempty.
@@ -47,6 +50,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -178,6 +182,32 @@ class _CMakeBuildExt(build_ext):
         subprocess.run(argv, check=True)
 
 
+class _PrebuiltBuildExt(build_ext):
+    """Copy verified native extensions into a wheel without recompiling them."""
+
+    def build_extensions(self) -> None:
+        source_dir = Path(os.environ["VLLM_SAIL_PREBUILT_EXT_DIR"]).resolve()
+        if not source_dir.is_dir():
+            raise RuntimeError(
+                f"prebuilt extension directory does not exist: {source_dir}"
+            )
+        for ext in self.extensions:
+            destination = Path(self.get_ext_fullpath(ext.name)).resolve()
+            matches = [
+                path
+                for path in source_dir.rglob(destination.name)
+                if path.is_file() and path.stat().st_size > 0
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"expected exactly one non-empty prebuilt {destination.name}, "
+                    f"found {len(matches)} in {source_dir}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(matches[0], destination)
+            logger.warning("vllm-sail: reused native extension %s", destination.name)
+
+
 class _SkippedBuildExt(build_ext):
     """No-op ``build_ext`` for the pure-Python wheel.
 
@@ -189,7 +219,20 @@ class _SkippedBuildExt(build_ext):
         return
 
 
-if _toolchain.skip_requested():
+_PREBUILT_EXT_DIR = os.getenv("VLLM_SAIL_PREBUILT_EXT_DIR", "").strip()
+if _PREBUILT_EXT_DIR and _toolchain.skip_requested():
+    raise RuntimeError(
+        "VLLM_SAIL_PREBUILT_EXT_DIR and VLLM_SAIL_SKIP_EXT are mutually exclusive"
+    )
+
+if _PREBUILT_EXT_DIR:
+    logger.warning(
+        "vllm-sail: packaging prebuilt compiled extensions from %s",
+        _PREBUILT_EXT_DIR,
+    )
+    _EXT_MODULES = [Extension(name, sources=[]) for name in _EXT_NAMES]
+    _BUILD_EXT = _PrebuiltBuildExt
+elif _toolchain.skip_requested():
     logger.warning(
         "vllm-sail: building a PURE-PYTHON wheel; compiled extensions skipped "
         "(VLLM_SAIL_SKIP_EXT requests it). PPU kernels will be unavailable until "

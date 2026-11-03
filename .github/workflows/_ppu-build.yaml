@@ -19,6 +19,10 @@ on:
         description: Semicolon-separated HG architectures (blank uses ppu_15;ppu_10)
         type: string
         default: ""
+      native_reuse_run_id:
+        description: Prior trusted run whose vLLM wheel and native SAIL extensions may be reused
+        type: string
+        default: ""
     outputs:
       image:
         description: Build image recorded for downstream tests
@@ -86,7 +90,19 @@ jobs:
         id: image
         run: printf 'image=%s\n' "$VLLM_SAIL_BUILD_IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Build wheels
+      - name: Download native wheel donor
+        if: inputs.native_reuse_run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ inputs.native_reuse_run_id }}
+          path: artifacts/native-reuse
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.native_reuse_run_id }}
+
+      - name: Build or repackage wheels
+        env:
+          VLLM_SAIL_NATIVE_REUSE_DIR: ${{ inputs.native_reuse_run_id != '' && format('{0}/artifacts/native-reuse', github.workspace) || '' }}
         run: bash scripts/ci/build_ppu_wheels.sh
 
       - name: Upload wheels

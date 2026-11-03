@@ -22,6 +22,19 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
     import tomli as tomllib
 
+LICENSE_FILES = {"LICENSE", "LICENSES/PyTorch.txt", "THIRD_PARTY_NOTICES.md"}
+
+
+def _assert_wheel_licenses(archive: zipfile.ZipFile, root: Path) -> None:
+    metadata = Parser().parsestr(
+        archive.read("vllm_sail-0.0.0.dist-info/METADATA").decode()
+    )
+    assert metadata["License-Expression"] == "Apache-2.0 AND BSD-3-Clause"
+    assert sorted(metadata.get_all("License-File")) == sorted(LICENSE_FILES)
+    for name in LICENSE_FILES:
+        packaged = f"vllm_sail-0.0.0.dist-info/licenses/{name}"
+        assert archive.read(packaged) == (root / name).read_bytes()
+
 
 def test_every_runtime_json_matches_explicit_package_data() -> None:
     """A wheel must carry every tuned config consumed at runtime."""
@@ -85,9 +98,7 @@ def test_sdist_includes_the_native_build_inputs() -> None:
 
     assert "include CMakeLists.txt" in manifest_in
     assert "recursive-include cmake *.cmake" in manifest_in
-    assert (
-        "recursive-include csrc *.cpp *.cu *.cuh *.hg *.h *.hpp *.toml" in manifest_in
-    )
+    assert "recursive-include csrc *.cpp *.cuh *.hg *.h *.hpp *.toml" in manifest_in
     assert "recursive-include requirements *.txt" in manifest_in
 
 
@@ -181,6 +192,7 @@ def test_built_wheel_and_sdist_are_self_contained(tmp_path: Path) -> None:
         )
         assert metadata["Name"] == "vllm-sail"
         assert metadata["Version"] == "0.0.0"
+        _assert_wheel_licenses(archive, root)
         config_paths = {
             path.relative_to(root).as_posix()
             for path in (root / "vllm_sail").rglob("*.json")
@@ -189,8 +201,12 @@ def test_built_wheel_and_sdist_are_self_contained(tmp_path: Path) -> None:
 
     with tarfile.open(sdist) as archive:
         sdist_names = set(archive.getnames())
+        for name in LICENSE_FILES:
+            member = archive.extractfile(f"vllm_sail-0.0.0/{name}")
+            assert member is not None
+            assert member.read() == (root / name).read_bytes()
     prefix = next(name.split("/", 1)[0] for name in sdist_names if "/" in name)
-    native_suffixes = {".cpp", ".cu", ".cuh", ".hg", ".h", ".hpp", ".toml"}
+    native_suffixes = {".cpp", ".cuh", ".hg", ".h", ".hpp", ".toml"}
     required_build_inputs = {
         f"{prefix}/{path.relative_to(root).as_posix()}"
         for path in (root / "csrc").rglob("*")
@@ -309,3 +325,94 @@ assert 'torch' not in sys.modules and 'vllm' not in sys.modules
     )
     with zipfile.ZipFile(rebuilt / wheel.name) as archive:
         assert set(archive.namelist()) == wheel_names
+
+
+def test_prebuilt_extension_mode_repackages_current_python_without_cmake(
+    tmp_path: Path,
+) -> None:
+    import sysconfig
+
+    if importlib.util.find_spec("setuptools_scm") is None:
+        pytest.skip("setuptools_scm is required for the direct wheel build")
+    root = Path(__file__).parents[2]
+    source = tmp_path / "source"
+    shutil.copytree(
+        root,
+        source,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv-test",
+            "build",
+            "dist",
+            "*.egg-info",
+            "__pycache__",
+            "_version.py",
+            "*.so",
+        ),
+    )
+    prebuilt = tmp_path / "prebuilt"
+    prebuilt.mkdir()
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    expected = {}
+    for module in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C"):
+        payload = f"donor:{module}".encode()
+        expected[f"vllm_sail/{module}{suffix}"] = payload
+        (prebuilt / f"{module}{suffix}").write_bytes(payload)
+    (source / "vllm_sail/repack_probe.py").write_text("VALUE = 'current source'\n")
+
+    artifacts = tmp_path / "artifacts"
+    result = subprocess.run(
+        [sys.executable, "setup.py", "bdist_wheel", "--dist-dir", str(artifacts)],
+        cwd=source,
+        env={
+            **os.environ,
+            "VLLM_SAIL_PREBUILT_EXT_DIR": str(prebuilt),
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_SAIL": "0.0.0",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    wheel = next(artifacts.glob("*.whl"))
+    assert "none-any" not in wheel.name
+    with zipfile.ZipFile(wheel) as archive:
+        _assert_wheel_licenses(archive, root)
+        assert (
+            archive.read("vllm_sail/repack_probe.py") == b"VALUE = 'current source'\n"
+        )
+        for member, payload in expected.items():
+            assert archive.read(member) == payload
+
+
+def test_prebuilt_extension_mode_requires_every_exact_extension(tmp_path: Path) -> None:
+    import sysconfig
+
+    if importlib.util.find_spec("setuptools_scm") is None:
+        pytest.skip("setuptools_scm is required for the direct wheel build")
+    root = Path(__file__).parents[2]
+    source = tmp_path / "source"
+    shutil.copytree(
+        root,
+        source,
+        ignore=shutil.ignore_patterns(
+            ".git", "build", "dist", "*.egg-info", "__pycache__", "*.so"
+        ),
+    )
+    prebuilt = tmp_path / "prebuilt"
+    prebuilt.mkdir()
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    for module in ("_C", "_moe_C", "_upstream_C"):
+        (prebuilt / f"{module}{suffix}").write_bytes(b"native")
+    result = subprocess.run(
+        [sys.executable, "setup.py", "build_ext"],
+        cwd=source,
+        env={
+            **os.environ,
+            "VLLM_SAIL_PREBUILT_EXT_DIR": str(prebuilt),
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_SAIL": "0.0.0",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "expected exactly one non-empty prebuilt" in result.stderr

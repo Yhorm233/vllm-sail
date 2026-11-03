@@ -334,10 +334,17 @@ def test_context_wkv_proj_routes_to_the_channelwise_scheme(
     probe = _channelwise_match_probe()
     probe.__globals__["is_layer_skipped"] = matcher
     config = SimpleNamespace(
+        ignored_layers=[],
         fp8_channelwise_layers=["attn.wq_a", "attn.wkv"],
         packed_modules_mapping={"fused_wqa_wkv": ["wq_a", "wkv"]},
     )
-    assert probe(config, object(), "model.context_wkv_proj")
+    assert probe(config, object(), "model.context_wkv_proj") is True
+    # An explicit ignore must take precedence over the projection override.
+    unquantized_method = object()
+    probe.__globals__["UnquantizedLinearMethod"] = lambda: unquantized_method
+    config.ignored_layers = ["context_wkv_proj"]
+    assert probe(config, object(), "model.context_wkv_proj") is unquantized_method
+    config.ignored_layers = []
     # A genuine match, not an unconditional True: unrelated layers stay on
     # the default path.
     config.fp8_channelwise_layers = ["attn.unrelated"]

@@ -1,0 +1,169 @@
+name: PPU accuracy tests
+
+# Called by ppu-debug.yaml (manual single target) and ppu-accuracy-nightly.yaml
+# (scheduled). Accuracy is intentionally outside the per-PR gate.
+
+on:
+  workflow_call:
+    inputs:
+      pr_mode:
+        type: boolean
+        default: false
+      pr_head_sha:
+        type: string
+        default: ""
+      wheel_source_sha:
+        description: Validated SAIL source of the reused wheels
+        type: string
+        default: ""
+      build_run_id:
+        description: Run supplying the ppu-wheels artifact
+        required: true
+        type: string
+      models:
+        description: Comma-separated accuracy model catalog keys
+        type: string
+        default: qwen3.8-flash-next
+      hf_home:
+        description: Host Hugging Face cache root
+        type: string
+        default: ""
+      gsm8k_dataset_path:
+        description: Host GSM8K dataset directory
+        type: string
+        default: /ppusw/datasets/vision/EvalScope/data/gsm8k/v2/gsm8k
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+concurrency:
+  # Keyed by (build, requested models): one nightly dispatches several models
+  # of the same build, and those lanes must not cancel each other. Lanes that
+  # ask for the same set still queue, which keeps a runner's exclusive lock
+  # from being taken by a duplicate dispatch.
+  group: accuracy-ppu-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.models }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve accuracy matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.accuracy_matrix }}
+    steps:
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Select accuracy models
+        id: select
+        env:
+          MODELS: ${{ inputs.models }}
+        run: python3 scripts/ci/ppu_e2e_select.py "${MODELS}" >> "$GITHUB_OUTPUT"
+
+  accuracy:
+    name: Accuracy ${{ matrix.model.model_key }}
+    needs: prepare
+    runs-on: 8-ppu-m890p
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
+    env:
+      GIT_CONFIG_NOSYSTEM: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare private runtime directories and Git configuration
+        id: runtime
+        run: |
+          config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
+          wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-wheels.XXXXXX")"
+          artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-artifacts.XXXXXX")"
+          source_rel=".ppu-accuracy-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source="${GITHUB_WORKSPACE}/${source_rel}"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
+            printf 'wheels=%s\n' "$wheels"
+            printf 'artifacts=%s\n' "$artifacts"
+            printf 'source_rel=%s\n' "$source_rel"
+            printf 'source=%s\n' "$source"
+          } >> "$GITHUB_OUTPUT"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          path: ${{ steps.runtime.outputs.source_rel }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+        run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Download CI-built wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ inputs.build_run_id }}
+          path: ${{ steps.runtime.outputs.wheels }}
+          run-id: ${{ inputs.build_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Run GSM8K accuracy in the preloaded CUDA-compatible runtime
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
+          PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || inputs.pr_head_sha || github.sha }}
+          PPU_CI_HF_HOME: ${{ inputs.hf_home }}
+          HF_HUB_OFFLINE: "1"
+          GSM8K_DATASET_PATH: ${{ inputs.gsm8k_dataset_path }}
+          MODEL_KEY: ${{ matrix.model.model_key }}
+        run: bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" model-accuracy
+
+      - name: Upload accuracy diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-${{ matrix.model.model_key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.runtime.outputs.artifacts }}/**
+            ${{ steps.runtime.outputs.wheels }}/wheel-manifest.json
+          if-no-files-found: warn
+          retention-days: 14

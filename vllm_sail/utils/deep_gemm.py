@@ -206,6 +206,7 @@ _bf16_gemm_nt_impl: Callable[..., Any] | None = None
 _bf16_grouped_nopad_impl: Callable[..., Any] | None = None
 _bf16_grouped_masked_impl: Callable[..., Any] | None = None
 _fp4_grouped_nopad_impl: Callable[..., Any] | None = None
+_fp4_grouped_fused_impl: Callable[..., Any] | None = None
 _fp4_grouped_masked_impl: Callable[..., Any] | None = None
 _w4a16_grouped_nopad_impl: Callable[..., Any] | None = None
 _w4a16_grouped_fused_impl: Callable[..., Any] | None = None
@@ -239,7 +240,7 @@ def _lazy_init() -> None:
     global _int8_grouped_nopad_impl, _int8_grouped_masked_impl
     global _bf16_gemm_nt_impl
     global _bf16_grouped_nopad_impl, _bf16_grouped_masked_impl
-    global _fp4_grouped_nopad_impl, _fp4_grouped_masked_impl
+    global _fp4_grouped_nopad_impl, _fp4_grouped_fused_impl, _fp4_grouped_masked_impl
     global \
         _w4a16_grouped_nopad_impl, \
         _w4a16_grouped_fused_impl, \
@@ -269,6 +270,7 @@ def _lazy_init() -> None:
         or _bf16_grouped_nopad_impl is not None
         or _bf16_grouped_masked_impl is not None
         or _fp4_grouped_nopad_impl is not None
+        or _fp4_grouped_fused_impl is not None
         or _fp4_grouped_masked_impl is not None
         or _w4a16_grouped_nopad_impl is not None
         or _w4a16_grouped_fused_impl is not None
@@ -338,6 +340,7 @@ def _lazy_init() -> None:
         _dg, "m_grouped_gemm_bf16_bf16_bf16_nt_masked", None
     )
     _fp4_grouped_nopad_impl = getattr(_dg, "m_grouped_gemm_fp4_fp4_bf16_nt_nopad", None)
+    _fp4_grouped_fused_impl = getattr(_dg, "m_grouped_gemm_fp4_fp4_bf16_nt_fused", None)
     _fp4_grouped_masked_impl = getattr(
         _dg, "m_grouped_gemm_fp4_fp4_bf16_nt_masked", None
     )
@@ -455,6 +458,13 @@ def m_grouped_fp4_gemm_nt_nopad(*args, **kwargs):
     if _fp4_grouped_nopad_impl is None:
         return _missing(*args, **kwargs)
     return _fp4_grouped_nopad_impl(*args, **kwargs)
+
+
+def m_grouped_fp4_gemm_nt_fused(*args, **kwargs):
+    _lazy_init()
+    if _fp4_grouped_fused_impl is None:
+        return _missing(*args, **kwargs)
+    return _fp4_grouped_fused_impl(*args, **kwargs)
 
 
 def fp4_m_grouped_gemm_nt_masked(*args, **kwargs):
@@ -654,6 +664,67 @@ def get_paged_mqa_logits_metadata(
     )
 
 
+def _fp8_paged_mqa_logits_ppu10(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """810E FP8 兼容计算：固定形状、分页平面布局，无设备标量读取。"""
+    batch, next_n, heads, dim = q_fp8.shape
+    pages, block_size, kv_heads, record_bytes = kv_cache.shape
+    if kv_heads != 1 or record_bytes != dim + 4 or kv_cache.dtype != torch.uint8:
+        raise ValueError("810E FP8 indexer requires packed FP8 values and FP32 scales")
+    if max_model_len > block_tables.shape[1] * block_size:
+        raise ValueError("block table cannot address max_model_len")
+    if context_lens.ndim == 1:
+        # 一维 context 是请求的最终长度；每个 query 保留自己的因果前缀。
+        ends = (
+            context_lens[:, None]
+            - next_n
+            + torch.arange(
+                1, next_n + 1, device=q_fp8.device, dtype=context_lens.dtype
+            )[None, :]
+        )
+    elif tuple(context_lens.shape) == (batch, next_n):
+        ends = context_lens
+    else:
+        raise ValueError("context lengths must have shape [B] or [B, next_n]")
+    positions = torch.arange(max_model_len, device=q_fp8.device)
+    slots = positions % block_size
+    logical_pages = positions // block_size
+    page_ids = block_tables[:, logical_pages].long()
+    # Graph padding 行可能没有合法 page。只在可见前缀内使用请求的地址。
+    visible = positions[None, :] < ends.max(dim=1).values[:, None]
+    page_ids = torch.where(visible, page_ids, 0)
+    # SDK 的每页格式是全部 FP8 token data，然后全部 FP32 token scales。
+    # 必须保留真实 block stride/storage offset，不能按交错 record 解包。
+    offset = kv_cache.storage_offset()
+    key_bytes = torch.as_strided(
+        kv_cache, (pages, block_size, dim), (kv_cache.stride(0), dim, 1), offset
+    )
+    scale_bytes = torch.as_strided(
+        kv_cache,
+        (pages, block_size, 4),
+        (kv_cache.stride(0), 4, 1),
+        offset + block_size * dim,
+    )
+    keys = key_bytes[page_ids, slots[None, :]].view(q_fp8.dtype).float()
+    scales = scale_bytes[page_ids, slots[None, :]].contiguous().view(torch.float32)
+    scores = torch.bmm(
+        q_fp8.float().reshape(batch, next_n * heads, dim), keys.transpose(1, 2)
+    ).reshape(batch, next_n, heads, max_model_len)
+    terms = scores.clamp_min(0) * scales[:, None, :, :].transpose(2, 3)
+    terms = terms * weights.reshape(batch, next_n, heads, 1)
+    logits = terms.sum(dim=2)
+    logits = logits.masked_fill(
+        positions[None, None, :] >= ends[:, :, None], float("-inf")
+    )
+    return logits.reshape(batch * next_n, max_model_len)
+
+
 def fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -686,6 +757,14 @@ def fp8_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    # PPU MODIFICATION: begin
+    # SDK FP8 MMA 在 810E 编译失败；不改变 INT8、MXFP4 或其他平台路由。
+    # 软件路径额外清理不可见列，也满足 clean_logits=False 的有效前缀合同。
+    if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
+        return _fp8_paged_mqa_logits_ppu10(
+            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+        )
+    # PPU MODIFICATION: end
     _lazy_init()
     if _fp8_paged_mqa_logits_impl is None:
         return _missing()
@@ -949,6 +1028,12 @@ def should_use_deepgemm_for_bf16_linear(
     must fall back to acblas (``F.linear``) to avoid the extra elementwise
     add overhead.  Otherwise (no bias) callers can use DeepGEMM when all
     conditions are satisfied.
+
+    The BF16 dense NT kernel tiles ``N`` in pairs and rejects an odd ``N``
+    at JIT time (``BF16 dense GEMM requires even N``).  Every odd ``N`` --
+    including ``N == 1``, which the kernel does not specialise (e.g. the 1-D
+    Kimi-K3 AttnRes projections) -- is rejected here so it falls back to
+    acblas instead of failing inside the kernel.
     """
     if bias is not None:
         return False
@@ -968,6 +1053,7 @@ def should_use_deepgemm_for_bf16_linear(
         x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and weight.dim() == 2
+        and weight.shape[0] % 2 == 0
         and x.is_contiguous()
         and weight.is_contiguous()
     )
@@ -1127,6 +1213,7 @@ __all__ = [
     "m_grouped_bf16_gemm_nt_nopad",
     "bf16_m_grouped_gemm_nt_masked",
     "m_grouped_fp4_gemm_nt_nopad",
+    "m_grouped_fp4_gemm_nt_fused",
     "fp4_m_grouped_gemm_nt_masked",
     "m_grouped_w4a16_gemm_nt_nopad",
     "m_grouped_w4a16_gemm_nt_fused",

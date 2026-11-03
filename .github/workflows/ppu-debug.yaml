@@ -12,12 +12,17 @@ on:
         description: Stages to rerun against the existing build
         required: true
         type: choice
-        options: [both, pin-ut, model-tests]
+        options: [both, pin-ut, model-tests, accuracy-tests]
         default: both
       models:
-        description: Comma-separated model catalog keys for model tests (blank = every model in scripts/ci/ppu_e2e_models.json)
+        description: Comma-separated smoke model catalog keys
         required: false
         default: qwen3.8-27b-m890p
+        type: string
+      accuracy_models:
+        description: Comma-separated accuracy model catalog keys
+        required: false
+        default: qwen3.8-flash-next
         type: string
 
 permissions:
@@ -28,7 +33,7 @@ cache-mode: none
 jobs:
   pin-unit-tests:
     name: PPU pin UT
-    if: inputs.target != 'model-tests'
+    if: inputs.target == 'both' || inputs.target == 'pin-ut'
     permissions:
       contents: read
       actions: read
@@ -39,7 +44,7 @@ jobs:
 
   model-tests:
     name: PPU model tests
-    if: inputs.target != 'pin-ut'
+    if: inputs.target == 'both' || inputs.target == 'model-tests'
     permissions:
       contents: read
       actions: read
@@ -48,3 +53,15 @@ jobs:
       pr_mode: false
       build_run_id: ${{ inputs.build_run_id }}
       models: ${{ inputs.models }}
+
+  accuracy-tests:
+    name: PPU accuracy tests
+    if: inputs.target == 'accuracy-tests'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-accuracy-tests.yaml
+    with:
+      pr_mode: false
+      build_run_id: ${{ inputs.build_run_id }}
+      models: ${{ inputs.accuracy_models }}

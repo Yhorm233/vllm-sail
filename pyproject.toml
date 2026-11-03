@@ -16,8 +16,8 @@ build-backend = "setuptools.build_meta"
 name = "vllm-sail"
 description = "vLLM SAIL: inference on T-Head PPU accelerators"
 readme = "README.md"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
+license = "Apache-2.0 AND BSD-3-Clause"
+license-files = ["LICENSE", "LICENSES/*.txt", "THIRD_PARTY_NOTICES.md"]
 keywords = ["vllm", "sail", "ppu", "hggc", "inference", "llm"]
 requires-python = ">=3.10,<3.14"
 dynamic = ["version", "dependencies", "optional-dependencies"]
@@ -94,6 +94,8 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# CPU and device suites can contain modules with the same basename.
+addopts = ["--import-mode=importlib"]
 markers = [
     "ppu: requires real PPU hardware (skipped when absent)",
     "upstream_source: checks the source selected by VLLM_SOURCE_ROOT without importing vLLM",

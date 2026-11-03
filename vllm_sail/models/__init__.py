@@ -16,6 +16,8 @@ Registered architectures (cross-checked against the PPU fork):
   fork's ``ppu/mtp.py``.
 * ``DSparkDraftModel`` -> ``vllm_sail.models.deepseek_v4.dspark`` — injects
   the target model's quantization mappings into DSpark's fresh quant config.
+* ``DSparkV41DraftModel`` -> ``vllm_sail.models.deepseek_v41.dspark`` — keeps
+  V4.1 draft execution and loading with the same quantization mapping contract.
 * ``GlmMoeDsaForCausalLM`` / ``DeepseekV32MTPModel`` -> legacy upstream models
   retaining PPU INT8 indexer and checkpoint-loader patches.
 * ``MiniMaxM3SparseForCausalLM`` / ``MiniMaxM3SparseForConditionalGeneration``
@@ -50,6 +52,9 @@ _REQUIRED_PPU_MODELS: dict[str, str] = {
     "DeepSeekV4MTPModel": "vllm_sail.models.deepseek_v4.mtp:DeepSeekV4MTP",
     "DSparkDraftModel": (
         "vllm_sail.models.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM"
+    ),
+    "DSparkV41DraftModel": (
+        "vllm_sail.models.deepseek_v41.dspark:DSparkDeepseekV41ForCausalLM"
     ),
     "GlmMoeDsaForCausalLM": (
         "vllm.model_executor.models.deepseek_v2:GlmMoeDsaForCausalLM"

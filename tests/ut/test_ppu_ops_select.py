@@ -373,7 +373,7 @@ def test_resource_exclusions_survive_selection_protocol(
         ),
         (["MANIFEST.in"], "full", None),
         ([".github/vllm-main-verified.commit"], "full", None),
-        (["csrc/upstream/libtorch_stable/activation_kernels.cu"], "full", None),
+        (["csrc/upstream/libtorch_stable/activation_kernels.hg"], "full", None),
         (["csrc/new.h"], "full", None),
         (["README.md", "vllm_sail/new.py"], "full", None),
         (["tests/ut/a.py", "vllm_sail/deleted.py"], "full", None),

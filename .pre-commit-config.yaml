@@ -40,6 +40,16 @@ repos:
   # Local policy guard; assemble prohibited tokens only at runtime.
   - repo: local
     hooks:
+      - id: require-sign-off
+        name: Require Signed-off-by trailer
+        language: system
+        entry: >-
+          bash -c 'if ! git interpret-trailers --parse "$1" |
+          grep -Eiq "^Signed-off-by: [^<>]+ <[^<>[:space:]]+@[^<>[:space:]]+>$"; then
+          printf "ERROR: Commit requires a Signed-off-by trailer. Use git commit -s.\n" >&2;
+          exit 1; fi' _
+        stages: [commit-msg]
+        always_run: true
       - id: no-prohibited-tokens
         name: Block prohibited tokens in staged code
         language: system

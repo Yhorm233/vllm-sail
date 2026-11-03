@@ -187,7 +187,12 @@ def _mxfp4_activation_key(monkeypatch: pytest.MonkeyPatch, chip: str):
 
 
 def _should_use_bf16_linear(
-    monkeypatch: pytest.MonkeyPatch, chip: str, *, bf16_env: bool, bias: bool
+    monkeypatch: pytest.MonkeyPatch,
+    chip: str,
+    *,
+    bf16_env: bool,
+    bias: bool,
+    n: int = 64,
 ) -> bool:
     if bf16_env:
         monkeypatch.setenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", "1")
@@ -197,7 +202,7 @@ def _should_use_bf16_linear(
     platform = platform_double(chip)
     x = types.SimpleNamespace(dtype="bf16", is_contiguous=lambda: True)
     weight = types.SimpleNamespace(
-        dtype="bf16", dim=lambda: 2, is_contiguous=lambda: True
+        dtype="bf16", dim=lambda: 2, shape=(n, 16), is_contiguous=lambda: True
     )
     fn = extract(
         DEEP_GEMM_PATH,
@@ -305,3 +310,29 @@ def test_bf16_dense_autoenable_only_on_890p_with_env(monkeypatch, chip) -> None:
     )
     # A present bias always forces the acblas/F.linear fallback.
     assert _should_use_bf16_linear(monkeypatch, chip, bf16_env=True, bias=True) is False
+
+
+@pytest.mark.parametrize(
+    ("n", "expected"),
+    [
+        (1, False),  # odd N, scalar projection included: kernel asserts even N
+        (2, True),
+        (64, True),
+        (4096, True),
+        (3, False),
+        (5, False),
+        (129, False),
+    ],
+)
+def test_bf16_dense_accepts_only_even_n(monkeypatch, n, expected) -> None:
+    """DeepGEMM BF16 dense NT tiling accepts an even N only.
+
+    Every odd N -- N == 1 (Kimi-K3 AttnRes scalar projections) included --
+    is rejected at dispatch so it falls back to acblas instead of failing
+    inside the kernel (the PPU "BF16 dense GEMM requires even N" JIT
+    assertion).
+    """
+    assert (
+        _should_use_bf16_linear(monkeypatch, "890p", bf16_env=True, bias=False, n=n)
+        is expected
+    )

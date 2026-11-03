@@ -28,6 +28,7 @@ from vllm_sail.patch.enhancement import quant_keys  # noqa: F401
 from vllm_sail.patch.enhancement import tuned_config_lookup  # noqa: F401
 from vllm_sail.patch.enhancement import models  # noqa: F401
 from vllm_sail.patch.enhancement import mxfp4
+from vllm_sail.patch.enhancement import qwen4_exp_ple
 from vllm_sail.patch.enhancement import residual  # noqa: F401
 
 # Leaf-style modules (like residual/): define their replacements without vLLM
@@ -35,6 +36,7 @@ from vllm_sail.patch.enhancement import residual  # noqa: F401
 compressed_tensors_ppu.install()
 fused_moe_ppu.install()
 mxfp4.install()
+qwen4_exp_ple.install()
 
 # After generic quantization adapters, before runtime calls consume tuned configs.
 from vllm_sail.patch.enhancement import triton_moe  # noqa: F401

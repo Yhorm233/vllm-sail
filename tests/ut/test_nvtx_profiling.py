@@ -44,6 +44,9 @@ PROFILING_TARGETS = (
     "vllm.v1.worker.gpu_model_runner.GPUModelRunner._sample",
     "vllm.v1.worker.gpu_model_runner.GPUModelRunner._model_forward",
     "vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model",
+    "vllm.v1.worker.gpu.model_runner.GPUModelRunner.prepare_inputs",
+    "vllm.v1.worker.gpu.model_runner.GPUModelRunner.sample",
+    "vllm.v1.worker.gpu.model_runner.GPUModelRunner.execute_model",
 )
 
 PROFILING_SUBMODULES = (
@@ -53,6 +56,7 @@ PROFILING_SUBMODULES = (
     "vllm_sail.profiling.nvtx",
     "vllm_sail.profiling.engine_core",
     "vllm_sail.profiling.model_runner",
+    "vllm_sail.profiling.model_runner_v2",
     "vllm_sail.profiling.scheduler",
 )
 
@@ -97,6 +101,7 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     package("vllm.v1")
     package("vllm.v1.worker")
+    package("vllm.v1.worker.gpu")
     package("vllm.v1.engine")
     package("vllm.v1.core")
     package("vllm.v1.core.sched")
@@ -116,6 +121,23 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
         def execute_model(self, scheduler_output, intermediate_tensors=None):
             return ("execute_model", scheduler_output, intermediate_tensors)
+
+    class GPUModelRunnerV2:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.init_args = (args, kwargs)
+
+        def prepare_inputs(
+            self, scheduler_output, batch_req_state, batch_desc, num_active_loras
+        ):
+            return ("prepare_inputs", scheduler_output, batch_req_state)
+
+        def sample(self, hidden_states, input_batch, grammar_output):
+            return ("sample", hidden_states, input_batch)
+
+        def execute_model(
+            self, scheduler_output, intermediate_tensors=None, dummy_run=False, **kw
+        ):
+            return ("execute_model", scheduler_output, dummy_run)
 
     class EngineCore:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -147,6 +169,8 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     runner_module = plain("vllm.v1.worker.gpu_model_runner")
     runner_module.GPUModelRunner = GPUModelRunner
+    runner_v2_module = plain("vllm.v1.worker.gpu.model_runner")
+    runner_v2_module.GPUModelRunner = GPUModelRunnerV2
     core_module = plain("vllm.v1.engine.core")
     core_module.EngineCore = EngineCore
     scheduler_module = plain("vllm.v1.core.sched.scheduler")
@@ -154,6 +178,7 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     return SimpleNamespace(
         GPUModelRunner=GPUModelRunner,
+        GPUModelRunnerV2=GPUModelRunnerV2,
         EngineCore=EngineCore,
         Scheduler=Scheduler,
         originals={
@@ -162,6 +187,13 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "GPUModelRunner._sample": GPUModelRunner._sample,
             "GPUModelRunner._model_forward": GPUModelRunner._model_forward,
             "GPUModelRunner.execute_model": GPUModelRunner.execute_model,
+            "gpu.model_runner.GPUModelRunner.prepare_inputs": (
+                GPUModelRunnerV2.prepare_inputs
+            ),
+            "gpu.model_runner.GPUModelRunner.sample": GPUModelRunnerV2.sample,
+            "gpu.model_runner.GPUModelRunner.execute_model": (
+                GPUModelRunnerV2.execute_model
+            ),
             "EngineCore.__init__": EngineCore.__init__,
             "EngineCore.step": EngineCore.step,
             "EngineCore.step_with_batch_queue": EngineCore.step_with_batch_queue,
@@ -211,6 +243,7 @@ def profiling_pkg(fake_vllm: SimpleNamespace, monkeypatch: pytest.MonkeyPatch):
         "nvtx",
         "engine_core",
         "model_runner",
+        "model_runner_v2",
         "scheduler",
         "linear",
         "modular_moe",
@@ -277,6 +310,13 @@ def test_gate_on_installs_every_patch(installed) -> None:
         "GPUModelRunner._sample": fakes.GPUModelRunner._sample,
         "GPUModelRunner._model_forward": fakes.GPUModelRunner._model_forward,
         "GPUModelRunner.execute_model": fakes.GPUModelRunner.execute_model,
+        "gpu.model_runner.GPUModelRunner.prepare_inputs": (
+            fakes.GPUModelRunnerV2.prepare_inputs
+        ),
+        "gpu.model_runner.GPUModelRunner.sample": fakes.GPUModelRunnerV2.sample,
+        "gpu.model_runner.GPUModelRunner.execute_model": (
+            fakes.GPUModelRunnerV2.execute_model
+        ),
         "EngineCore.__init__": fakes.EngineCore.__init__,
         "EngineCore.step": fakes.EngineCore.step,
         "EngineCore.step_with_batch_queue": fakes.EngineCore.step_with_batch_queue,
@@ -449,6 +489,93 @@ def test_prepare_inputs_is_annotated(installed) -> None:
     runner = installed.fakes.GPUModelRunner()
     assert runner._prepare_inputs("so", "nst") == ("prepare_inputs", "so", "nst")
     assert "prepare_inputs" in installed.nvtx_calls["annotated"]
+
+
+# ---------------------------------------------------------------------------
+# Model Runner V2 (the 0.31 default) carries the same ranges
+# ---------------------------------------------------------------------------
+
+
+def test_v2_execute_model_wraps_iteration_range(installed, recording_nvtx) -> None:
+    runner = installed.fakes.GPUModelRunnerV2()
+    # No __init__ patch: the counter is created on first use, like the engine
+    # core does it after the profiling patches load mid-construction.
+    assert not hasattr(runner, "iteration")
+
+    output = _sched_output()
+    assert runner.execute_model(output) == ("execute_model", output, False)
+
+    assert recording_nvtx.pushes == ["[prof_range]: iter 0", "total bs=1, P bs=1"]
+    assert len(recording_nvtx.pops) == 2
+    assert recording_nvtx.iters == [0]
+    assert runner.iteration == 1
+    assert any(m.startswith("total_tokens=5") for m in installed.nvtx_calls["marks"])
+
+    runner.execute_model(output)
+    assert recording_nvtx.pushes[2:] == [
+        "[prof_range]: iter 1",
+        "total bs=1, P bs=1",
+    ]
+
+
+def test_v2_execute_model_forwards_dummy_runs_unprofiled(
+    installed, recording_nvtx
+) -> None:
+    runner = installed.fakes.GPUModelRunnerV2()
+    output = _sched_output()
+
+    assert runner.execute_model(output, dummy_run=True) == (
+        "execute_model",
+        output,
+        True,
+    )
+    assert recording_nvtx.pushes == []
+    assert recording_nvtx.iters == []
+    # Memory profiling and CUDA-graph capture must not consume iteration numbers.
+    assert not hasattr(runner, "iteration")
+
+
+def test_v2_sample_wraps_sampler_range(installed, recording_nvtx) -> None:
+    runner = installed.fakes.GPUModelRunnerV2()
+    hidden_states = SimpleNamespace(shape=(7, 16))
+
+    assert runner.sample(hidden_states, "batch", None) == (
+        "sample",
+        hidden_states,
+        "batch",
+    )
+    assert recording_nvtx.pushes == [
+        "[FW_NATIVE] op:sampler,hidden_states:(7, 16)"
+    ]
+    assert len(recording_nvtx.pops) == 1
+
+
+def test_v2_prepare_inputs_is_annotated(installed) -> None:
+    runner = installed.fakes.GPUModelRunnerV2()
+
+    assert runner.prepare_inputs("so", "state", "desc", 0) == (
+        "prepare_inputs",
+        "so",
+        "state",
+    )
+    assert "prepare_inputs" in installed.nvtx_calls["annotated"]
+
+
+def test_v2_instruments_compute_logits_once(installed, recording_nvtx) -> None:
+    runner = installed.fakes.GPUModelRunnerV2()
+    model = SimpleNamespace(compute_logits=lambda hidden_states: hidden_states)
+    runner.model = model
+
+    runner.execute_model(_sched_output())
+    traced = model.compute_logits
+    runner.execute_model(_sched_output())
+    assert model.compute_logits is traced, "compute_logits must be wrapped once"
+
+    hidden_states = SimpleNamespace(shape=(2, 4))
+    assert model.compute_logits(hidden_states) is hidden_states
+    assert recording_nvtx.pushes[-1] == (
+        "[FW_GEMM] op:compute_logits,hidden_states:(2, 4)"
+    )
 
 
 def test_engine_core_steps_carry_iteration_ranges(installed, recording_nvtx) -> None:

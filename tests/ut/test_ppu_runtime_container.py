@@ -31,7 +31,11 @@ def test_runtime_wrapper_mounts_inputs_read_only_and_artifacts_writable():
     text = SCRIPT.read_text()
     assert "target=/source,readonly" in text
     assert "target=/wheels,readonly" in text
-    assert "target=/nas_aisw,readonly" in text
+    assert "source=${hf_home},target=${hf_home},readonly" in text
+    assert "source=${model_snapshot},target=${model_snapshot},readonly" in text
+    assert r"models--${MODEL_ID//\//--}" in text
+    assert "--env HF_HUB_OFFLINE=1" in text
+    assert "--env TRANSFORMERS_OFFLINE=1" in text
     assert 'target=/artifacts"' in text
     assert "/source/scripts/ci/ppu_pin_ut.sh" in text
     assert "/source/scripts/ci/ppu_e2e_smoke.sh" in text

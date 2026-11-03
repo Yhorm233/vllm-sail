@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     VLLM_SAIL_USE_OPT_TOKEN_GROUP_QUANT: bool = False
     VLLM_SAIL_DENSE_BF16_DEEPGEMM: bool = False
     VLLM_SAIL_USE_PLA: bool = True
-    VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED: bool = True
+    VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED: bool = False
     VLLM_SAIL_MOE_BACKEND: str | None = None
     VLLM_SAIL_DENSE_BACKEND: str | None = None
     VLLM_SAIL_FUSED_GDN_DECODE: bool = True
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     VLLM_PPU_USE_OPT_TOKEN_GROUP_QUANT: bool = False
     VLLM_PPU_DENSE_BF16_DEEPGEMM: bool = False
     VLLM_PPU_USE_PLA: bool = True
-    VLLM_PPU_DEEPGEMM_MOE_TP_FUSED: bool = True
+    VLLM_PPU_DEEPGEMM_MOE_TP_FUSED: bool = False
     VLLM_PPU_MOE_BACKEND: str | None = None
     VLLM_PPU_DENSE_BACKEND: str | None = None
     VLLM_PPU_FUSED_GDN_DECODE: bool = True
@@ -133,7 +133,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SAIL_DENSE_BF16_DEEPGEMM": _bool("VLLM_SAIL_DENSE_BF16_DEEPGEMM", False),
     "VLLM_SAIL_USE_PLA": _bool("VLLM_SAIL_USE_PLA", True),
-    "VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED": _bool("VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED", True),
+    "VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED": _bool("VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED", False),
     # -- MoE ---------------------------------------------------------------
     # PPU MoE group-GEMM backend. Unset means "pick the best available",
     # which is why `is_set()` is meaningful here.

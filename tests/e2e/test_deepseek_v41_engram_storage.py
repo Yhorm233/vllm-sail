@@ -10,6 +10,9 @@ torch = pytest.importorskip("torch")
 
 @pytest.fixture
 def modules(monkeypatch):
+    # 共享 conftest 可能已探测设备；本测试不得新增初始化或设备操作。
+    initialized_before = torch.cuda.is_initialized()
+
     def forbidden(*args, **kwargs):
         raise RuntimeError(
             "Device initialization and probing are forbidden in this CPU test"
@@ -17,12 +20,19 @@ def modules(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
     monkeypatch.setattr(torch._C, "_cuda_getDeviceCount", forbidden)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: types.SimpleNamespace(multi_processor_count=24),
+    )
     from vllm.models.deepseek_v41.common import engram as common
     from vllm.models.deepseek_v41.nvidia import engram as upstream
 
     from vllm_sail.models.deepseek_v41 import engram as plugin
 
-    return common, upstream, plugin
+    yield common, upstream, plugin
+    assert torch.cuda.is_initialized() == initialized_before
 
 
 def test_packed_storage_and_exact_head_loader(modules):
@@ -77,8 +87,9 @@ def test_real_constructor_attributes_and_tp_ownership(modules, monkeypatch, shar
     common, upstream, plugin = modules
     monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 1)
-    monkeypatch.setattr(plugin, "get_engram_dp_size", lambda: 16 if shared else 1)
-    monkeypatch.setattr(plugin, "is_uva_available", lambda: True)
+    # 上游构造函数继续拥有 DP 分片与 UVA 前置条件。
+    monkeypatch.setattr(upstream, "get_engram_dp_size", lambda: 16 if shared else 1)
+    monkeypatch.setattr(upstream, "is_uva_available", lambda: True)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         torch.cuda,
@@ -118,18 +129,28 @@ def test_real_constructor_attributes_and_tp_ownership(modules, monkeypatch, shar
     else:
         assert obj._packed is not None
         assert obj.weight_scale_inv.weight_loader is plugin.load_weight
-    assert not torch.cuda.is_initialized()
+    assert obj.weight.device.type == obj.weight_scale_inv.device.type == "cpu"
 
 
 def test_constructor_rejects_invalid_shared_and_uva_settings(modules, monkeypatch):
-    plugin = modules[2]
-    monkeypatch.setattr(plugin, "get_engram_dp_size", lambda: 1)
+    _, upstream, plugin = modules
+    monkeypatch.setattr(upstream, "get_engram_dp_size", lambda: 1)
     with pytest.raises(ValueError, match="cpu_offload"):
         plugin.Int8ParallelEngramEmbedding(2, 256, (2,), dp_shared_memory=True)
     with pytest.raises(ValueError, match="size > 1"):
         plugin.Int8ParallelEngramEmbedding(
             2, 256, (2,), cpu_offload=True, dp_shared_memory=True
         )
-    monkeypatch.setattr(plugin, "is_uva_available", lambda: False)
+    monkeypatch.setattr(upstream, "is_uva_available", lambda: False)
     with pytest.raises(RuntimeError, match="UVA"):
         plugin.Int8ParallelEngramEmbedding(2, 256, (2,), cpu_offload=True)
+    monkeypatch.setattr(upstream, "is_uva_available", lambda: True)
+    monkeypatch.setattr(upstream, "get_engram_dp_size", lambda: 2)
+    monkeypatch.setattr(plugin, "get_engram_dp_group", lambda: None)
+    common = modules[0]
+    monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 0)
+    with pytest.raises(RuntimeError, match="node-local shared group"):
+        plugin.Int8ParallelEngramEmbedding(
+            2, 256, (2,), cpu_offload=True, dp_shared_memory=True
+        )

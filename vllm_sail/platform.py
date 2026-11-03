@@ -204,6 +204,9 @@ class PPUPlatform(NvmlCudaPlatform):
         # Registering PPU custom ops here (rather than at plugin import) keeps
         # the registration after torch and the platform are both initialised.
         from vllm_sail import ops  # noqa: F401
+        from vllm_sail.models.deepseek_v41.config import normalize_expert_dtype
+
+        normalize_expert_dtype(vllm_config)
 
         if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
             raise ValueError(

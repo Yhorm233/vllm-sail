@@ -368,15 +368,17 @@ def test_an_include_escaping_csrc_is_fatal(tmp_path: Path) -> None:
 
 
 def test_vendored_paths_mirror_upstream_below_csrc(ported: Ported) -> None:
-    """``csrc/a/b.cu`` -> ``csrc/upstream/a/b.cu``, so a vLLM bump stays a diff."""
+    """``csrc/a/b.cu`` -> ``csrc/upstream/a/b.hg``, so a vLLM bump stays a diff."""
     assert ported.result.sources == (
         "csrc/upstream/libtorch_stable/torch_bindings.cpp",
-        "csrc/upstream/libtorch_stable/cache_kernels.cu",
+        "csrc/upstream/libtorch_stable/cache_kernels.hg",
         "csrc/upstream/libtorch_stable/moe/torch_bindings.cpp",
-        "csrc/upstream/libtorch_stable/moe/moe_align.cu",
+        "csrc/upstream/libtorch_stable/moe/moe_align.hg",
     )
-    assert (ported.dest / "libtorch_stable/moe/moe_align.cu").is_file()
+    assert (ported.dest / "libtorch_stable/moe/moe_align.hg").is_file()
     assert (ported.dest / "core/registration.h").is_file()
+    # Compiled TUs are renamed, not copied alongside their upstream names.
+    assert not list(ported.dest.rglob("*.cu"))
 
 
 def test_only_compiled_tiers_are_vendored(ported: Ported) -> None:
@@ -387,15 +389,29 @@ def test_only_compiled_tiers_are_vendored(ported: Ported) -> None:
 
 
 def test_the_translator_is_handed_every_copied_file_after_the_copy(
-    ported: Ported,
+    upstream: Path, dest: Path, kernel_manifest: m.Manifest
 ) -> None:
-    """sailify rewrites in place, so the copies must already exist when it runs."""
-    offered = sorted(
-        f"csrc/upstream/{path.relative_to(ported.dest).as_posix()}"
-        for path in ported.offered
-    )
-    assert offered == sorted(ported.result.files)
-    assert all(path.is_file() for path in ported.offered)
+    """sailify rewrites in place under upstream names; the rename comes after.
+
+    The translator must see the copied tree exactly as upstream named it, with
+    every file already on disk; the vendor tree applies ``vendored_name`` once
+    translation is done.
+    """
+    offered: list[Path] = []
+    existing: list[bool] = []
+
+    def translate(dest_root: Path, files: Sequence[Path]) -> None:
+        offered.extend(files)
+        existing.extend(path.is_file() for path in files)
+
+    result = porting.port(upstream, dest, kernel_manifest, translate)
+
+    def vendored(path: Path) -> str:
+        rel = path.relative_to(dest.resolve()).as_posix()
+        return f"csrc/upstream/{m.vendored_name(f'csrc/{rel}')}"
+
+    assert sorted(vendored(path) for path in offered) == sorted(result.files)
+    assert all(existing)
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +502,9 @@ def test_text_overlay_requires_one_translated_match(
 
     if occurrences == 1:
         porting.port(upstream, dest, manifest, translate)
-        assert (dest / "libtorch_stable/cache_kernels.cu").read_text() == (
+        # The manifest keys the upstream `.cu` name; the overlay lands in the
+        # renamed vendored file.
+        assert (dest / "libtorch_stable/cache_kernels.hg").read_text() == (
             "void adapted() {}\n"
         )
     else:

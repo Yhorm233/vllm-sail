@@ -151,11 +151,15 @@ def test_rename_extension_targets_match_the_cmake_and_python_module_names(
     [
         (
             "csrc/libtorch_stable/cache_kernels.cu",
-            "csrc/upstream/libtorch_stable/cache_kernels.cu",
+            "csrc/upstream/libtorch_stable/cache_kernels.hg",
         ),
         (
             "csrc/libtorch_stable/moe/moe_wna16.cu",
-            "csrc/upstream/libtorch_stable/moe/moe_wna16.cu",
+            "csrc/upstream/libtorch_stable/moe/moe_wna16.hg",
+        ),
+        (
+            "csrc/libtorch_stable/torch_bindings.cpp",
+            "csrc/upstream/libtorch_stable/torch_bindings.cpp",
         ),
     ],
 )
@@ -179,14 +183,14 @@ def test_compiled_sources_partition_the_compiled_entries(shipped: m.Manifest) ->
     assert sources and moe_sources
 
 
-def test_every_vendored_cu_source_is_compiled(shipped: m.Manifest) -> None:
-    """A normal native build must not silently omit a vendored CUDA-shaped TU."""
+def test_every_vendored_hg_source_is_compiled(shipped: m.Manifest) -> None:
+    """A normal native build must not silently omit a vendored device TU."""
     root = Path(__file__).parents[2]
     sources, moe_sources = shipped.compiled_sources()
-    configured = {path for path in (*sources, *moe_sources) if path.endswith(".cu")}
+    configured = {path for path in (*sources, *moe_sources) if path.endswith(".hg")}
     vendored = {
         path.relative_to(root).as_posix()
-        for path in (root / "csrc" / "upstream").rglob("*.cu")
+        for path in (root / "csrc" / "upstream").rglob("*.hg")
     }
 
     assert configured == vendored

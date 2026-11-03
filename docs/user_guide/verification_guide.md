@@ -116,6 +116,12 @@ These tests require a real PPU and the applicable SDK libraries. Verify that the
 intended tests actually ran. Include dtype, shape, tolerance and device in a
 correctness report, and test both architecture targets when claiming both.
 
+Capability markers restrict tests to one chip: `cap80` runs only on compute
+capability 8.0 (Zhenwu 810E) and `cap89` only on 8.9 (Zhenwu M890); other
+devices skip them. `perf` marks performance benchmarks and `model_e2e` marks
+offline model end-to-end tests. Select or exclude them with `-m`, for example
+`pytest tests/e2e -q -rs -m "not perf"`.
+
 ### GDN fused MTP decode
 
 Run the native GDN MTP accuracy matrix with a native plugin build:

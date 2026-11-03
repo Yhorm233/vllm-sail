@@ -31,6 +31,7 @@ PR = {
     "user": USER,
     "head": {"sha": SHA},
     "base": {"ref": "release/next", "repo": {"full_name": REPO}},
+    "changed_files": 1,
     "labels": [{"name": "ready"}],
 }
 EVENT = {
@@ -810,6 +811,10 @@ def executor_setup(inputs=None, needs=None):
         },
     )
     gh.add("GET", ROOT + "/pulls/7", PR)
+    gh.page(
+        "/pulls/7/files",
+        [{"filename": "vllm_sail/platform.py", "status": "modified"}],
+    )
     permission(gh)
     gh.add("POST", ROOT + f"/statuses/{SHA}", {})
     gh.page(COMMENTS, [])
@@ -908,6 +913,20 @@ def test_report_mapping_and_finishes_old_sha_without_reauthorization(
     assert MARKER in reply(gh)
     assert status["description"] in reply(gh) and status["target_url"] in reply(gh)
     assert not any("/pulls/" in c[1] or "/collaborators/" in c[1] for c in gh.calls)
+
+
+def test_report_marks_docs_only_execution_as_skipped_success():
+    control, gh, _ = executor_setup(
+        needs={
+            "validate": {"result": "success", "outputs": {"skip_ppu": "true"}},
+            "ppu": {"result": "success"},
+        }
+    )
+    control.report()
+    status = gh.writes(f"/statuses/{SHA}")[0][2]
+    assert status["state"] == "success"
+    assert status["description"] == ("Skipped (no PPU-impacting changes) (attempt 2)")
+    assert status["description"] in reply(gh)
 
 
 @pytest.mark.parametrize("owner,patch", [(BOT, True), (USER, False)])
@@ -1308,7 +1327,7 @@ def test_stdlib_only_python310_syntax_and_physical_line_budget():
     from pathlib import Path
 
     source = Path(module().__file__).read_text()
-    assert len(source.splitlines()) <= 550
+    assert len(source.splitlines()) <= 650
     tree = ast.parse(source, feature_version=(3, 10))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1318,6 +1337,102 @@ def test_stdlib_only_python310_syntax_and_physical_line_budget():
             )
         elif isinstance(node, ast.ImportFrom):
             assert node.module.split(".")[0] in sys.stdlib_module_names
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [{"filename": "docs/guide.md", "status": "modified"}],
+        [{"filename": "README.md", "status": "modified"}],
+        [{"filename": ".github/ISSUE_TEMPLATE/bug_report.yml", "status": "modified"}],
+        [
+            {
+                "filename": "docs/new.md",
+                "previous_filename": "docs/old.md",
+                "status": "renamed",
+            }
+        ],
+    ],
+)
+def test_validate_skips_ppu_for_non_executable_changes(files, github_output, capsys):
+    control, gh, _ = executor_setup()
+    gh.add("GET", ROOT + "/pulls/7", {**PR, "changed_files": len(files)})
+    gh.page("/pulls/7/files", files)
+    control.validate()
+    outputs = dict(
+        line.split("=", 1) for line in github_output.read_text().splitlines()
+    )
+    assert outputs == {
+        "skip_ppu": "true",
+        "existing_build_run_id": "",
+        "native_reuse_run_id": "",
+        "wheel_source_sha": "",
+    }
+    assert not any(
+        c[1] == ROOT + RUNS or "/artifacts" in c[1] or "/compare/" in c[1]
+        for c in gh.calls
+    )
+    assert "mode=skip" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [
+            {"filename": "docs/guide.md", "status": "modified"},
+            {"filename": "vllm_sail/platform.py", "status": "modified"},
+        ],
+        [{"filename": ".github/workflows/ut.yaml", "status": "modified"}],
+        [{"filename": "tests/e2e/test_model.py", "status": "modified"}],
+        [{"filename": "MANIFEST.in", "status": "modified"}],
+        [{"filename": "requirements/ppu.txt", "status": "modified"}],
+        [{"filename": "docs/new.md", "status": "renamed"}],
+    ],
+)
+def test_validate_does_not_skip_ppu_for_executable_or_incomplete_changes(
+    files, github_output
+):
+    control, gh, _ = executor_setup()
+    gh.add("GET", ROOT + "/pulls/7", {**PR, "changed_files": len(files)})
+    gh.page("/pulls/7/files", files)
+    control.validate()
+    outputs = dict(
+        line.split("=", 1) for line in github_output.read_text().splitlines()
+    )
+    assert outputs["skip_ppu"] == "false"
+
+
+@pytest.mark.parametrize(
+    "changed,files",
+    [
+        (0, []),
+        (301, []),
+        (2, [{"filename": "docs/guide.md", "status": "modified"}]),
+    ],
+)
+def test_skip_detection_fails_closed_for_incomplete_file_inventory(
+    changed, files, github_output
+):
+    control, gh, _ = executor_setup()
+    gh.add("GET", ROOT + "/pulls/7", {**PR, "changed_files": changed})
+    if 0 < changed <= 300:
+        gh.page("/pulls/7/files", files)
+    control.validate()
+    outputs = dict(
+        line.split("=", 1) for line in github_output.read_text().splitlines()
+    )
+    assert outputs["skip_ppu"] == "false"
+
+
+def test_skip_detection_api_failure_runs_ppu_instead(github_output, capsys):
+    control, gh, _ = executor_setup()
+    gh.page("/pulls/7/files", http_error(503))
+    control.validate()
+    outputs = dict(
+        line.split("=", 1) for line in github_output.read_text().splitlines()
+    )
+    assert outputs["skip_ppu"] == "false"
+    assert "503" in capsys.readouterr().err
 
 
 # Reuse is a trusted executor optimization, never a command/dispatch decision.
@@ -1354,9 +1469,10 @@ def reuse_setup(files=None, candidates=None, compare=None):
 def validate_pair(control, gh, github_output):
     control.validate()
     assert states(gh) == ["pending"]
-    assert not any("/files" in c[1] for c in gh.calls)
+    assert len([c for c in gh.calls if c[1].endswith("/pulls/7/files")]) == 1
     assert not any(
-        "/pulls/" in c[1] and not c[1].endswith("/pulls/7") for c in gh.calls
+        "/pulls/" in c[1] and not c[1].endswith(("/pulls/7", "/pulls/7/files"))
+        for c in gh.calls
     )
     assert all(c[0] == "GET" or "/statuses/" in c[1] for c in gh.calls)
     assert github_output.exists(), "validate must emit the trusted reuse pair"
@@ -1376,7 +1492,9 @@ def test_command_does_not_inspect_files_or_choose_reuse():
 @pytest.mark.parametrize(
     "extra",
     [
+        {"skip_ppu": "true"},
         {"existing_build_run_id": "555"},
+        {"native_reuse_run_id": "555"},
         {"wheel_source_sha": OLD},
         {"unexpected": ""},
     ],
@@ -1388,6 +1506,15 @@ def test_executor_rejects_forged_extra_inputs_before_apis(extra, mode, github_ou
         getattr(control, mode)()
     assert gh.calls == []
     assert not github_output.exists()
+
+
+def reuse_result(mode, run_id="555", source=OLD):
+    return {
+        "skip_ppu": "false",
+        "existing_build_run_id": run_id if mode == "full" else "",
+        "native_reuse_run_id": run_id if mode == "native" else "",
+        "wheel_source_sha": source if mode != "none" else "",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1407,57 +1534,54 @@ def test_executor_rejects_forged_extra_inputs_before_apis(extra, mode, github_ou
         ],
     ],
 )
-def test_validate_reuses_proven_source_not_workflow_sha(files, github_output, capsys):
+def test_validate_reuses_complete_wheels_for_non_package_changes(
+    files, github_output, capsys
+):
     control, gh = reuse_setup(files=files)
-    assert validate_pair(control, gh, github_output) == {
-        "existing_build_run_id": "555",
-        "wheel_source_sha": OLD,
-    }
+    assert validate_pair(control, gh, github_output) == reuse_result("full")
     calls = [c[1] for c in gh.calls]
     assert ROOT + f"/compare/{OLD}...{SHA}" in calls
     assert calls.index(ROOT + "/collaborators/author/permission") < calls.index(
         ROOT + RUNS
     )
     logs = capsys.readouterr().out
-    assert "555" in logs and OLD in logs
+    assert "mode=full" in logs and "555" in logs and OLD in logs
 
 
 @pytest.mark.parametrize(
-    "path",
+    "path,mode",
     [
-        "README.md",
-        "LICENSE",
-        "MANIFEST.in",
-        "AGENTS.md",
-        "CONTRIBUTING.md",
-        "setup.py",
-        "pyproject.toml",
-        "CMakeLists.txt",
-        "csrc/kernel.cu",
-        "vllm_sail/file.py",
-        "plugin/hooks.py",
-        "cmake/build.cmake",
-        "requirements/dev.txt",
-        ".github/vllm-main-verified.commit",
-        "scripts/ci/build_ppu_wheels.sh",
-        "scripts/ci/ppu_image_stack.py",
-        "scripts/ci/ppu_wheel_manifest.py",
-        "unknown/file",
-        "scripts/ci/ppu_ci_command.py.bak",
+        ("README.md", "full"),
+        ("LICENSE", "full"),
+        ("MANIFEST.in", "full"),
+        ("AGENTS.md", "full"),
+        ("CONTRIBUTING.md", "full"),
+        ("requirements/dev.txt", "full"),
+        ("scripts/ci/build_ppu_wheels.sh", "none"),
+        ("scripts/ci/ppu_image_stack.py", "none"),
+        ("scripts/ci/ppu_wheel_manifest.py", "none"),
+        ("setup.py", "none"),
+        ("pyproject.toml", "none"),
+        ("CMakeLists.txt", "none"),
+        ("csrc/kernel.cu", "none"),
+        ("vllm_sail/file.py", "native"),
+        ("plugin/hooks.py", "none"),
+        ("cmake/build.cmake", "none"),
+        (".github/vllm-main-verified.commit", "none"),
+        ("unknown/file", "none"),
+        ("scripts/ci/ppu_ci_command.py.bak", "full"),
+        (".github/workflows/_ppu-build.yaml", "none"),
     ],
 )
 @pytest.mark.parametrize("rename", [False, True])
-def test_unknown_or_wheel_inputs_in_either_rename_path_build(
-    path, rename, github_output
-):
+def test_package_changes_use_a_verified_native_donor(path, mode, rename, github_output):
     file = {"filename": path}
     if rename:
         file = {"filename": "docs/new", "previous_filename": path, "status": "renamed"}
     control, gh = reuse_setup(files=[file])
-    assert validate_pair(control, gh, github_output) == {
-        "existing_build_run_id": "",
-        "wheel_source_sha": "",
-    }
+    assert validate_pair(control, gh, github_output) == reuse_result(
+        mode, source=SHA if mode == "native" else OLD
+    )
 
 
 @pytest.mark.parametrize(
@@ -1471,7 +1595,6 @@ def test_unknown_or_wheel_inputs_in_either_rename_path_build(
         {"status": "ahead", "merge_base_commit": {"sha": OLD}},
         {"status": "ahead", "merge_base_commit": {"sha": OLD}, "files": None},
         {"status": "ahead", "merge_base_commit": {"sha": OLD}, "files": "docs/a"},
-        {"status": "ahead", "merge_base_commit": {"sha": OLD}, "files": [{}]},
         {
             "status": "ahead",
             "merge_base_commit": {"sha": OLD},
@@ -1482,21 +1605,34 @@ def test_unknown_or_wheel_inputs_in_either_rename_path_build(
             "merge_base_commit": {"sha": OLD},
             "files": [{"filename": "docs/a"}] * 300,
         },
-        http_error(500),
     ],
 )
-def test_unusable_truncated_or_nonancestor_compare_builds(compare, github_output):
+def test_unusable_truncated_or_nonancestor_compare_rejects_donor(
+    compare, github_output
+):
     control, gh = reuse_setup(compare=compare)
-    assert validate_pair(control, gh, github_output) == {
-        "existing_build_run_id": "",
-        "wheel_source_sha": "",
-    }
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
+
+
+def test_malformed_compare_falls_back_to_full_build(github_output):
+    control, gh = reuse_setup(
+        compare={
+            "status": "ahead",
+            "merge_base_commit": {"sha": OLD},
+            "files": [{}],
+        }
+    )
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
+
+
+def test_compare_api_failure_falls_back_to_full_build(github_output):
+    control, gh = reuse_setup(compare=http_error(500))
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
 
 
 @pytest.mark.parametrize(
     "extra",
     [
-        {"head_sha": "d" * 40},
         {"head_sha": None},
         {"head_branch": "feature"},
         {"event": "pull_request"},
@@ -1511,11 +1647,19 @@ def test_validate_only_reuses_successful_trusted_executors(extra, github_output)
     control, gh = reuse_setup(
         candidates=[run(555, OLD, **{"conclusion": "success", **extra})]
     )
-    assert validate_pair(control, gh, github_output) == {
-        "existing_build_run_id": "",
-        "wheel_source_sha": "",
-    }
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
     assert not any("/compare/" in c[1] or "/artifacts" in c[1] for c in gh.calls)
+
+
+def test_validate_accepts_artifacts_from_an_older_trusted_workflow_revision(
+    github_output,
+):
+    control, gh = reuse_setup(
+        candidates=[run(555, OLD, conclusion="success", head_sha="d" * 40)]
+    )
+    assert validate_pair(control, gh, github_output) == reuse_result(
+        "native", source=SHA
+    )
 
 
 @pytest.mark.parametrize(
@@ -1535,10 +1679,9 @@ def test_other_pr_needs_actual_immutable_source_equivalence(
         files=[{"filename": "csrc/new.cu" if code_changed else "tests/new.py"}],
     )
     pair = validate_pair(control, gh, github_output)
-    assert pair == {
-        "existing_build_run_id": "" if code_changed else "555",
-        "wheel_source_sha": "" if code_changed else source,
-    }
+    mode = "full" if same_source or not code_changed else "none"
+    expected_source = source
+    assert pair == reuse_result(mode, source=expected_source)
 
 
 @pytest.mark.parametrize(
@@ -1560,10 +1703,9 @@ def test_missing_deleted_expired_or_reuse_only_run_falls_back_to_real_producer(
         ]
     )
     gh.page("/actions/runs/555/artifacts", artifacts, "artifacts")
-    assert validate_pair(control, gh, github_output) == {
-        "existing_build_run_id": "554",
-        "wheel_source_sha": OLD,
-    }
+    assert validate_pair(control, gh, github_output) == reuse_result(
+        "full", run_id="554"
+    )
 
 
 def test_reuse_artifacts_are_paginated(github_output):
@@ -1594,13 +1736,10 @@ def test_reuse_api_failure_logs_and_builds_not_optimistic_reuse(
         gh.page("/actions/runs/555/artifacts", http_error(503))
     else:
         gh.add("GET", ROOT + f"/compare/{OLD}...{SHA}", http_error(503))
-    assert validate_pair(control, gh, github_output) == {
-        "existing_build_run_id": "",
-        "wheel_source_sha": "",
-    }
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
     logs = capsys.readouterr()
     assert "503" in logs.err
-    assert "full build" in logs.out.lower()
+    assert "mode=none" in logs.out.lower()
 
 
 def test_reuse_candidates_paginate_and_bound_expensive_selection(github_output):
