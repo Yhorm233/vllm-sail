@@ -16,12 +16,62 @@ ROOT = Path(__file__).parents[2]
 SOURCE = ROOT / "vllm_sail/models/deepseek_v41/runtime_audit.py"
 
 
+@contextmanager
+def _isolated_audit_hooks():
+    """审计测试独占当前线程的 hooks，退出时恢复 coverage 等外层工具。"""
+    profile = sys.getprofile()
+    trace = sys.gettrace()
+    try:
+        sys.setprofile(None)
+        sys.settrace(None)
+        yield
+    finally:
+        sys.setprofile(profile)
+        sys.settrace(trace)
+
+
 @pytest.fixture
 def audit():
     spec = importlib.util.spec_from_file_location("v41_audit_unit", SOURCE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+    with _isolated_audit_hooks():
+        yield module
+
+
+@pytest.mark.parametrize("hooks", ["none", "profile", "trace", "both"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_isolated_audit_hooks_restore_outer_state(hooks, failed):
+    outer_profile = sys.getprofile()
+    outer_trace = sys.gettrace()
+
+    def existing_profile(*args):
+        return None
+
+    def existing_trace(*args):
+        return existing_trace
+
+    profile = existing_profile if hooks in ("profile", "both") else None
+    trace = existing_trace if hooks in ("trace", "both") else None
+    try:
+        sys.setprofile(profile)
+        sys.settrace(trace)
+        expected = (
+            pytest.raises(RuntimeError, match="fixture failure")
+            if failed
+            else nullcontext()
+        )
+        with expected:
+            with _isolated_audit_hooks():
+                assert sys.getprofile() is None
+                assert sys.gettrace() is None
+                if failed:
+                    raise RuntimeError("fixture failure")
+        assert sys.getprofile() is profile
+        assert sys.gettrace() is trace
+    finally:
+        sys.setprofile(outer_profile)
+        sys.settrace(outer_trace)
 
 
 def test_import_has_no_runtime_dependency(audit):
@@ -60,17 +110,28 @@ def test_failure_removes_profiler_and_is_not_success(audit, where):
     assert sys.getprofile() is None
 
 
-def test_existing_profiler_not_overwritten(audit):
+@pytest.mark.parametrize("kind", ["profile", "trace"])
+def test_existing_profiler_or_trace_not_overwritten(audit, kind):
     def existing(*args):
-        return None
+        return existing
 
-    sys.setprofile(existing)
+    getter = getattr(sys, "get" + kind)
+    setter = getattr(sys, "set" + kind)
+    previous = getter()
+    calls = []
+    setter(existing)
     try:
         with pytest.raises(RuntimeError, match="profiler/trace"):
-            audit.execute_traced(lambda: 1, (), {}, lambda: None)
-        assert sys.getprofile() is existing
+            audit.execute_traced(
+                lambda: calls.append("forward"),
+                (),
+                {},
+                lambda: calls.append("synchronize"),
+            )
+        assert getter() is existing
+        assert calls == []
     finally:
-        sys.setprofile(None)
+        setter(previous)
 
 
 def test_first_last_samples_bounded_counts_complete(audit, monkeypatch):
