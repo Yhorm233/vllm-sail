@@ -487,20 +487,6 @@ class PPUCutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None,
         output_shape: list,
     ) -> torch.Tensor:
-        # PPU MODIFICATION: begin
-        # PPU builds exclude CUTLASS. Keep quantized FP8 inputs, use PyTorch
-        # casts and FP32 GEMM, and apply scales/bias before final rounding.
-        if current_platform.is_ppu():
-            if As.numel() not in (1, A.shape[0]) or Bs.numel() not in (1, B.shape[1]):
-                raise ValueError(
-                    "PPU FP8 linear requires tensor/token and tensor/channel scales"
-                )
-            output = torch.mm(A.float(), B.float())
-            output = output * As.float().reshape(-1, 1) * Bs.float().reshape(1, -1)
-            if bias is not None:
-                output = output + bias.float()
-            return output.to(out_dtype).view(*output_shape)
-        # PPU MODIFICATION: end
         # Fused GEMM_DQ
         output = ops.cutlass_scaled_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias

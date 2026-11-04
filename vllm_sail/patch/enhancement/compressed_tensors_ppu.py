@@ -43,8 +43,8 @@ AFFECTED_VERSIONS = ">=0.31.0,<0.32.0"
 
 REASON_CHANNELWISE = (
     "The fork adds fp8_channelwise_layers to CompressedTensorsConfig: dense "
-    "layers listed there are quantized FP8 channelwise on PPU instead of with "
-    "the checkpoint's scheme; upstream has no such plumbing."
+    "layers listed there use FP8 channelwise on PPU while preserving explicit "
+    "INT8 weight schemes; upstream has no such plumbing."
 )
 REASON_MOE_REDIRECT = (
     "PPU runs compressed-tensors MXFP4 MoE through Mxfp4MoEMethod (whose PPU "
@@ -229,6 +229,15 @@ def install() -> None:
                 QuantizationStrategy,
                 QuantizationType,
             )
+            scheme_dict = self.get_scheme_dict(layer, layer_name)
+            weight_quant = (scheme_dict or {}).get("weights")
+            if (
+                weight_quant is not None
+                and weight_quant.type == QuantizationType.INT
+                and weight_quant.num_bits == 8
+            ):
+                return _upstream_get_scheme(self, layer, layer_name)
+
             from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (  # noqa: E501
                 CompressedTensorsW8A8Fp8,
             )

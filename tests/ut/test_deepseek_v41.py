@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """V4.1 integration contracts; CPU tests never import torch or vLLM."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -608,3 +609,85 @@ def test_v41_draft_inherits_its_own_loader_and_execution(modules):
     assert draft.hf_to_vllm_mapper is mapper
     assert mapper_args == [("fp4", "weight_scale")]
     assert draft.packed_modules_mapping["fused_wqa_wkv"] == ["wq_a", "wkv"]
+
+
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("int8", [False, True])
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("fail_forward", [False, True])
+@pytest.mark.parametrize("has_outer_config", [False, True])
+def test_v41_wrapper_scopes_int8_config_and_restores_forward_context(
+    modules, monkeypatch, ppu, int8, eager, fail_forward, has_outer_config
+):
+    calls = []
+    outer_config = object() if has_outer_config else None
+    current = [outer_config]
+    selected = ppu and int8
+    original_mapper, mapped = object(), object()
+    config = SimpleNamespace(
+        quant_config=None, model_config=SimpleNamespace(enforce_eager=eager)
+    )
+
+    @contextmanager
+    def configuration(value):
+        previous = current[0]
+        current[0] = value
+        calls.append(("configure", value))
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    class Base:
+        hf_to_vllm_mapper = original_mapper
+
+        def __init__(self, **kwargs):
+            calls.append(("construct", kwargs))
+
+        def forward(self, *args, **kwargs):
+            assert current[0] is (config if selected else outer_config)
+            calls.append(("forward", args, kwargs))
+            if fail_forward:
+                raise RuntimeError("forward failed")
+            return 17
+
+    def recognize(value):
+        assert value is config
+        calls.append(("recognize", value))
+        return int8
+
+    def map_weights(mapper):
+        assert mapper is original_mapper
+        calls.append(("map", mapper))
+        return mapped
+
+    modules("vllm.config", set_current_vllm_config=configuration)
+    modules("vllm.models.deepseek_v41.nvidia.vl_model", DeepseekV41ForCausalLM=Base)
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
+    modules("vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=recognize)
+    module = load_patch("vllm_sail/models/deepseek_v41/ppu_model.py")
+    monkeypatch.setattr(module, "int8_weights_mapper", map_weights)
+    model = module.DeepseekV41ForCausalLM(vllm_config=config, prefix="model")
+    assert calls[0] == ("construct", dict(vllm_config=config, prefix="model"))
+    assert model._v41_int8_config is (config if selected else None)
+    assert model.hf_to_vllm_mapper is (mapped if selected else original_mapper)
+    assert Base.hf_to_vllm_mapper is original_mapper
+    assert sum(call[0] == "recognize" for call in calls) == int(ppu)
+    assert sum(call[0] == "map" for call in calls) == int(selected)
+    constructor_calls = list(calls)
+    calls.clear()
+    for _ in range(2):
+        if fail_forward:
+            with pytest.raises(RuntimeError, match="forward failed"):
+                model.forward(1, 2, 3, 4, lookback_token_ids=5, extra=6)
+        else:
+            assert model.forward(1, 2, 3, 4, lookback_token_ids=5, extra=6) == 17
+        assert calls[-1] == (
+            "forward",
+            (1, 2, 3, 4),
+            dict(lookback_token_ids=5, extra=6),
+        )
+        assert current[0] is outer_config
+    assert sum(call[0] == "configure" for call in calls) == 2 * int(selected)
+    assert all(call[0] in ("configure", "forward") for call in calls)
+    assert sum(call[0] == "construct" for call in constructor_calls) == 1

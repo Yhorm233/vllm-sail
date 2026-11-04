@@ -44,7 +44,6 @@ if TYPE_CHECKING:
     VLLM_SAIL_ENABLE_MOE_MARLIN: bool = False
     VLLM_SAIL_USE_TRITON_INT8_QUANT: bool = True
     VLLM_SAIL_NVTX_PROFILE: bool = False
-    VLLM_SAIL_V41_AUDIT_DIR: str = ""
     VLLM_SAIL_NVTX_DUMP_TOPK: bool = False
     VLLM_SAIL_NVTX_VFA_DUMP_SEQLEN: bool = False
     VLLM_DEEPEPLL_RECV_HOOK: bool = True
@@ -64,7 +63,6 @@ if TYPE_CHECKING:
     VLLM_PPU_ENABLE_MOE_MARLIN: bool = False
     VLLM_PPU_USE_TRITON_INT8_QUANT: bool = True
     VLLM_PPU_NVTX_PROFILE: bool = False
-    VLLM_PPU_V41_AUDIT_DIR: str = ""
     VLLM_PPU_NVTX_DUMP_TOPK: bool = False
     VLLM_PPU_NVTX_VFA_DUMP_SEQLEN: bool = False
 
@@ -163,8 +161,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 selects an event-based fallback that is also a simpler debugging
     # baseline for overlap issues.
     "VLLM_DEEPEPLL_RECV_HOOK": _bool("VLLM_DEEPEPLL_RECV_HOOK", True),
-    # V4.1 audit directory; an empty value disables audit imports and profiler installation.
-    "VLLM_SAIL_V41_AUDIT_DIR": lambda: _read_env("VLLM_SAIL_V41_AUDIT_DIR")[1] or "",
     # -- Profiling (opt-in; see vllm_sail/profiling/) ------------------------
     "VLLM_SAIL_NVTX_PROFILE": _bool(
         "VLLM_SAIL_NVTX_PROFILE",
