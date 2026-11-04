@@ -226,8 +226,8 @@ def _dequantize_and_gather_k_cache_triton(
     """SM80 Triton dispatch — uses _decode_e4m3fn instead of the
     fp8e4nv bitcast that Triton refuses to compile on SM80."""
     # PPU MODIFICATION: begin
-    # 主 cache 的 E4M3/UE8M0 解码与 DSA 的 INT8 量化合同无关。
-    # 复用相同分页内核，分别保留 MXFP8 和 FP8/BF16 的真实平面布局。
+    # Main-cache E4M3/UE8M0 decoding is independent of the DSA INT8 contract.
+    # Reuse the paged kernel, preserving the MXFP8 and FP8/BF16 planar layouts.
     if k_cache.shape[-1] == 528:
         TOKEN_FP8_DIM = 512
         TOKEN_BF16_DIM = 0

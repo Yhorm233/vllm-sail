@@ -16,7 +16,7 @@ from vllm.models.deepseek_v41.nvidia.engram import (
 
 
 def validate_weight(param, loaded_weight):
-    """拒绝 INT8 表和 FP32 scale 的隐式类型转换或不完整分片。"""
+    """Reject implicit casts or incomplete shards of INT8 tables and FP32 scales."""
     if (
         param.dtype not in (torch.int8, torch.float32)
         or loaded_weight.dtype != param.dtype
@@ -73,7 +73,7 @@ class Int8DPSharedEngramStorage(DPSharedEngramStorage):
 
 
 class Int8ParallelEngramEmbedding(ParallelEngramEmbedding):
-    """保留上游构造、分片、UVA、prefetch，仅替换 INT8/FP32 存储。"""
+    """Replace only INT8/FP32 storage; retain upstream setup, sharding, UVA and prefetch."""
 
     _weight_loader = staticmethod(load_weight)
 

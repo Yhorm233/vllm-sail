@@ -226,7 +226,7 @@ def test_fp8_paged_causal_prefixes_and_padding_graph(next_n, per_query_context, 
     sms = get_num_sms()
 
     def step():
-        # SDK metadata 要求二维 query 前缀；logits 仍接收原一维/二维输入。
+        # SDK metadata requires 2D query prefixes; logits keep the original 1D/2D input.
         metadata_context = context
         if not per_query_context:
             offsets = torch.arange(next_n, dtype=context.dtype, device=context.device)

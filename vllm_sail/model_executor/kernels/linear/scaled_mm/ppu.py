@@ -469,8 +469,8 @@ class PPUCutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         output_shape: list,
     ) -> torch.Tensor:
         # PPU MODIFICATION: begin
-        # 810E 的 CUTLASS op 是不支持执行的 stub。保留 FP8 量化输入，
-        # 通过 PyTorch 转换和 FP32 GEMM 计算；scale 和 bias 在最终舍入前应用。
+        # The 810E CUTLASS op is a non-executable stub. Keep quantized FP8 inputs,
+        # use PyTorch casts and FP32 GEMM, and apply scales/bias before final rounding.
         if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
             if As.numel() not in (1, A.shape[0]) or Bs.numel() not in (1, B.shape[1]):
                 raise ValueError(

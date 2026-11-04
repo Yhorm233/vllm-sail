@@ -672,7 +672,7 @@ def _fp8_paged_mqa_logits_ppu10(
     block_tables: torch.Tensor,
     max_model_len: int,
 ) -> torch.Tensor:
-    """810E FP8 兼容计算：固定形状、分页平面布局，无设备标量读取。"""
+    """810E FP8 emulation with fixed shapes, paged planar layout and no scalar reads."""
     batch, next_n, heads, dim = q_fp8.shape
     pages, block_size, kv_heads, record_bytes = kv_cache.shape
     if kv_heads != 1 or record_bytes != dim + 4 or kv_cache.dtype != torch.uint8:
@@ -680,7 +680,7 @@ def _fp8_paged_mqa_logits_ppu10(
     if max_model_len > block_tables.shape[1] * block_size:
         raise ValueError("block table cannot address max_model_len")
     if context_lens.ndim == 1:
-        # 一维 context 是请求的最终长度；每个 query 保留自己的因果前缀。
+        # 1D context holds final request lengths; each query keeps its causal prefix.
         ends = (
             context_lens[:, None]
             - next_n
@@ -696,11 +696,11 @@ def _fp8_paged_mqa_logits_ppu10(
     slots = positions % block_size
     logical_pages = positions // block_size
     page_ids = block_tables[:, logical_pages].long()
-    # Graph padding 行可能没有合法 page。只在可见前缀内使用请求的地址。
+    # Graph padding rows may lack valid pages; use request addresses only when visible.
     visible = positions[None, :] < ends.max(dim=1).values[:, None]
     page_ids = torch.where(visible, page_ids, 0)
-    # SDK 的每页格式是全部 FP8 token data，然后全部 FP32 token scales。
-    # 必须保留真实 block stride/storage offset，不能按交错 record 解包。
+    # SDK pages store all FP8 token data followed by all FP32 token scales.
+    # Preserve block strides/storage offsets; do not unpack as interleaved records.
     offset = kv_cache.storage_offset()
     key_bytes = torch.as_strided(
         kv_cache, (pages, block_size, dim), (kv_cache.stride(0), dim, 1), offset
@@ -758,8 +758,8 @@ def fp8_paged_mqa_logits(
         `torch.float32`.
     """
     # PPU MODIFICATION: begin
-    # SDK FP8 MMA 在 810E 编译失败；不改变 INT8、MXFP4 或其他平台路由。
-    # 软件路径额外清理不可见列，也满足 clean_logits=False 的有效前缀合同。
+    # SDK FP8 MMA fails to compile on 810E; keep INT8, MXFP4 and other platform routes.
+    # Software also masks invisible columns, honoring the clean_logits=False prefix contract.
     if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
         return _fp8_paged_mqa_logits_ppu10(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len

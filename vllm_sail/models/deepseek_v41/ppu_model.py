@@ -62,8 +62,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         forward = super().forward
         args = (input_ids, positions, intermediate_tensors, inputs_embeds)
         kwargs["lookback_token_ids"] = lookback_token_ids
-        # profiling 和常规 forward 不保证有初始化配置上下文。
-        # 仅为构造时核验过的 810E W8A8 实例提供作用域配置，退出或异常时恢复。
+        # Profiling and regular forward may lack an initialized config context.
+        # Scope config to verified 810E W8A8 instances; restore it on exit or error.
         context = (
             set_current_vllm_config(self._v41_int8_config)
             if self._v41_int8_config is not None

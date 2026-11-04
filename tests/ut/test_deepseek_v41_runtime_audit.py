@@ -18,7 +18,7 @@ SOURCE = ROOT / "vllm_sail/models/deepseek_v41/runtime_audit.py"
 
 @contextmanager
 def _isolated_audit_hooks():
-    """审计测试独占当前线程的 hooks，退出时恢复 coverage 等外层工具。"""
+    """Isolate this thread's audit hooks and restore outer tools such as coverage."""
     profile = sys.getprofile()
     trace = sys.gettrace()
     try:

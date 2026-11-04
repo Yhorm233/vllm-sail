@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""在上游 V4.1 插件结构中仅接入 810E W8A8 算子，不替换其他量化路径。"""
+"""Integrate 810E W8A8 operators into upstream V4.1 without replacing other quantization paths."""
 
 import sys
 
@@ -105,8 +105,8 @@ def dequantize_and_gather_k_cache(out, k_cache, seq_lens, gather_lens, block_tab
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset,
         )
     # PPU MODIFICATION: begin
-    # FP8/MXFP8 主 cache 也需软件 E4M3 解码；此分支不启用 INT8 Q/K。
-    # 仅替换已有布局的 810E 读取，FNUZ、NVFP4 及其他平台继续委托。
+    # FP8/MXFP8 main caches also need software E4M3 decoding; do not enable INT8 Q/K.
+    # Replace only 810E reads for existing layouts; delegate FNUZ, NVFP4 and other platforms.
     if (
         current_platform.is_ppu()
         and current_platform.is_device_capability((8, 0))
@@ -122,7 +122,7 @@ def dequantize_and_gather_k_cache(out, k_cache, seq_lens, gather_lens, block_tab
                    offset, use_fnuz=use_fnuz)
 
 
-# 仅同步已加载的 V4.1 消费者；不触碰 V4 共用 provider。
+# Rebind only loaded V4.1 consumers; leave shared V4 providers untouched.
 _ALIASES = (
     ("fused_indexer_q_rope_quant", _q, fused_indexer_q_rope_quant),
     ("indexer_k_norm_rope_store", _k, indexer_k_norm_rope_store),

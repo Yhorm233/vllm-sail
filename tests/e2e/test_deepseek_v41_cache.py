@@ -91,7 +91,7 @@ def test_cache_gather_after_preloaded_module(record_bytes, tail_only, graph_repl
             offset,
         )
 
-    # 无 INT8 权重量化配置：只验证既有 FP8/MXFP8 cache 的软件解码。
+    # No INT8 weight config: verify only software decoding of existing FP8/MXFP8 caches.
     with set_current_vllm_config(VllmConfig()):
         if graph_replay:
             stream = torch.cuda.Stream()
@@ -108,7 +108,7 @@ def test_cache_gather_after_preloaded_module(record_bytes, tail_only, graph_repl
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
         assert (storage[:, 1::2] == -77).all()
         if graph_replay:
-            # 改变同一设备地址的 cache 内容，确认 replay 没有冻结旧输入。
+            # Change cache data at the same device address to detect stale replay inputs.
             cache.copy_(packed.flip(0).reshape_as(cache))
             graph.replay()
             torch.testing.assert_close(

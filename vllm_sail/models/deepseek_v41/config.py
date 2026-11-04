@@ -5,7 +5,7 @@ import re
 
 
 def uses_int8_w8a8(vllm_config):
-    """只接受 V4.1 的对称 W8A8 channel/token compressed-tensors 合同。"""
+    """Accept only V4.1 symmetric W8A8 channel/token compressed-tensors contracts."""
     quant = getattr(vllm_config, "quant_config", None)
     if quant is None or quant.get_name() != "compressed-tensors":
         return False

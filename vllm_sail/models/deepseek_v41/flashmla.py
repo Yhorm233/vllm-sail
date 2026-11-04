@@ -42,7 +42,8 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
             ):
                 if num_heads not in (8, 64):
                     raise ValueError(
-                        f"810E V4.1 INT8 仅验证 TP8/TP1，实际 head 数为 {num_heads}"
+                        "810E V4.1 INT8 is validated only for TP8/TP1; "
+                        f"actual head count is {num_heads}"
                     )
                 return num_heads
             return PPUV4FlashMLAAttention.get_padded_num_q_heads(num_heads)

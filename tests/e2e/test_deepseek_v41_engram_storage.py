@@ -10,7 +10,7 @@ torch = pytest.importorskip("torch")
 
 @pytest.fixture
 def modules(monkeypatch):
-    # 共享 conftest 可能已探测设备；本测试不得新增初始化或设备操作。
+    # Shared conftest may have probed devices; this test must add no device operations.
     initialized_before = torch.cuda.is_initialized()
 
     def forbidden(*args, **kwargs):
@@ -87,7 +87,7 @@ def test_real_constructor_attributes_and_tp_ownership(modules, monkeypatch, shar
     common, upstream, plugin = modules
     monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 1)
-    # 上游构造函数继续拥有 DP 分片与 UVA 前置条件。
+    # The upstream constructor retains ownership of DP sharding and UVA prerequisites.
     monkeypatch.setattr(upstream, "get_engram_dp_size", lambda: 16 if shared else 1)
     monkeypatch.setattr(upstream, "is_uva_available", lambda: True)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)

@@ -33,7 +33,7 @@ def test_channelwise_engram_lookup_preserves_fp32_scales(cpu_offload):
         [[0, 4, 8, 999], [0, 4, 11, -1]], dtype=torch.int64, device="cuda"
     )
     out = torch.empty(2, 3, 256, dtype=torch.bfloat16, device="cuda")
-    # 通过已安装的模型入口选择 810E 软件解码或上游原生 FP8 内核。
+    # Use the installed model entry point to select 810E software or native FP8 decoding.
     owner = SimpleNamespace(
         weight=weight,
         _storage=lambda: views,

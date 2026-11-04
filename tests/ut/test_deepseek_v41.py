@@ -560,7 +560,7 @@ def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, co
             and args[4] is attn._wo_b_proj
         )
         assert kw["einsum_recipe"] == (1, 1, 128) and kw["heads_per_group"] == 4
-        with pytest.raises(ValueError, match="实际 head"):
+        with pytest.raises(ValueError, match="actual head count"):
             cls.get_padded_num_q_heads(16)
     assert cls.get_padded_num_q_heads(8) == (8 if ppu else 64)
     backend = module.PPUDeepseekV41FlashMLABackend
