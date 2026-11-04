@@ -588,7 +588,7 @@ def test_wrapper_audit_guard_and_forward_delegation(
     calls = []
     outer_config = object()
     current = [outer_config]
-    selected = ppu and cap == (8, 0) and int8
+    selected = ppu and int8
 
     @contextmanager
     def configuration(value):
@@ -650,8 +650,8 @@ def test_wrapper_audit_guard_and_forward_delegation(
         quant_config=None, model_config=types.SimpleNamespace(enforce_eager=eager)
     )
     cls = namespace["DeepseekV41ForCausalLM"]
-    if enabled and not (ppu and cap == (8, 0) and eager):
-        with pytest.raises(ValueError, match="810E PPU eager"):
+    if enabled and not (ppu and eager):
+        with pytest.raises(ValueError, match="PPU eager"):
             cls(vllm_config=config)
         assert calls == []
         return

@@ -105,11 +105,7 @@ def _create_embedding(self, layout, layer_hash_index):
     vllm_config = get_current_vllm_config()
     quant = getattr(vllm_config.model_config.hf_config, "quantization_config", None) or {}
     name = f"layers.{layout.layer_ids[layer_hash_index]}.engram.embed"
-    if (
-        current_platform.is_ppu()
-        and current_platform.is_device_capability((8, 0))
-        and uses_int8_w8a8(vllm_config)
-    ):
+    if current_platform.is_ppu() and uses_int8_w8a8(vllm_config):
         from vllm_sail.models.deepseek_v41.engram import Int8ParallelEngramEmbedding
 
         config = vllm_config.engram_config
@@ -134,12 +130,12 @@ def _create_embedding(self, layout, layer_hash_index):
 
 @patch(
     "vllm.models.deepseek_v41.common.engram", "ParallelEngramEmbedding.lookup",
-    reason="810E Engram requires INT8/FP32 lookup or software E4M3 decoding without changing upstream offload and prefetch.",
+    reason="PPU Engram uses INT8/FP32 lookup or software E4M3 decoding without changing upstream offload and prefetch.",
     affected_versions=_AFFECTED,
-    remove_when="Upstream Engram lookup supports 810E software E4M3 and INT8 per-row scales.",
+    remove_when="Upstream Engram lookup supports PPU software E4M3 and INT8 per-row scales.",
 )
 def lookup(self, indices, out, background=False):
-    if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
+    if current_platform.is_ppu():
         if self.weight.dtype != torch.int8 or uses_int8_w8a8(get_current_vllm_config()):
             from vllm_sail.models.deepseek_v41.ops.engram_lookup import lookup as ppu_lookup
 
@@ -157,8 +153,7 @@ def lookup(self, indices, out, background=False):
     remove_when="Engram shared-memory capacity calculation follows the selected storage format.",
 )
 def can_share_engram_tables(layout, block_size=32):
-    if (current_platform.is_ppu() and current_platform.is_device_capability((8, 0))
-            and uses_int8_w8a8(get_current_vllm_config())):
+    if current_platform.is_ppu() and uses_int8_w8a8(get_current_vllm_config()):
         from vllm_sail.models.deepseek_v41.engram import can_share_engram_tables as share
 
         return share(layout, block_size)

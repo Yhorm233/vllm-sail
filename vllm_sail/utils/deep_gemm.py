@@ -664,67 +664,6 @@ def get_paged_mqa_logits_metadata(
     )
 
 
-def _fp8_paged_mqa_logits_ppu10(
-    q_fp8: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-) -> torch.Tensor:
-    """810E FP8 emulation with fixed shapes, paged planar layout and no scalar reads."""
-    batch, next_n, heads, dim = q_fp8.shape
-    pages, block_size, kv_heads, record_bytes = kv_cache.shape
-    if kv_heads != 1 or record_bytes != dim + 4 or kv_cache.dtype != torch.uint8:
-        raise ValueError("810E FP8 indexer requires packed FP8 values and FP32 scales")
-    if max_model_len > block_tables.shape[1] * block_size:
-        raise ValueError("block table cannot address max_model_len")
-    if context_lens.ndim == 1:
-        # 1D context holds final request lengths; each query keeps its causal prefix.
-        ends = (
-            context_lens[:, None]
-            - next_n
-            + torch.arange(
-                1, next_n + 1, device=q_fp8.device, dtype=context_lens.dtype
-            )[None, :]
-        )
-    elif tuple(context_lens.shape) == (batch, next_n):
-        ends = context_lens
-    else:
-        raise ValueError("context lengths must have shape [B] or [B, next_n]")
-    positions = torch.arange(max_model_len, device=q_fp8.device)
-    slots = positions % block_size
-    logical_pages = positions // block_size
-    page_ids = block_tables[:, logical_pages].long()
-    # Graph padding rows may lack valid pages; use request addresses only when visible.
-    visible = positions[None, :] < ends.max(dim=1).values[:, None]
-    page_ids = torch.where(visible, page_ids, 0)
-    # SDK pages store all FP8 token data followed by all FP32 token scales.
-    # Preserve block strides/storage offsets; do not unpack as interleaved records.
-    offset = kv_cache.storage_offset()
-    key_bytes = torch.as_strided(
-        kv_cache, (pages, block_size, dim), (kv_cache.stride(0), dim, 1), offset
-    )
-    scale_bytes = torch.as_strided(
-        kv_cache,
-        (pages, block_size, 4),
-        (kv_cache.stride(0), 4, 1),
-        offset + block_size * dim,
-    )
-    keys = key_bytes[page_ids, slots[None, :]].view(q_fp8.dtype).float()
-    scales = scale_bytes[page_ids, slots[None, :]].contiguous().view(torch.float32)
-    scores = torch.bmm(
-        q_fp8.float().reshape(batch, next_n * heads, dim), keys.transpose(1, 2)
-    ).reshape(batch, next_n, heads, max_model_len)
-    terms = scores.clamp_min(0) * scales[:, None, :, :].transpose(2, 3)
-    terms = terms * weights.reshape(batch, next_n, heads, 1)
-    logits = terms.sum(dim=2)
-    logits = logits.masked_fill(
-        positions[None, None, :] >= ends[:, :, None], float("-inf")
-    )
-    return logits.reshape(batch * next_n, max_model_len)
-
-
 def fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -757,14 +696,6 @@ def fp8_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    # PPU MODIFICATION: begin
-    # SDK FP8 MMA fails to compile on 810E; keep INT8, MXFP4 and other platform routes.
-    # Software also masks invisible columns, honoring the clean_logits=False prefix contract.
-    if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
-        return _fp8_paged_mqa_logits_ppu10(
-            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
-        )
-    # PPU MODIFICATION: end
     _lazy_init()
     if _fp8_paged_mqa_logits_impl is None:
         return _missing()
@@ -793,11 +724,11 @@ def int8_paged_mqa_logits(
     """Compute INT8 MQA logits using paged KV-cache.
 
     Args:
-        q_fp8: Query tensor of shape [B, next_n, H, D]. Casted to
-            `torch.float8_e4m3fn` by caller.
-        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
-            [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. The last
-            4 bytes per (block,pos) store the `float` dequant scale.
+        q_fp8: Legacy argument name for INT8 Q of shape [B, next_n, H, D],
+            dtype `torch.int8`; the Q scale is folded into `weights`.
+        kv_cache_fp8: Legacy argument name for the packed INT8 cache with shape
+            [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. Each page
+            stores an INT8 value plane followed by an FP32 scale plane.
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
         context_lens: Tensor of shape [B], dtype int32; effective context length
             for each batch element.

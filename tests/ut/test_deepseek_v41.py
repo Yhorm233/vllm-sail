@@ -467,10 +467,16 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         (True, (8, 0), True),
         (True, (8, 0), False),
         (True, (8, 9), True),
+        (True, (8, 9), False),
+        (True, (9, 0), True),
         (False, (8, 0), True),
+        (False, (8, 9), True),
     ],
 )
-def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, contract):
+@pytest.mark.parametrize("weight_dtype", ["int8", "bf16"])
+def test_v41_projection_dispatches_by_quantization(
+    modules, ppu, capability, contract, weight_dtype
+):
     calls = []
 
     class Upstream:
@@ -512,9 +518,7 @@ def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, co
     )
     modules(
         "vllm.platforms",
-        current_platform=SimpleNamespace(
-            is_ppu=lambda: ppu, is_device_capability=lambda cap: cap == capability
-        ),
+        current_platform=SimpleNamespace(is_ppu=lambda: ppu),
     )
     modules(
         "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
@@ -535,7 +539,7 @@ def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, co
     attn = cls()
     attn.__dict__.update(
         _o_proj_block_size=128,
-        wo_a=SimpleNamespace(weight=SimpleNamespace(dtype="int8")),
+        wo_a=SimpleNamespace(weight=SimpleNamespace(dtype=weight_dtype)),
         _wo_b_proj=object(),
         rotary_emb=SimpleNamespace(cos_sin_cache=object()),
         n_local_groups=2,
@@ -546,7 +550,7 @@ def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, co
     )
     expected = (
         "int8"
-        if ppu and capability == (8, 0) and contract
+        if ppu and contract and weight_dtype == "int8"
         else "ppuv4"
         if ppu
         else "upstream"
@@ -564,8 +568,10 @@ def test_v41_int8_projection_and_backend_are_narrow(modules, ppu, capability, co
             cls.get_padded_num_q_heads(16)
     assert cls.get_padded_num_q_heads(8) == (8 if ppu else 64)
     backend = module.PPUDeepseekV41FlashMLABackend
-    assert backend.supports_compute_capability(SimpleNamespace(major=8, minor=0)) is ppu
-    assert backend.supports_compute_capability(SimpleNamespace(major=9, minor=0))
+    for major, minor in ((8, 0), (8, 9), (9, 0), (10, 0)):
+        assert backend.supports_compute_capability(
+            SimpleNamespace(major=major, minor=minor)
+        ) is (ppu or major in (9, 10))
 
 
 def test_v41_draft_inherits_its_own_loader_and_execution(modules):

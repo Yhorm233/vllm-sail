@@ -138,7 +138,7 @@ def test_export_dispatch_preserves_bf16_and_per_layer_precision(
 
 @pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
 @pytest.mark.parametrize("bias", [False, True])
-def test_fp8_linear_810e_scale_axes_and_delegation(ppu, cap, bias):
+def test_fp8_linear_ppu_scale_axes_and_delegation(ppu, cap, bias):
     class Tensor:
         def __init__(self, label, shape=(2, 3), count=1):
             self.label, self.shape, self.count = label, shape, count
@@ -199,7 +199,7 @@ def test_fp8_linear_810e_scale_axes_and_delegation(ppu, cap, bias):
         output_shape=[1, 2, 3],
     )
     result = apply(None, **kwargs)
-    if ppu and cap == (8, 0):
+    if ppu:
         assert calls == [("mm", "a", "b")]
         scaled = (
             "mul",
@@ -226,12 +226,8 @@ def test_fp8_linear_810e_scale_axes_and_delegation(ppu, cap, bias):
 
 @pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
 @pytest.mark.parametrize("clean", [False, True])
-def test_fp8_paged_logits_keeps_sdk_route_outside_810e(ppu, cap, clean):
+def test_fp8_paged_logits_keeps_sdk_route_without_ppu_emulation(ppu, cap, clean):
     calls = []
-
-    def software(*args):
-        calls.append(("software", args))
-        return "software"
 
     def sdk(*args, **kwargs):
         calls.append(("sdk", args, kwargs))
@@ -245,15 +241,10 @@ def test_fp8_paged_logits_keeps_sdk_route_outside_810e(ppu, cap, clean):
                 is_ppu=lambda: ppu,
                 is_device_capability=lambda expected: cap == expected,
             ),
-            "_fp8_paged_mqa_logits_ppu10": software,
             "_lazy_init": lambda: calls.append(("lazy",)),
             "_fp8_paged_mqa_logits_impl": sdk,
         },
     )
     args = tuple(range(7))
-    if ppu and cap == (8, 0):
-        assert wrapper(*args, clean) == "software"
-        assert calls == [("software", args[:5] + (args[6],))]
-    else:
-        assert wrapper(*args, clean) == "sdk"
-        assert calls == [("lazy",), ("sdk", args, dict(clean_logits=clean))]
+    assert wrapper(*args, clean) == "sdk"
+    assert calls == [("lazy",), ("sdk", args, dict(clean_logits=clean))]

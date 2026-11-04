@@ -249,24 +249,32 @@ def test_k_aliases_forward_exact_contract(installed, consumer):
     assert fn(*range(8), True) == "k_upstream"
 
 
-@pytest.mark.parametrize("ppu,cap", [(False, (8, 0)), (True, (8, 9))])
-def test_non_810e_delegation(installed, ppu, cap):
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
+def test_non_ppu_delegation(installed, cap):
     state = installed
-    state.platform.ppu, state.platform.capability = ppu, cap
+    state.platform.ppu, state.platform.capability = False, cap
     assert state.patch.fused_indexer_q_rope_quant(*range(6)) == "q_upstream"
     assert "output_buffers" not in state.calls[-1][2]
     assert state.patch.indexer_k_norm_rope_store(*range(9)) == "k_upstream"
     assert state.patch.rope_quant_insert(*range(6)) == "store_upstream"
     assert state.engram.lookup(None, 1, 2) == "lookup_upstream"
-    assert state.selector._select_dsv4_attn_cls(state.config) is (
-        state.ppu if ppu else state.nvidia
-    )
+    assert state.selector._select_dsv4_attn_cls(state.config) is state.nvidia
     with pytest.raises(ValueError, match="output_buffers"):
         state.patch.fused_indexer_q_rope_quant(*range(6), output_buffers=(1, 2))
 
 
-def test_selector_cache_and_engram(installed):
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
+def test_selector_cache_and_engram(installed, cap):
     state = installed
+    state.platform.capability = cap
+
+    def reject_capability_query(*args):
+        raise AssertionError("V4.1 INT8 dispatch must not query chip capability")
+
+    state.platform.is_device_capability = reject_capability_query
+    assert state.patch._uses_int8() is True
+    assert state.patch.fused_indexer_q_rope_quant(*range(6)) == "q810"
+    assert state.patch.indexer_k_norm_rope_store(*range(8), False) == "k810"
     assert state.selector._select_dsv4_attn_cls(state.config) is state.ppu
     assert (
         state.modules[BASE + ".compressor"].rope_quant_insert(*range(6)) == "store810"
@@ -298,7 +306,7 @@ def test_fp8_main_cache_decoding_does_not_enable_int8(
     assert state.patch._uses_int8() is False
     cache = types.SimpleNamespace(dtype="uint8", shape=(2, 64, record_bytes))
     args = (0, cache, 2, None, 4, 64, 3)
-    selected = ppu and cap == (8, 0) and not use_fnuz and record_bytes in (528, 584)
+    selected = ppu and not use_fnuz and record_bytes in (528, 584)
     consumer = state.modules[BASE + ".nvidia.prefill"].dequantize_and_gather_k_cache
     assert consumer(*args, use_fnuz=use_fnuz) == (
         "gather810" if selected else "gather_upstream"
@@ -388,8 +396,10 @@ def test_engram_sharing_retains_upstream_capacity_fallback(installed):
     assert fn(None) is False
 
 
-def test_int8_engram_factory_and_non_quant_isolation(installed):
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
+def test_int8_engram_factory_and_non_quant_isolation(installed, cap):
     state = installed
+    state.platform.capability = cap
     layout = types.SimpleNamespace(
         layer_ids=[1, 14],
         num_embeddings=[123, 456],
@@ -417,10 +427,12 @@ def test_int8_engram_factory_and_non_quant_isolation(installed):
         ("dynamic", True),
     ],
 )
-def test_other_compressed_formats_do_not_use_int8_engram(installed, field, value):
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9)])
+def test_other_compressed_formats_do_not_use_int8_engram(installed, field, value, cap):
     state = installed
     raw = state.config.model_config.hf_config.quantization_config
     raw["config_groups"]["W8A8"]["weights"][field] = value
+    state.platform.capability = cap
     assert state.patch._uses_int8() is False
     layout = types.SimpleNamespace(layer_ids=[1])
     assert state.engram._create_embedding(None, layout, 0) == "embedding_upstream"
@@ -436,12 +448,14 @@ def test_other_compressed_formats_do_not_use_int8_engram(installed, field, value
         ("symmetric", False),
     ],
 )
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9)])
 def test_non_w8a8_quantization_delegates_all_int8_operators(
-    installed, kind, field, value
+    installed, kind, field, value, cap
 ):
     state = installed
     raw = state.config.model_config.hf_config.quantization_config
     raw["config_groups"]["W8A8"][kind][field] = value
+    state.platform.capability = cap
     assert state.patch._uses_int8() is False
     assert state.patch.fused_indexer_q_rope_quant(*range(6)) == "q_upstream"
     assert state.patch.indexer_k_norm_rope_store(*range(8), False) == "k_upstream"
@@ -468,7 +482,9 @@ def test_fp4_query_keeps_original_provider(installed):
     )
 
 
-def test_metadata_preserves_ratio_alignment(installed):
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
+def test_metadata_preserves_ratio_alignment(installed, cap):
+    installed.platform.capability = cap
     config = installed.config
     config.model_config.hf_text_config = types.SimpleNamespace(
         index_n_heads=32, index_head_dim=128
@@ -561,8 +577,7 @@ def test_real_indexer_spec_and_kernel_selection(
         assert selected == spec.block_size == 64 * ratio
         assert spec.block_size // spec.tokens_per_state == 64
         assert spec.page_size_padded == 8640
-        expected_heads = (32, 128) if capability == (8, 0) else (64, 128)
-        assert (spec.indexer_n_head, spec.indexer_q_head_dim) == expected_heads
+        assert (spec.indexer_n_head, spec.indexer_q_head_dim) == (32, 128)
     else:
         assert spec == before
         assert selected == (64 if capability == (9, 0) else 128)
@@ -676,6 +691,239 @@ def test_int8_mapper_is_local_and_preserves_engram():
     assert mapped.orig_to_new_regex[engram] == original.orig_to_new_regex[engram]
     assert mapped.orig_to_new_regex[dense] == ".weight_scale"
     assert original.orig_to_new_regex[dense] == ".weight_scale_inv"
+
+
+@pytest.fixture
+def sparse_indexer(installed):
+    from tests.support.source import function
+
+    state = installed
+    state.config.parallel_config = types.SimpleNamespace(
+        decode_context_parallel_size=1, prefill_context_parallel_size=1
+    )
+    state.config.kernel_config = types.SimpleNamespace(
+        sparse_indexer_topk_backend="auto", enable_jit_warmup=False
+    )
+    state.platform.is_cuda = lambda: True
+    state.platform.fp8_dtype = lambda: "float8_e4m3fn"
+    state.module("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: True)
+    warmups = []
+    state.module(
+        "vllm.v1.attention.ops.common",
+        _PACK_SEQ_TRITON_KERNEL=types.SimpleNamespace(
+            register_warmup=lambda **kwargs: warmups.append(kwargs)
+        ),
+        _UNPACK_SEQ_TRITON_KERNEL=types.SimpleNamespace(
+            register_warmup=lambda: warmups.append("unpack")
+        ),
+    )
+
+    class Parent:
+        def __init__(self):
+            self.parent_initialized = True
+
+    class Indexer(Parent):
+        pass
+
+    path = "vllm_sail/patch/enhancement/attention/sparse_attn_indexer.py"
+    namespace = dict(
+        SparseAttnIndexer=Indexer,
+        torch=state.modules["torch"],
+        current_platform=state.platform,
+        get_current_vllm_config=lambda: state.config,
+        has_deep_gemm=lambda: True,
+    )
+    init = function(path, "sparse_attn_indexer_init", namespace)
+    calls = []
+
+    def op(*args):
+        calls.append(args)
+        return "sparse_ppu"
+
+    forward = function(
+        path,
+        "sparse_attn_indexer_forward_ppu",
+        dict(
+            torch=types.SimpleNamespace(
+                int8="int8",
+                ops=types.SimpleNamespace(
+                    vllm=types.SimpleNamespace(ppu_sparse_attn_indexer=op)
+                ),
+            ),
+            _encode_layer_name=lambda name: name,
+        ),
+    )
+    Indexer.forward_ppu = forward
+    native = function(
+        path,
+        "sparse_attn_indexer_forward_native",
+        dict(
+            current_platform=state.platform,
+            _upstream_forward_native=lambda *args: "sparse_upstream",
+        ),
+    )
+    Indexer.forward_native = native
+
+    def construct(use_fp4_cache=False):
+        indexer = Indexer.__new__(Indexer)
+        cache = types.SimpleNamespace(prefix="v41.indexer", kv_cache=object())
+        init(
+            indexer,
+            cache,
+            128,
+            "scale",
+            2,
+            128,
+            32,
+            32,
+            object(),
+            use_fp4_cache=use_fp4_cache,
+        )
+        return indexer
+
+    return types.SimpleNamespace(
+        construct=construct, calls=calls, namespace=namespace, warmups=warmups
+    )
+
+
+@pytest.mark.parametrize("ppu,contract", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize("fp4_cache", [False, True])
+def test_indexer_warmup_uses_int8_only_for_w8a8(
+    installed, sparse_indexer, ppu, contract, fp4_cache
+):
+    installed.platform.ppu = ppu
+    if not contract:
+        installed.config.quant_config = None
+    installed.config.kernel_config.enable_jit_warmup = True
+    sparse_indexer.construct(use_fp4_cache=fp4_cache)
+    dtype = "int8" if ppu and contract else "uint8" if fp4_cache else "float8_e4m3fn"
+    assert sparse_indexer.warmups == [
+        dict(dtype=dtype, pad_value=0 if fp4_cache else -float("inf")),
+        "unpack",
+    ]
+
+
+@pytest.mark.parametrize("ppu,contract", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
+def test_indexer_int8_contract_is_frozen_at_construction(
+    installed, sparse_indexer, ppu, contract, cap
+):
+    state = installed
+    state.platform.ppu, state.platform.capability = ppu, cap
+    if not contract:
+        state.config.quant_config = None
+
+    def unavailable(*args):
+        raise AssertionError("indexer must not query capability or runtime config")
+
+    state.platform.is_device_capability = unavailable
+    indexer = sparse_indexer.construct()
+    assert indexer.parent_initialized
+    assert indexer._v41_int8_indexer is (ppu and contract)
+    state.config.quant_config = None
+    sparse_indexer.namespace["get_current_vllm_config"] = unavailable
+    q, weights = types.SimpleNamespace(dtype="int8"), object()
+    assert indexer.forward_ppu(None, q, None, weights) == "sparse_ppu"
+    assert sparse_indexer.calls[0][3:7] == (q, None, None, weights)
+    assert indexer._v41_int8_indexer is (ppu and contract)
+
+
+@pytest.mark.parametrize("dispatch", ["forward_ppu", "forward_native"])
+@pytest.mark.parametrize(
+    "dtype,has_scale,fp4_cache",
+    [
+        ("int8", False, False),
+        ("float8_e4m3fn", False, False),
+        ("bfloat16", False, False),
+        ("uint8", True, True),
+        ("int8", True, False),
+        ("int8", False, True),
+    ],
+)
+@pytest.mark.parametrize("contract", [True, False])
+def test_w8a8_indexer_rejects_non_int8_before_custom_op(
+    installed, sparse_indexer, dispatch, dtype, has_scale, fp4_cache, contract
+):
+    if not contract:
+        installed.config.quant_config = None
+    indexer = sparse_indexer.construct(use_fp4_cache=fp4_cache)
+    q, scale = types.SimpleNamespace(dtype=dtype), object() if has_scale else None
+    quant = (q, scale) if has_scale else q
+    invalid = dtype != "int8" or has_scale or fp4_cache
+    if contract and invalid:
+        with pytest.raises(ValueError, match="W8A8 indexer requires torch.int8"):
+            getattr(indexer, dispatch)(None, quant, None, None)
+        assert not sparse_indexer.calls
+    else:
+        assert getattr(indexer, dispatch)(None, quant, None, None) == "sparse_ppu"
+        assert sparse_indexer.calls[0][3:5] == (q, scale)
+
+
+def test_non_ppu_native_indexer_keeps_upstream(installed, sparse_indexer):
+    installed.platform.ppu = False
+    indexer = sparse_indexer.construct()
+    assert indexer.forward_native(None, object(), None, None) == "sparse_upstream"
+    assert not sparse_indexer.calls
+
+
+@pytest.mark.parametrize("kind", ["int8", "fp8"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_paged_logits_delegates_sdk_without_software_fallback(kind, missing):
+    from tests.support.source import function
+
+    calls = []
+
+    def initialize():
+        calls.append("initialize")
+
+    def unavailable():
+        raise RuntimeError("missing SDK logits")
+
+    output = object()
+
+    def implementation(*args, **kwargs):
+        calls.append((args, kwargs))
+        return output
+
+    name = kind + "_paged_mqa_logits"
+    namespace = dict(_lazy_init=initialize, _missing=unavailable)
+    namespace["_" + name + "_impl"] = None if missing else implementation
+    logits = function("vllm_sail/utils/deep_gemm.py", name, namespace)
+    args = [object() for _ in range(8)]
+    if missing:
+        with pytest.raises(RuntimeError, match="missing SDK logits"):
+            logits(*args)
+        assert calls == ["initialize"]
+    else:
+        assert logits(*args) is output
+        assert calls == ["initialize", (tuple(args[:7]), dict(clean_logits=args[7]))]
+        kwargs = dict(
+            zip(
+                (
+                    "q_fp8",
+                    "kv_cache_fp8",
+                    "weights",
+                    "context_lens",
+                    "block_tables",
+                    "schedule_metadata",
+                    "max_model_len",
+                    "clean_logits",
+                ),
+                args,
+                strict=True,
+            )
+        )
+        assert logits(**kwargs) is output
+
+
+def test_fp8_indexer_software_fallback_is_removed():
+    tree = ast.parse((ROOT / "vllm_sail/utils/deep_gemm.py").read_text())
+    assert not any(
+        isinstance(node, ast.Name | ast.FunctionDef)
+        and getattr(node, "id", getattr(node, "name", None))
+        == "_fp8_paged_mqa_logits_ppu10"
+        for node in ast.walk(tree)
+    )
 
 
 def test_cudart_loading_is_lazy_and_cached_by_sdk(monkeypatch):

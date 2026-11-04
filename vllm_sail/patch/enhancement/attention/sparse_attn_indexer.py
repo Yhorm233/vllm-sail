@@ -5,10 +5,11 @@
 
 The fork makes three changes to ``SparseAttnIndexer``:
 
-* ``__init__`` warns instead of raising when DeepGEMM is missing on PPU (the
-  op falls back to a less efficient PyTorch path); upstream raises on CUDA,
+* ``__init__`` warns instead of raising when DeepGEMM is missing on PPU;
+  logits execution still requires SAIL DeepGEMM. Upstream raises on CUDA,
   which PPU inherits via ``PlatformEnum.CUDA``. Verbatim body with markers —
-  delegation cannot intercept the upstream raise.
+  delegation cannot intercept the upstream raise. It also freezes the V4.1
+  W8A8 indexer contract and registers INT8 pack warmup for that path.
 * ``forward_native`` redirects to ``forward_ppu`` on PPU before the CUDA
   branch. Verbatim body with markers (the fork's exact insertion point).
 * Adds ``forward_ppu``, which calls the PPU ``ppu_sparse_attn_indexer`` custom
@@ -52,11 +53,12 @@ def _with_target_globals(fn):
     _MODULE,
     "SparseAttnIndexer.__init__",
     reason=(
-        "PPU tolerates a missing DeepGEMM in SparseAttnIndexer with a warning "
-        "(falling back to a less efficient PyTorch path), while upstream raises "
-        "on CUDA. PPU inherits the CUDA raise via PlatformEnum.CUDA, so the "
-        "fork's PPU branch must run first. Delegation cannot intercept the "
-        "upstream raise, hence the verbatim body."
+        "PPU warns about a missing DeepGEMM in SparseAttnIndexer, while upstream "
+        "raises on CUDA. PPU inherits the CUDA raise via PlatformEnum.CUDA, so "
+        "the fork's PPU branch must run first. Delegation cannot intercept the "
+        "upstream raise, hence the verbatim body. PPU logits still require SAIL "
+        "DeepGEMM. Freeze the V4.1 W8A8 contract and warm up packing with INT8 "
+        "rather than FP8 for that path."
     ),
     affected_versions=_AFFECTED,
     remove_when="upstream downgrades the missing-DeepGEMM error to a warning, or PPU always ships DeepGEMM.",
@@ -104,6 +106,11 @@ def sparse_attn_indexer_init(
     # during model construction) and pass them into the custom op, rather
     # than threading them through per-step metadata.
     vllm_config = get_current_vllm_config()
+    # PPU MODIFICATION: begin
+    from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
+
+    self._v41_int8_indexer = current_platform.is_ppu() and uses_int8_w8a8(vllm_config)
+    # PPU MODIFICATION: end
     parallel_config = vllm_config.parallel_config
     self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
     self._parallel_config = parallel_config
@@ -134,6 +141,10 @@ def sparse_attn_indexer_init(
         )
 
         pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+        # PPU MODIFICATION: begin
+        if self._v41_int8_indexer:
+            pack_dtype = torch.int8
+        # PPU MODIFICATION: end
         _PACK_SEQ_TRITON_KERNEL.register_warmup(
             dtype=pack_dtype,
             pad_value=0 if use_fp4_cache else -float("inf"),
@@ -192,7 +203,8 @@ def sparse_attn_indexer_forward_native(
         "ppu_sparse_attn_indexer custom op registered by vllm_sail.ops. Upstream "
         "has no forward_ppu; installed additively and reached through the "
         "custom_op_dispatch patch (enabled path) or the forward_native redirect "
-        "(disabled path)."
+        "(disabled path). V4.1 W8A8 requires INT8 Q with its scale folded into "
+        "weights; reject FP8/FP4 inputs before invoking the op."
     ),
     affected_versions=_AFFECTED,
     remove_when="upstream adds a forward_ppu hook and the PPU op moves into the dispatch ladder.",
@@ -208,6 +220,15 @@ def sparse_attn_indexer_forward_ppu(
         q_values, q_scale = q_quant
     else:
         q_values, q_scale = q_quant, None
+    # PPU MODIFICATION: begin
+    if self._v41_int8_indexer and (
+        q_values.dtype != torch.int8 or q_scale is not None or self.use_fp4_cache
+    ):
+        raise ValueError(
+            "PPU V4.1 W8A8 indexer requires torch.int8 Q, no FP4 cache, "
+            "and Q scales folded into weights; FP8/FP4 fallback is not supported."
+        )
+    # PPU MODIFICATION: end
     return torch.ops.vllm.ppu_sparse_attn_indexer(
         hidden_states,
         _encode_layer_name(self.k_cache.prefix),
