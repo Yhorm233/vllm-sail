@@ -55,28 +55,43 @@ def quant(x):
     return (x / scale).clamp(-127, 127).to(torch.int8), scale
 
 
-@pytest.mark.parametrize("n", [0, 1, 16, 33, 256, 8192])
+@pytest.mark.parametrize(
+    "n,heads",
+    [
+        (0, 32),
+        (1, 4),
+        (1, 8),
+        (1, 12),
+        (1, 16),
+        (1, 32),
+        (1, 64),
+        (16, 32),
+        (33, 32),
+        (256, 32),
+        (8192, 32),
+    ],
+)
 @pytest.mark.parametrize("strided", [False, True])
-def test_q(kernels, n, strided):
+def test_q(kernels, n, heads, strided):
     torch.manual_seed(1017)
     backing = torch.randn(
-        (max(n, 1), 32, 256 if strided else 128), device="cuda", dtype=torch.bfloat16
+        (max(n, 1), heads, 256 if strided else 128), device="cuda", dtype=torch.bfloat16
     )
     q = backing[:n, :, :128]
-    w = torch.randn((n, 64 if strided else 32), device="cuda", dtype=torch.bfloat16)[
-        :, :32
-    ]
+    w = torch.randn(
+        (n, 2 * heads if strided else heads), device="cuda", dtype=torch.bfloat16
+    )[:, :heads]
     positions = torch.arange(n, device="cuda", dtype=torch.int64) + 511
     cs = cos_sin()
     expected, scale = quant(rope(q, positions, cs))
-    weights = w.float() * scale.squeeze(-1) * 0.125 * (32**-0.5)
+    weights = w.float() * scale.squeeze(-1) * 0.125 * (heads**-0.5)
     result, actual_weights = kernels.fused_indexer_q_rope_quant_int8(
-        positions, q, cs, w, 0.125, 32**-0.5
+        positions, q, cs, w, 0.125, heads**-0.5
     )
     torch.testing.assert_close(result, expected, rtol=0, atol=1)
     torch.testing.assert_close(actual_weights, weights, rtol=1e-2, atol=1e-8)
     repeated = kernels.fused_indexer_q_rope_quant_int8(
-        positions, q, cs, w, 0.125, 32**-0.5
+        positions, q, cs, w, 0.125, heads**-0.5
     )
     assert torch.equal(result, repeated[0]) and torch.equal(actual_weights, repeated[1])
     if n:

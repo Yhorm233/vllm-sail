@@ -475,8 +475,9 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
     ],
 )
 @pytest.mark.parametrize("weight_dtype", ["int8", "bf16"])
+@pytest.mark.parametrize("num_heads", [2, 4, 8, 16, 32, 64])
 def test_v41_projection_dispatches_by_quantization(
-    modules, ppu, capability, contract, weight_dtype
+    modules, ppu, capability, contract, weight_dtype, num_heads
 ):
     calls = []
 
@@ -497,7 +498,7 @@ def test_v41_projection_dispatches_by_quantization(
     class PPUV4:
         @classmethod
         def get_padded_num_q_heads(cls, heads):
-            return heads
+            return heads + 128
 
         def _o_proj(self, *args):
             calls.append(("ppuv4", args, {}))
@@ -505,7 +506,7 @@ def test_v41_projection_dispatches_by_quantization(
 
     class Output:
         def __getitem__(self, slices):
-            assert slices == (slice(None), slice(None, 8))
+            assert slices == (slice(None), slice(None, num_heads))
             return "actual_heads"
 
     def int8(*args, **kw):
@@ -544,7 +545,7 @@ def test_v41_projection_dispatches_by_quantization(
         _wo_b_proj=object(),
         rotary_emb=SimpleNamespace(cos_sin_cache=object()),
         n_local_groups=2,
-        n_local_heads=8,
+        n_local_heads=num_heads,
         nope_head_dim=448,
         rope_head_dim=64,
         o_lora_rank=1024,
@@ -564,10 +565,10 @@ def test_v41_projection_dispatches_by_quantization(
             and args[3] is attn.wo_a
             and args[4] is attn._wo_b_proj
         )
-        assert kw["einsum_recipe"] == (1, 1, 128) and kw["heads_per_group"] == 4
-        with pytest.raises(ValueError, match="actual head count"):
-            cls.get_padded_num_q_heads(16)
-    assert cls.get_padded_num_q_heads(8) == (8 if ppu else 64)
+        assert kw["einsum_recipe"] == (1, 1, 128)
+        assert kw["heads_per_group"] == num_heads // attn.n_local_groups
+    expected_heads = num_heads if ppu and contract else num_heads + 128 if ppu else 64
+    assert cls.get_padded_num_q_heads(num_heads) == expected_heads
     backend = module.PPUDeepseekV41FlashMLABackend
     for major, minor in ((8, 0), (8, 9), (9, 0), (10, 0)):
         assert backend.supports_compute_capability(
