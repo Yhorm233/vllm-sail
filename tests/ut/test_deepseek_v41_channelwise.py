@@ -138,58 +138,34 @@ def test_export_dispatch_preserves_bf16_and_per_layer_precision(
 
 @pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
 @pytest.mark.parametrize("bias", [False, True])
-def test_fp8_linear_ppu_scale_axes_and_delegation(ppu, cap, bias):
-    class Tensor:
-        def __init__(self, label, shape=(2, 3), count=1):
-            self.label, self.shape, self.count = label, shape, count
-
-        def numel(self):
-            return self.count
-
-        def float(self):
-            return self
-
-        def reshape(self, *shape):
-            return Tensor(("reshape", self.label, shape))
-
-        def __mul__(self, other):
-            return Tensor(("mul", self.label, other.label))
-
-        def __add__(self, other):
-            return Tensor(("add", self.label, other.label))
-
-        def to(self, dtype):
-            return Tensor(("to", self.label, dtype))
-
-        def view(self, *shape):
-            return ("view", self.label, shape)
-
+def test_fp8_linear_preserves_native_route_without_software_gemm(ppu, cap, bias):
     calls = []
 
-    def mm(a, b):
-        calls.append(("mm", a.label, b.label))
-        return Tensor("product")
-
     def native(a, b, **kwargs):
-        calls.append(("native", a, b, kwargs))
-        return Tensor("native")
+        calls.append((a, b, kwargs))
+        return SimpleNamespace(view=lambda *shape: ("native", shape))
 
+    platform = SimpleNamespace(
+        is_ppu=lambda: ppu,
+        is_device_capability=lambda expected: cap == expected,
+    )
+    supported = function(
+        "vllm_sail/model_executor/kernels/linear/scaled_mm/ppu.py",
+        "PPUCutlassFP8ScaledMMLinearKernel.is_supported",
+        {"current_platform": platform},
+    )
+    ok, reason = supported(None, cap[0] * 10 + cap[1])
+    assert ok is ppu
+    assert reason is None if ppu else "requires PPU" in reason
     apply = function(
         "vllm_sail/model_executor/kernels/linear/scaled_mm/ppu.py",
         "PPUCutlassFP8ScaledMMLinearKernel.apply_scaled_mm",
-        {
-            "torch": SimpleNamespace(mm=mm),
-            "ops": SimpleNamespace(cutlass_scaled_mm=native),
-            "current_platform": SimpleNamespace(
-                is_ppu=lambda: ppu,
-                is_device_capability=lambda expected: cap == expected,
-            ),
-        },
+        {"ops": SimpleNamespace(cutlass_scaled_mm=native)},
     )
-    a, b = Tensor("a", (2, 4)), Tensor("b", (4, 3))
-    as_, bs = Tensor("as", count=2), Tensor("bs", count=3)
-    bias_tensor = Tensor("bias") if bias else None
-    kwargs = dict(
+    a, b, as_, bs = (object() for _ in range(4))
+    bias_tensor = object() if bias else None
+    assert apply(
+        None,
         A=a,
         B=b,
         As=as_,
@@ -197,31 +173,10 @@ def test_fp8_linear_ppu_scale_axes_and_delegation(ppu, cap, bias):
         bias=bias_tensor,
         out_dtype="bf16",
         output_shape=[1, 2, 3],
-    )
-    result = apply(None, **kwargs)
-    if ppu:
-        assert calls == [("mm", "a", "b")]
-        scaled = (
-            "mul",
-            ("mul", "product", ("reshape", "as", (-1, 1))),
-            ("reshape", "bs", (1, -1)),
-        )
-        expected = ("add", scaled, "bias") if bias else scaled
-        assert result == ("view", ("to", expected, "bf16"), (1, 2, 3))
-        kwargs["As"] = Tensor("blockscale", count=4)
-        with pytest.raises(ValueError, match="tensor/token"):
-            apply(None, **kwargs)
-        assert len(calls) == 1
-    else:
-        assert calls == [
-            (
-                "native",
-                a,
-                b,
-                dict(out_dtype="bf16", scale_a=as_, scale_b=bs, bias=bias_tensor),
-            )
-        ]
-        assert result == ("view", "native", (1, 2, 3))
+    ) == ("native", (1, 2, 3))
+    assert calls == [
+        (a, b, dict(out_dtype="bf16", scale_a=as_, scale_b=bs, bias=bias_tensor))
+    ]
 
 
 @pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])

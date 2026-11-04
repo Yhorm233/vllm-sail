@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.source import definition, function
 from vllm_sail.patch.utils import PATCH_REGISTRY
 
 ENHANCEMENT_DIR = Path(__file__).parents[2] / "vllm_sail" / "patch" / "enhancement"
@@ -490,6 +491,9 @@ def _build_ct_stubs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         def get_scheme(self, layer, layer_name=None):
             return "upstream-scheme"
 
+        def get_scheme_dict(self, layer, layer_name=None):
+            return state.get("scheme_dict")
+
     class CompressedTensorsKVCacheMethod:
         def create_weights(self, layer, *args, **kwargs):
             torch = pytest.importorskip("torch")
@@ -626,9 +630,18 @@ def test_ct_config_gains_fp8_channelwise_layers(
     module.install()  # idempotent
 
 
-def test_ct_get_scheme_channelwise_override(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "weight_type,weight_bits", [(None, None), ("float", 8), ("int", 4)]
+)
+def test_ct_get_scheme_channelwise_override(
+    monkeypatch: pytest.MonkeyPatch, weight_type, weight_bits
+) -> None:
     module = _leaf("compressed_tensors_ppu")
     state = _build_ct_stubs(monkeypatch)
+    if weight_type is not None:
+        state["scheme_dict"] = {
+            "weights": types.SimpleNamespace(type=weight_type, num_bits=weight_bits)
+        }
 
     class QuantizationArgs:
         def __init__(self, **kwargs):
@@ -637,7 +650,7 @@ def test_ct_get_scheme_channelwise_override(monkeypatch: pytest.MonkeyPatch) -> 
     ct_quant = types.ModuleType("compressed_tensors.quantization")
     ct_quant.QuantizationArgs = QuantizationArgs  # type: ignore[attr-defined]
     ct_quant.QuantizationStrategy = types.SimpleNamespace(CHANNEL="channel")  # type: ignore[attr-defined]
-    ct_quant.QuantizationType = types.SimpleNamespace(FLOAT="float")  # type: ignore[attr-defined]
+    ct_quant.QuantizationType = types.SimpleNamespace(FLOAT="float", INT="int")  # type: ignore[attr-defined]
     monkeypatch.setitem(
         sys.modules, "compressed_tensors", types.ModuleType("compressed_tensors")
     )
@@ -671,6 +684,183 @@ def test_ct_get_scheme_channelwise_override(monkeypatch: pytest.MonkeyPatch) -> 
     _Platform.ppu = False
     assert config.get_scheme(object(), "model.dense.proj") == "upstream-scheme"
     _Platform.ppu = True
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("matched", [False, True])
+@pytest.mark.parametrize("strategy", ["tensor", "channel"])
+@pytest.mark.parametrize("static_input", [False, True])
+def test_ct_int8_scheme_keeps_int8_initialization_with_fp8_layer_hints(
+    monkeypatch, upstream_source_root, ppu, matched, strategy, static_input
+):
+    from enum import Enum
+
+    class Strategy(str, Enum):
+        TENSOR = "tensor"
+        CHANNEL = "channel"
+        TOKEN = "token"
+        BLOCK = "block"
+
+    quant_type = types.SimpleNamespace(INT="int", FLOAT="float")
+    state = _build_ct_stubs(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", ppu)
+    quant_module = types.ModuleType("compressed_tensors.quantization")
+    quant_module.QuantizationArgs = types.SimpleNamespace
+    quant_module.QuantizationStrategy = Strategy
+    quant_module.QuantizationType = quant_type
+    _register_chain(monkeypatch, quant_module.__name__, quant_module)
+    weight_quant = types.SimpleNamespace(
+        type="int",
+        num_bits=8,
+        strategy=Strategy(strategy),
+        dynamic=False,
+        symmetric=True,
+    )
+    input_quant = types.SimpleNamespace(
+        type="int",
+        num_bits=8,
+        strategy=Strategy.TENSOR if static_input else Strategy.TOKEN,
+        dynamic=not static_input,
+        symmetric=True,
+    )
+    state["scheme_dict"] = {
+        "weights": weight_quant,
+        "input_activations": input_quant,
+        "format": "int-quantized",
+    }
+    calls = []
+    kernel = types.SimpleNamespace(
+        process_weights_after_loading=lambda layer: calls.append(("process", layer)),
+        apply_weights=lambda layer, x, bias: ("int8", layer, x, bias),
+    )
+
+    def init_int8(**kwargs):
+        calls.append(("init_int8", kwargs))
+        return kernel
+
+    quant_root = (
+        upstream_source_root
+        / "vllm/model_executor/layers/quantization/compressed_tensors"
+    )
+    namespace = {
+        "CompressedTensorsScheme": object,
+        "QuantizationStrategy": Strategy,
+        "init_int8_linear_kernel": init_int8,
+        "torch": types.SimpleNamespace(
+            int8="int8",
+            float32="fp32",
+            empty=lambda *shape, dtype: types.SimpleNamespace(shape=shape, dtype=dtype),
+        ),
+        **{
+            name: types.SimpleNamespace
+            for name in (
+                "ModelWeightParameter",
+                "ChannelQuantScaleParameter",
+                "PerTensorScaleParameter",
+                "BasevLLMParameter",
+            )
+        },
+    }
+    scheme_node = definition(
+        quant_root / "schemes/compressed_tensors_w8a8_int8.py",
+        "CompressedTensorsW8A8Int8",
+    )
+    source = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            scheme_node,
+        ],
+        type_ignores=[],
+    )
+    exec(
+        compile(ast.fix_missing_locations(source), "<upstream-int8-scheme>", "exec"),
+        namespace,
+    )
+    Int8Scheme = namespace["CompressedTensorsW8A8Int8"]
+    upstream = quant_root / "compressed_tensors.py"
+    config_globals = {
+        "QuantizationType": quant_type,
+        "QuantizationStrategy": Strategy,
+        "CompressedTensorsW8A8Int8": Int8Scheme,
+        "is_activation_quantization_format": lambda value: value == "int-quantized",
+        "logger": types.SimpleNamespace(debug=lambda *args: None),
+        "CompressionFormat": types.SimpleNamespace(
+            pack_quantized=types.SimpleNamespace(value="pack-quantized")
+        ),
+    }
+    Config = state["ct"].CompressedTensorsConfig
+    for name in ("get_scheme", "_get_scheme_from_parts"):
+        monkeypatch.setattr(
+            Config,
+            name,
+            function(
+                upstream, "CompressedTensorsConfig." + name, config_globals.copy()
+            ),
+            raising=False,
+        )
+    for name in (
+        "_is_fp8_w8a8",
+        "_is_fp8_w8a16",
+        "_is_static_tensor_w8a8",
+        "_is_dynamic_token_w8a8",
+    ):
+        monkeypatch.setattr(
+            Config,
+            name,
+            staticmethod(
+                function(
+                    upstream, "CompressedTensorsConfig." + name, config_globals.copy()
+                )
+            ),
+            raising=False,
+        )
+    for name in (
+        "_is_nvfp4_format",
+        "_is_mxfp4",
+        "_is_mxfp8",
+        "_is_fp8_w4a8_sm90",
+        "_is_wNa8o8_int",
+        "_is_wNaM_int",
+        "_is_wNa16_group_channel",
+    ):
+        monkeypatch.setattr(Config, name, lambda *args: False, raising=False)
+    monkeypatch.setattr(
+        Config, "_check_scheme_supported", lambda *args: True, raising=False
+    )
+    module = _leaf("compressed_tensors_ppu")
+    module.install()
+    config = Config(fp8_channelwise_layers=["dense" if matched else "other"])
+    config.quant_format = "int-quantized"
+    layer = types.SimpleNamespace()
+    layer.register_parameter = lambda name, value: setattr(layer, name, value)
+    scheme = config.get_scheme(layer, "model.dense.proj")
+    assert isinstance(scheme, Int8Scheme)
+    scheme.create_weights(
+        layer,
+        output_partition_sizes=[128],
+        input_size_per_partition=64,
+        params_dtype="bf16",
+        weight_loader=object(),
+    )
+    assert layer.weight.data.dtype == "int8"
+    assert calls == [
+        (
+            "init_int8",
+            dict(
+                is_channelwise=strategy == "channel",
+                is_static_input_scheme=static_input,
+                input_symmetric=True,
+                module_name="CompressedTensorsW8A8Int8",
+            ),
+        )
+    ]
+    scheme.process_weights_after_loading(layer)
+    assert calls[-1] == ("process", layer)
+    x, bias = object(), object()
+    assert scheme.apply_weights(layer, x, bias) == ("int8", layer, x, bias)
 
 
 def test_ct_moe_redirect_and_int8_swiglu(monkeypatch: pytest.MonkeyPatch) -> None:

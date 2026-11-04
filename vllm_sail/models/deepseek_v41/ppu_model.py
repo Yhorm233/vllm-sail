@@ -10,7 +10,6 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
 )
 from vllm.platforms import current_platform
 
-from vllm_sail import envs
 from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
 
 
@@ -28,21 +27,11 @@ def int8_weights_mapper(mapper):
 
 class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=""):
-        directory = envs.VLLM_SAIL_V41_AUDIT_DIR
-        if directory and (
-            not current_platform.is_ppu() or not vllm_config.model_config.enforce_eager
-        ):
-            raise ValueError("V4.1 runtime auditing requires a PPU eager service")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._v41_int8_config = None
         if current_platform.is_ppu() and uses_int8_w8a8(vllm_config):
             self.hf_to_vllm_mapper = int8_weights_mapper(self.hf_to_vllm_mapper)
             self._v41_int8_config = vllm_config
-        self._v41_audit = None
-        if directory:
-            from .runtime_audit import RuntimeAudit
-
-            self._v41_audit = RuntimeAudit(directory, self, vllm_config)
 
     def forward(
         self,
@@ -64,6 +53,4 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
             else nullcontext()
         )
         with context:
-            if self._v41_audit is None:
-                return forward(*args, **kwargs)
-            return self._v41_audit.run(forward, *args, **kwargs)
+            return forward(*args, **kwargs)
