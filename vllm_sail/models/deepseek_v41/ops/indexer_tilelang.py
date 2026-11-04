@@ -202,11 +202,12 @@ def fused_indexer_q_rope_quant_int8(
     *,
     output_buffers=None,
 ):
-    """V4.1 32-head Q with output scales folded into FP32 weights."""
+    """Fold V4.1 Q scales into FP32 weights, processing four heads per kernel group."""
     assert not use_fp4 and weights_out_dtype == torch.float32
-    assert index_q.ndim == 3 and index_q.shape[1:] == (32, 128)
+    assert index_q.ndim == 3 and index_q.shape[2] == 128
     assert index_q.dtype == torch.bfloat16 and index_q.stride(2) == 1
     n, heads, _ = index_q.shape
+    assert heads > 0 and heads % 4 == 0, "INT8 Q requires complete groups of 4 heads"
     assert positions.dtype == torch.int64 and positions.shape == (n,)
     assert positions.is_contiguous()
     assert index_weights.shape == (n, heads) and index_weights.stride(1) == 1

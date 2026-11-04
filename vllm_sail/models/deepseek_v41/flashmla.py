@@ -38,11 +38,6 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         if current_platform.is_ppu():
             if uses_int8_w8a8(get_current_vllm_config()):
-                if num_heads not in (8, 64):
-                    raise ValueError(
-                        "PPU V4.1 INT8 is validated only for TP8/TP1; "
-                        f"actual head count is {num_heads}"
-                    )
                 return num_heads
             return PPUV4FlashMLAAttention.get_padded_num_q_heads(num_heads)
         return super().get_padded_num_q_heads(num_heads)
