@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Integrate 810E W8A8 operators into upstream V4.1 without replacing other quantization paths."""
+"""Integrate PPU W8A8 operators into upstream V4.1 without replacing other quantization paths."""
 
 import sys
 
@@ -17,9 +17,9 @@ from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
 from vllm_sail.patch.utils import patch
 
 _PREFIX = "vllm.models.deepseek_v41"
-REASON = "810E V4.1 W8A8 requires INT8 DSA and software FP8 main-cache operators."
+REASON = "PPU V4.1 W8A8 uses INT8 DSA and software FP8 main-cache operators."
 AFFECTED_VERSIONS = ">=0.31.0,<0.32.0"
-REMOVE_WHEN = "V4.1 provides quantization-aware PPU operator registration for 810E W8A8."
+REMOVE_WHEN = "V4.1 provides quantization-aware PPU operator registration for W8A8."
 _q = ops.fused_indexer_q_rope_quant
 _k = indexer_k_store.indexer_k_norm_rope_store
 _store = fused_compress_quant_cache.rope_quant_insert
@@ -27,7 +27,7 @@ _gather = cache_utils.dequantize_and_gather_k_cache
 
 
 def _uses_int8(vllm_config=None):
-    if not current_platform.is_ppu() or not current_platform.is_device_capability((8, 0)):
+    if not current_platform.is_ppu():
         return False
     return uses_int8_w8a8(vllm_config or get_current_vllm_config())
 
@@ -43,7 +43,7 @@ def fused_indexer_q_rope_quant(
 ):
     if not _uses_int8() or use_fp4:
         if output_buffers is not None:
-            raise ValueError("output_buffers is supported only on the 810E INT8 path")
+            raise ValueError("output_buffers is supported only on the PPU V4.1 INT8 path")
         return _q(
             positions, index_q, index_q_cos_sin_cache, index_weights,
             index_weights_softmax_scale, index_weights_head_scale,
@@ -100,16 +100,15 @@ def dequantize_and_gather_k_cache(out, k_cache, seq_lens, gather_lens, block_tab
                                 block_size, offset, use_fnuz=False):
     if _uses_int8():
         if use_fnuz or k_cache.dtype != torch.uint8 or k_cache.shape[-1] != 584:
-            raise ValueError("810E V4.1 gather supports only the 584-byte OCP main cache")
+            raise ValueError("PPU V4.1 INT8 gather supports only the 584-byte OCP main cache")
         return torch.ops.vllm.ppu_deepseek_v4_dequant_gather(
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset,
         )
     # PPU MODIFICATION: begin
-    # FP8/MXFP8 main caches also need software E4M3 decoding; do not enable INT8 Q/K.
-    # Replace only 810E reads for existing layouts; delegate FNUZ, NVFP4 and other platforms.
+    # Decode PPU FP8/MXFP8 main caches in software without enabling INT8 Q/K.
+    # Match existing layouts; delegate FNUZ, NVFP4 and non-PPU platforms.
     if (
         current_platform.is_ppu()
-        and current_platform.is_device_capability((8, 0))
         and not use_fnuz
         and k_cache.dtype == torch.uint8
         and k_cache.shape[-1] in (528, 584)

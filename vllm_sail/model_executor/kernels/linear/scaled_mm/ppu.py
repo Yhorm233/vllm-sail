@@ -469,12 +469,12 @@ class PPUCutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         output_shape: list,
     ) -> torch.Tensor:
         # PPU MODIFICATION: begin
-        # The 810E CUTLASS op is a non-executable stub. Keep quantized FP8 inputs,
-        # use PyTorch casts and FP32 GEMM, and apply scales/bias before final rounding.
-        if current_platform.is_ppu() and current_platform.is_device_capability((8, 0)):
+        # PPU builds exclude CUTLASS. Keep quantized FP8 inputs, use PyTorch
+        # casts and FP32 GEMM, and apply scales/bias before final rounding.
+        if current_platform.is_ppu():
             if As.numel() not in (1, A.shape[0]) or Bs.numel() not in (1, B.shape[1]):
                 raise ValueError(
-                    "810E FP8 linear requires tensor/token and tensor/channel scales"
+                    "PPU FP8 linear requires tensor/token and tensor/channel scales"
                 )
             output = torch.mm(A.float(), B.float())
             output = output * As.float().reshape(-1, 1) * Bs.float().reshape(1, -1)

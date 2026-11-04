@@ -24,7 +24,7 @@ from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
 class PPUDeepseekV41FlashMLABackend(DeepseekV4FlashMLABackend):
     @classmethod
     def supports_compute_capability(cls, capability):
-        if current_platform.is_ppu() and (capability.major, capability.minor) == (8, 0):
+        if current_platform.is_ppu():
             return True
         return super().supports_compute_capability(capability)
 
@@ -37,12 +37,10 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         if current_platform.is_ppu():
-            if current_platform.is_device_capability((8, 0)) and uses_int8_w8a8(
-                get_current_vllm_config()
-            ):
+            if uses_int8_w8a8(get_current_vllm_config()):
                 if num_heads not in (8, 64):
                     raise ValueError(
-                        "810E V4.1 INT8 is validated only for TP8/TP1; "
+                        "PPU V4.1 INT8 is validated only for TP8/TP1; "
                         f"actual head count is {num_heads}"
                     )
                 return num_heads
@@ -53,8 +51,7 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
         if not current_platform.is_ppu():
             return super()._o_proj(o, positions)
         if (
-            current_platform.is_device_capability((8, 0))
-            and uses_int8_w8a8(get_current_vllm_config())
+            uses_int8_w8a8(get_current_vllm_config())
             and self.wo_a.weight.dtype == torch.int8
         ):
             from vllm_sail.models.deepseek_v4.ops.o_proj import deep_gemm_int8_o_proj
