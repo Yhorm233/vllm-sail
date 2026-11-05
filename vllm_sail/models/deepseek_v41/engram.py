@@ -72,21 +72,28 @@ class Int8DPSharedEngramStorage(DPSharedEngramStorage):
         super().load_weight(param, loaded_weight)
 
 
-class Int8ParallelEngramEmbedding(ParallelEngramEmbedding):
-    """Replace only INT8/FP32 storage; retain upstream setup, sharding, UVA and prefetch."""
-
-    _weight_loader = staticmethod(load_weight)
+class ChannelwiseEngramEmbedding(ParallelEngramEmbedding):
+    """FP8 or INT8 values with FP32 row scales and upstream sharding/prefetch."""
 
     def __init__(
         self,
         num_embeddings,
         dim,
         head_sizes,
-        block_size=32,
+        *,
         cpu_offload=False,
         dp_shared_memory=False,
         use_thp=False,
+        weight_dtype=torch.float8_e4m3fn,
     ):
+        self.weight_dtype = weight_dtype
+        if weight_dtype == torch.int8:
+            self._weight_loader = load_weight
+        elif dp_shared_memory:
+            raise ValueError(
+                "Channelwise Engram does not support dp_shared_memory; "
+                "use cpu_offload without shared DP storage."
+            )
         super().__init__(
             num_embeddings,
             dim,
@@ -96,6 +103,8 @@ class Int8ParallelEngramEmbedding(ParallelEngramEmbedding):
             dp_shared_memory=dp_shared_memory,
             use_thp=use_thp,
         )
+        # Keep the upstream parameter name and head-shard loader. The PPU
+        # lookup distinguishes FP32 scales from exponent bytes by tensor dtype.
         self.weight_scale_inv.dummy_weight_value = 1.0
 
     def _allocate_weights(self):
@@ -108,7 +117,7 @@ class Int8ParallelEngramEmbedding(ParallelEngramEmbedding):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
-        if self.cpu_offload and self.use_thp:
+        if self.weight_dtype == torch.int8 and self.cpu_offload and self.use_thp:
             weight_bytes = rows * dim
             if weight_bytes % 4:
                 raise ValueError("INT8 Engram scale storage must be four-byte aligned")
@@ -121,53 +130,6 @@ class Int8ParallelEngramEmbedding(ParallelEngramEmbedding):
                 )
         placement = {"device": "cpu", "pin_memory": True} if self.cpu_offload else {}
         return (
-            torch.empty(rows, dim, dtype=torch.int8, **placement),
+            torch.empty(rows, dim, dtype=self.weight_dtype, **placement),
             torch.empty(rows, 1, dtype=torch.float32, **placement),
-        )
-
-
-class ChannelwiseEngramEmbedding(ParallelEngramEmbedding):
-    """FP8 embedding values and one FP32 scale per row, with no requantization."""
-
-    def __init__(
-        self,
-        num_embeddings,
-        dim,
-        head_sizes,
-        *,
-        cpu_offload=False,
-        dp_shared_memory=False,
-    ):
-        if dp_shared_memory:
-            raise ValueError(
-                "Channelwise Engram does not support dp_shared_memory; "
-                "use cpu_offload without shared DP storage."
-            )
-        super().__init__(
-            num_embeddings,
-            dim,
-            head_sizes,
-            block_size=dim,
-            cpu_offload=cpu_offload,
-            dp_shared_memory=False,
-        )
-        # Keep the upstream parameter name and head-shard loader. The PPU
-        # lookup distinguishes FP32 scales from exponent bytes by tensor dtype.
-        self.weight_scale_inv.dummy_weight_value = 1.0
-
-    def _allocate_weights(self):
-        placement = {"device": "cpu", "pin_memory": True} if self.cpu_offload else {}
-        return (
-            torch.empty(
-                self.part_num_embeddings,
-                self.dim,
-                dtype=torch.float8_e4m3fn,
-                **placement,
-            ),
-            torch.empty(
-                self.part_num_embeddings,
-                1,
-                dtype=torch.float32,
-                **placement,
-            ),
         )

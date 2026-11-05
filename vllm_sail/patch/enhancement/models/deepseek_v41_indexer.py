@@ -7,7 +7,6 @@ from vllm.models.deepseek_v41 import attention
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
 
-from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
 from vllm_sail.patch.utils import patch
 
 _cache_spec = attention.DeepseekV4IndexerCache.get_kv_cache_spec
@@ -35,10 +34,6 @@ def get_kv_cache_spec(self, vllm_config):
         spec = replace(
             spec, block_size=64 * self.compress_ratio, page_size_padded=None
         )
-        if uses_int8_w8a8(vllm_config):
-            config = vllm_config.model_config.hf_text_config
-            spec = replace(spec, indexer_n_head=config.index_n_heads,
-                           indexer_q_head_dim=config.index_head_dim)
     return spec
 
 

@@ -88,9 +88,10 @@ def installed(monkeypatch, patch_utils_module):
     nvidia = type("NvidiaAttention", (), {})
     ppu = type("PPUAttention", (), {})
     module(BASE + ".nvidia.flashmla", DeepseekV4FlashMLAAttention=nvidia)
-    sharing = types.SimpleNamespace(available=True)
+    sharing = types.SimpleNamespace(available=True, calls=[])
 
     def can_share(layout, block_size=32):
+        sharing.calls.append((layout, block_size))
         return sharing.available
 
     class Engram:
@@ -133,13 +134,9 @@ def installed(monkeypatch, patch_utils_module):
     module("vllm.config", get_current_vllm_config=lambda: config)
     module(BASE + ".nvidia.engram", can_share_engram_tables=can_share, Engram=Engram)
 
-    def int8_share(layout, block_size=32):
-        return sharing.available
-
     module(
         PLUGIN + ".engram",
-        can_share_engram_tables=int8_share,
-        Int8ParallelEngramEmbedding=operation("embedding810"),
+        ChannelwiseEngramEmbedding=operation("embedding810"),
     )
     module(
         BASE + ".nvidia.model",
@@ -219,6 +216,7 @@ def installed(monkeypatch, patch_utils_module):
         indexer=indexer,
         module=module,
         original_q=q,
+        original_share=can_share,
         utils=patch_utils_module,
         ppu=ppu,
         nvidia=nvidia,
@@ -386,20 +384,46 @@ def test_software_main_cache_launch_preserves_plane_geometry(
     assert not calls
 
 
-def test_engram_sharing_retains_upstream_capacity_fallback(installed):
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+def test_engram_sharing_keeps_upstream_provider_and_consumer(
+    installed, ppu, quantized, available
+):
     state = installed
-    fn = state.modules[BASE + ".nvidia.model"].can_share_engram_tables
-    assert fn(None) is True
-    state.sharing.available = False
-    assert fn(None) is False
-    state.platform.ppu = False
-    assert fn(None) is False
+    state.platform.ppu = ppu
+    state.sharing.available = available
+    if not quantized:
+        state.config.quant_config = None
+
+    def unavailable():
+        raise AssertionError("upstream sharing must not query the plugin config")
+
+    state.modules["vllm.config"].get_current_vllm_config = unavailable
+    state.engram.get_current_vllm_config = unavailable
+    assert not hasattr(state.engram, "can_share_engram_tables")
+    assert not hasattr(state.engram, "_rebind_share_aliases")
+    targets = {
+        BASE + ".nvidia.engram.can_share_engram_tables",
+        BASE + ".nvidia.model.can_share_engram_tables",
+    }
+    assert targets.isdisjoint(record.target for record in state.utils.PATCH_REGISTRY)
+    layout = object()
+    for consumer in ("nvidia.engram", "nvidia.model"):
+        fn = state.modules[BASE + "." + consumer].can_share_engram_tables
+        assert fn is state.original_share
+        assert fn(layout, block_size=64) is available
+    assert state.sharing.calls == [(layout, 64), (layout, 64)]
 
 
 @pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
-def test_int8_engram_factory_and_non_quant_isolation(installed, cap):
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("use_thp", [False, True])
+def test_int8_engram_factory_and_non_quant_isolation(installed, cap, shared, use_thp):
     state = installed
     state.platform.capability = cap
+    state.config.engram_config.dp_shared_memory = shared
+    state.config.engram_config.use_thp = use_thp
     layout = types.SimpleNamespace(
         layer_ids=[1, 14],
         num_embeddings=[123, 456],
@@ -409,12 +433,14 @@ def test_int8_engram_factory_and_non_quant_isolation(installed, cap):
     assert state.engram._create_embedding(None, layout, 1) == "embedding810"
     assert state.calls[-1][1] == (456, 256, (200, 256))
     assert state.calls[-1][2] == dict(
-        cpu_offload=True, dp_shared_memory=True, use_thp=False
+        cpu_offload=True, dp_shared_memory=shared, use_thp=use_thp, weight_dtype="int8"
     )
     state.config.quant_config = None
     assert state.engram._create_embedding(None, layout, 1) == "embedding_upstream"
     state.sharing.available = False
-    assert state.engram.can_share_engram_tables(layout) is False
+    assert (
+        state.modules[BASE + ".nvidia.engram"].can_share_engram_tables(layout) is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -483,19 +509,31 @@ def test_fp4_query_keeps_original_provider(installed):
 
 
 @pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
-def test_metadata_preserves_ratio_alignment(installed, cap):
+def test_indexer_spec_preserves_geometry_without_quantization_queries(installed, cap):
+    class UnavailableModelConfig:
+        @property
+        def model_config(self):
+            raise AssertionError("cache sizing must not query model geometry")
+
+        @property
+        def quant_config(self):
+            raise AssertionError("cache sizing must not query quantization")
+
     installed.platform.capability = cap
-    config = installed.config
-    config.model_config.hf_text_config = types.SimpleNamespace(
-        index_n_heads=32, index_head_dim=128
-    )
+    config = UnavailableModelConfig()
     cache = installed.modules[BASE + ".attention"].DeepseekV4IndexerCache()
+    before = installed.indexer._cache_spec(cache, config)
     spec = cache.get_kv_cache_spec(config)
-    assert (spec.indexer_n_head, spec.indexer_q_head_dim) == (32, 128)
+    assert (
+        (spec.indexer_n_head, spec.indexer_q_head_dim)
+        == (before.indexer_n_head, before.indexer_q_head_dim)
+        == (64, 128)
+    )
     assert (spec.alignment, spec.tokens_per_state) == (576, 2)
     assert spec.block_size == 128 and spec.page_size_padded is None
+    assert not hasattr(installed.indexer, "uses_int8_w8a8")
     installed.platform.ppu = False
-    assert cache.get_kv_cache_spec(config).indexer_n_head == 64
+    assert cache.get_kv_cache_spec(config) == before
 
 
 @pytest.mark.upstream_source
@@ -520,8 +558,8 @@ def test_real_indexer_spec_and_kernel_selection(
         alignment: int
         block_stride_alignment: int | None = None
         page_size_padded: int | None = None
-        indexer_n_head: int = 64
-        indexer_q_head_dim: int = 128
+        indexer_n_head: int | None = None
+        indexer_q_head_dim: int | None = None
 
         def __post_init__(self):
             if self.page_size_padded is None:
@@ -559,9 +597,6 @@ def test_real_indexer_spec_and_kernel_selection(
     )
     config = state.config
     config.cache_config = types.SimpleNamespace(cache_dtype="fp8_ds_mla")
-    config.model_config.hf_text_config = types.SimpleNamespace(
-        index_n_heads=32, index_head_dim=128
-    )
     before = state.indexer._cache_spec(cache, config)
     spec = state.indexer.get_kv_cache_spec(cache, config)
     backend = state.modules[
@@ -577,10 +612,14 @@ def test_real_indexer_spec_and_kernel_selection(
         assert selected == spec.block_size == 64 * ratio
         assert spec.block_size // spec.tokens_per_state == 64
         assert spec.page_size_padded == 8640
-        assert (spec.indexer_n_head, spec.indexer_q_head_dim) == (32, 128)
     else:
         assert spec == before
         assert selected == (64 if capability == (9, 0) else 128)
+    assert (
+        (spec.indexer_n_head, spec.indexer_q_head_dim)
+        == (before.indexer_n_head, before.indexer_q_head_dim)
+        == (None, None)
+    )
     assert cache.cache_config.block_size == manager_block
 
 
@@ -764,7 +803,12 @@ def sparse_indexer(installed):
     )
     Indexer.forward_native = native
 
-    def construct(use_fp4_cache=False):
+    def construct(
+        use_fp4_cache=False,
+        candidate_blocks=None,
+        candidate_block_size=0,
+        candidate_write=False,
+    ):
         indexer = Indexer.__new__(Indexer)
         cache = types.SimpleNamespace(prefix="v41.indexer", kv_cache=object())
         init(
@@ -778,6 +822,9 @@ def sparse_indexer(installed):
             32,
             object(),
             use_fp4_cache=use_fp4_cache,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+            candidate_write=candidate_write,
         )
         return indexer
 
@@ -788,7 +835,7 @@ def sparse_indexer(installed):
 
 @pytest.mark.parametrize("ppu,contract", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("fp4_cache", [False, True])
-def test_indexer_warmup_uses_int8_only_for_w8a8(
+def test_indexer_warmup_preserves_cache_format(
     installed, sparse_indexer, ppu, contract, fp4_cache
 ):
     installed.platform.ppu = ppu
@@ -796,7 +843,7 @@ def test_indexer_warmup_uses_int8_only_for_w8a8(
         installed.config.quant_config = None
     installed.config.kernel_config.enable_jit_warmup = True
     sparse_indexer.construct(use_fp4_cache=fp4_cache)
-    dtype = "int8" if ppu and contract else "uint8" if fp4_cache else "float8_e4m3fn"
+    dtype = "uint8" if fp4_cache else "float8_e4m3fn"
     assert sparse_indexer.warmups == [
         dict(dtype=dtype, pad_value=0 if fp4_cache else -float("inf")),
         "unpack",
@@ -805,7 +852,7 @@ def test_indexer_warmup_uses_int8_only_for_w8a8(
 
 @pytest.mark.parametrize("ppu,contract", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("cap", [(8, 0), (8, 9), (9, 0)])
-def test_indexer_int8_contract_is_frozen_at_construction(
+def test_indexer_forward_does_not_depend_on_model_quantization(
     installed, sparse_indexer, ppu, contract, cap
 ):
     state = installed
@@ -819,13 +866,14 @@ def test_indexer_int8_contract_is_frozen_at_construction(
     state.platform.is_device_capability = unavailable
     indexer = sparse_indexer.construct()
     assert indexer.parent_initialized
-    assert indexer._v41_int8_indexer is (ppu and contract)
+    assert not hasattr(indexer, "_v41_int8_indexer")
     state.config.quant_config = None
-    sparse_indexer.namespace["get_current_vllm_config"] = unavailable
+    indexer.forward_ppu.__func__.__globals__["get_current_vllm_config"] = unavailable
+    indexer.forward_ppu.__func__.__globals__["current_platform"] = state.platform
     q, weights = types.SimpleNamespace(dtype="int8"), object()
     assert indexer.forward_ppu(None, q, None, weights) == "sparse_ppu"
     assert sparse_indexer.calls[0][3:7] == (q, None, None, weights)
-    assert indexer._v41_int8_indexer is (ppu and contract)
+    assert not hasattr(indexer, "_v41_int8_indexer")
 
 
 @pytest.mark.parametrize("dispatch", ["forward_ppu", "forward_native"])
@@ -841,22 +889,53 @@ def test_indexer_int8_contract_is_frozen_at_construction(
     ],
 )
 @pytest.mark.parametrize("contract", [True, False])
-def test_w8a8_indexer_rejects_non_int8_before_custom_op(
-    installed, sparse_indexer, dispatch, dtype, has_scale, fp4_cache, contract
+@pytest.mark.parametrize("candidate_write", [False, True])
+def test_indexer_wrapper_forwards_inputs_to_custom_op(
+    installed,
+    sparse_indexer,
+    dispatch,
+    dtype,
+    has_scale,
+    fp4_cache,
+    contract,
+    candidate_write,
 ):
     if not contract:
         installed.config.quant_config = None
-    indexer = sparse_indexer.construct(use_fp4_cache=fp4_cache)
+    candidates = object()
+    indexer = sparse_indexer.construct(
+        use_fp4_cache=fp4_cache,
+        candidate_blocks=candidates,
+        candidate_block_size=8,
+        candidate_write=candidate_write,
+    )
     q, scale = types.SimpleNamespace(dtype=dtype), object() if has_scale else None
     quant = (q, scale) if has_scale else q
-    invalid = dtype != "int8" or has_scale or fp4_cache
-    if contract and invalid:
-        with pytest.raises(ValueError, match="W8A8 indexer requires torch.int8"):
-            getattr(indexer, dispatch)(None, quant, None, None)
-        assert not sparse_indexer.calls
-    else:
-        assert getattr(indexer, dispatch)(None, quant, None, None) == "sparse_ppu"
-        assert sparse_indexer.calls[0][3:5] == (q, scale)
+    hidden_states, k, weights = object(), object(), object()
+    assert getattr(indexer, dispatch)(hidden_states, quant, k, weights) == "sparse_ppu"
+    assert sparse_indexer.calls == [
+        (
+            hidden_states,
+            indexer.k_cache.prefix,
+            indexer.k_cache.kv_cache,
+            q,
+            scale,
+            k,
+            weights,
+            indexer.quant_block_size,
+            indexer.scale_fmt,
+            indexer.topk_tokens,
+            indexer.head_dim,
+            indexer.max_model_len,
+            indexer.max_total_seq_len,
+            indexer.topk_indices_buffer,
+            indexer.skip_k_cache_insert,
+            fp4_cache,
+            candidates,
+            8,
+            candidate_write,
+        )
+    ]
 
 
 def test_non_ppu_native_indexer_keeps_upstream(installed, sparse_indexer):

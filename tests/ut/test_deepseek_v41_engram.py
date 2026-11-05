@@ -14,7 +14,8 @@ load_patch = harness.load_patch
 
 
 @pytest.mark.parametrize("offload", [False, True])
-def test_engram_channelwise_storage_keeps_real_fp32_scales(modules, offload):
+@pytest.mark.parametrize("use_thp", [False, True])
+def test_engram_channelwise_storage_keeps_real_fp32_scales(modules, offload, use_thp):
     allocations = []
 
     def allocate(*shape, **kwargs):
@@ -30,6 +31,7 @@ def test_engram_channelwise_storage_keeps_real_fp32_scales(modules, offload):
         "torch",
         empty=allocate,
         float8_e4m3fn="fp8",
+        int8="int8",
         float32="fp32",
     )
     modules("vllm.model_executor.utils", set_weight_attrs=set_weight_attrs)
@@ -37,11 +39,13 @@ def test_engram_channelwise_storage_keeps_real_fp32_scales(modules, offload):
     class Upstream:
         lookup = object()
         _storage = object()
+        _weight_loader = object()
 
         def __init__(self, n, dim, heads, **kwargs):
             self.dim, self.part_num_embeddings = dim, n
-            self.cpu_offload = kwargs["cpu_offload"]
+            self.__dict__.update(kwargs)
             assert kwargs["block_size"] == dim
+            assert kwargs["use_thp"] is use_thp
             self.weight, self.weight_scale_inv = self._allocate_weights()
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
 
@@ -64,10 +68,11 @@ def test_engram_channelwise_storage_keeps_real_fp32_scales(modules, offload):
     cls = load_patch(
         "vllm_sail/models/deepseek_v41/engram.py"
     ).ChannelwiseEngramEmbedding
-    embedding = cls(10, 256, (10,), cpu_offload=offload)
+    embedding = cls(10, 256, (10,), cpu_offload=offload, use_thp=use_thp)
     assert [item[0] for item in allocations] == [(10, 256), (10, 1)]
-    assert allocations[1][1]["dtype"] == "fp32"
-    assert (allocations[1][1].get("device") == "cpu") is offload
+    assert [item[1]["dtype"] for item in allocations] == ["fp8", "fp32"]
+    assert all((item[1].get("device") == "cpu") is offload for item in allocations)
+    assert embedding._weight_loader is Upstream._weight_loader
     assert embedding.weight_scale_inv.dummy_weight_value == 1.0
     assert (
         embedding.lookup is Upstream.lookup and embedding._storage is Upstream._storage
@@ -180,6 +185,7 @@ def int8_storage(modules):
     class Upstream:
         lookup = object()
         _storage = object()
+        _weight_loader = staticmethod(lambda *args: loads.append(("upstream", *args)))
 
         def __init__(self, n, dim, heads, **kw):
             constructors.append((n, dim, heads, kw))
@@ -190,7 +196,7 @@ def int8_storage(modules):
             self.weight, self.weight_scale_inv = self._allocate_weights()
             self.weight_scale_inv.dummy_weight_value = 127
 
-    modules("torch", int8="int8", float32="fp32", empty=allocate)
+    modules("torch", int8="int8", float8_e4m3fn="fp8", float32="fp32", empty=allocate)
     group = SimpleNamespace(value=object())
     modules(
         "vllm.distributed",
@@ -223,8 +229,8 @@ def int8_storage(modules):
 @pytest.mark.parametrize("offload", [False, True])
 def test_int8_embedding_reuses_constructor_storage_and_loader(int8_storage, offload):
     state = int8_storage
-    embedding = state.module.Int8ParallelEngramEmbedding(
-        10, 256, (4, 6), cpu_offload=offload
+    embedding = state.module.ChannelwiseEngramEmbedding(
+        10, 256, (4, 6), cpu_offload=offload, weight_dtype="int8"
     )
     assert state.constructors == [
         (
@@ -258,12 +264,23 @@ def test_int8_embedding_reuses_constructor_storage_and_loader(int8_storage, offl
         )
 
 
-def test_int8_shared_storage_preserves_upstream_allocation_and_barrier(int8_storage):
+@pytest.mark.parametrize("use_thp", [False, True])
+def test_int8_shared_storage_preserves_upstream_allocation_and_barrier(
+    int8_storage, use_thp
+):
     state = int8_storage
-    cls = state.module.Int8ParallelEngramEmbedding
+    cls = state.module.ChannelwiseEngramEmbedding
     with pytest.raises(ValueError, match="CPU offload"):
-        cls(10, 256, (4, 6), dp_shared_memory=True)
-    embedding = cls(10, 256, (4, 6), dp_shared_memory=True, cpu_offload=True)
+        cls(10, 256, (4, 6), dp_shared_memory=True, weight_dtype="int8")
+    embedding = cls(
+        10,
+        256,
+        (4, 6),
+        dp_shared_memory=True,
+        cpu_offload=True,
+        use_thp=use_thp,
+        weight_dtype="int8",
+    )
     assert state.allocations == [(10 * 260, "shared")]
     assert (embedding.weight.dtype, embedding.weight_scale_inv.dtype) == (
         "int8",
@@ -275,9 +292,74 @@ def test_int8_shared_storage_preserves_upstream_allocation_and_barrier(int8_stor
     assert state.loads == [("shared", embedding.weight, loaded)]
     state.group.value = None
     with pytest.raises(RuntimeError, match="node-local"):
-        cls(10, 256, (4, 6), dp_shared_memory=True, cpu_offload=True)
+        cls(
+            10,
+            256,
+            (4, 6),
+            dp_shared_memory=True,
+            cpu_offload=True,
+            weight_dtype="int8",
+        )
     with pytest.raises(ValueError, match="four-byte aligned"):
         state.module.Int8DPSharedEngramStorage(3, 3, 3, object())
+
+
+@pytest.mark.parametrize("dtypes", [("fp8", "int8"), ("int8", "fp8")])
+def test_channelwise_loader_is_selected_per_instance(int8_storage, dtypes):
+    state = int8_storage
+    for dtype in dtypes:
+        kwargs = {"weight_dtype": dtype} if dtype == "int8" else {}
+        embedding = state.module.ChannelwiseEngramEmbedding(10, 256, (4, 6), **kwargs)
+        expected = (
+            state.module.load_weight
+            if dtype == "int8"
+            else state.upstream._weight_loader
+        )
+        assert embedding.weight.dtype == dtype
+        assert embedding._weight_loader is expected
+        loaded = state.Tensor((12, 256), dtype)
+        embedding._weight_loader(embedding.weight, loaded)
+        assert state.loads[-1] == (
+            "shard" if dtype == "int8" else "upstream",
+            embedding.weight,
+            loaded,
+        )
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+def test_int8_thp_storage_and_pinned_fallback(
+    int8_storage, monkeypatch, offload, available
+):
+    state = int8_storage
+    packed = state.Tensor((10 * 260,), "uint8") if available else None
+    requests = []
+
+    def allocate(size):
+        requests.append(size)
+        return packed
+
+    monkeypatch.setattr(state.module, "_allocate_huge_page_storage", allocate)
+    embedding = state.module.ChannelwiseEngramEmbedding(
+        10, 256, (4, 6), cpu_offload=offload, use_thp=True, weight_dtype="int8"
+    )
+    assert requests == ([10 * 260] if offload else [])
+    assert (embedding.weight.dtype, embedding.weight_scale_inv.dtype) == (
+        "int8",
+        "fp32",
+    )
+    assert (embedding.weight.shape, embedding.weight_scale_inv.shape) == (
+        (10, 256),
+        (10, 1),
+    )
+    assert embedding._weight_loader is state.module.load_weight
+    assert embedding.weight_scale_inv.dummy_weight_value == 1.0
+    if offload and available:
+        assert embedding._packed is packed
+        assert state.allocations == []
+    else:
+        assert [a[0] for a in state.allocations] == [(10, 256), (10, 1)]
+        assert all((a[1].get("device") == "cpu") is offload for a in state.allocations)
 
 
 @pytest.mark.upstream_source

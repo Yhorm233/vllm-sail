@@ -45,7 +45,6 @@ def test_indexer_cache_pages(
         is_device_capability=lambda value: capability == value[0] * 10 + value[1],
     )
     modules("vllm.platforms", current_platform=platform)
-    modules("vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=lambda config: False)
     indexer_source = upstream_source_root / "vllm/v1/attention/backends/mla/indexer.py"
     kernel_sizes = function(
         indexer_source,
