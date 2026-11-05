@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise channelwise checkpoint loading through the actual PPU FP8 kernel."""
+"""Validate explicit W8A8 INT8 dispatch, loading, scales, bias and graph numerics."""
 
 from types import SimpleNamespace
 
@@ -11,7 +11,6 @@ pytestmark = pytest.mark.ppu
 @pytest.mark.parametrize("input_size", [256, 576])
 def test_channelwise_dense_loading_and_per_token_activation(monkeypatch, input_size):
     import torch
-    from compressed_tensors.quantization import QuantizationArgs
     from vllm.config import VllmConfig, set_current_vllm_config
 
     import vllm_sail
@@ -25,21 +24,15 @@ def test_channelwise_dense_loading_and_per_token_activation(monkeypatch, input_s
     monkeypatch.setattr(
         "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
     )
-    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
-        CompressedTensorsW8A8Fp8,
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
     )
-    from vllm.platforms import current_platform
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+        CompressedTensorsW8A8Int8,
+    )
 
     from vllm_sail.model_executor.kernels.linear.scaled_mm.ppu import (
-        PPUCutlassFP8ScaledMMLinearKernel,
-        PPUDeepGemmFP8ScaledMMLinearKernel,
-    )
-
-    use_cutlass = current_platform.is_device_capability((8, 0))
-    expected_kernel = (
-        PPUCutlassFP8ScaledMMLinearKernel
-        if use_cutlass
-        else PPUDeepGemmFP8ScaledMMLinearKernel
+        PPUInt8ScaledMMLinearKernel,
     )
 
     config = VllmConfig()
@@ -48,32 +41,54 @@ def test_channelwise_dense_loading_and_per_token_activation(monkeypatch, input_s
     try:
         torch.set_default_dtype(torch.bfloat16)
         with set_current_vllm_config(config), torch.device("cuda"):
-            scheme = CompressedTensorsW8A8Fp8(
-                QuantizationArgs(num_bits=8, type="float", strategy="channel"),
-                is_static_input_scheme=False,
+            quant_config = CompressedTensorsConfig.from_config(
+                {
+                    "format": "int-quantized",
+                    "config_groups": {
+                        "dense": {
+                            "targets": ["re:.*"],
+                            "weights": {
+                                "num_bits": 8,
+                                "type": "int",
+                                "strategy": "channel",
+                                "symmetric": True,
+                            },
+                            "input_activations": {
+                                "num_bits": 8,
+                                "type": "int",
+                                "strategy": "token",
+                                "symmetric": True,
+                                "dynamic": True,
+                            },
+                        },
+                    },
+                    "fp8_channelwise_layers": ["layers.0.attn.wq_a"],
+                }
             )
             layer = torch.nn.Module()
+            scheme = quant_config.get_scheme(layer, "layers.0.attn.wq_a")
+            assert type(scheme) is CompressedTensorsW8A8Int8
             scheme.create_weights(
                 layer,
-                input_size,
-                [128],
-                input_size,
-                128,
-                torch.bfloat16,
+                output_partition_sizes=[128],
+                input_size_per_partition=input_size,
+                params_dtype=torch.bfloat16,
                 weight_loader=lambda param, value: param.copy_(value),
             )
             scales = torch.linspace(0.125, 0.5, 128, dtype=torch.float32)[:, None]
             layer.weight.data.fill_(2.0)
             layer.weight_scale.data.copy_(scales)
             scheme.process_weights_after_loading(layer)
-            assert type(scheme.fp8_linear) is expected_kernel
-            assert layer.weight.dtype == torch.float8_e4m3fn
+            assert type(scheme.kernel) is PPUInt8ScaledMMLinearKernel
+            assert layer.weight.dtype == torch.int8
             assert layer.weight.shape == (
-                (input_size, 128) if use_cutlass else (128, input_size)
+                (128, input_size)
+                if scheme.kernel.weight_RowMajor
+                else (input_size, 128)
             )
             x = torch.tensor([0.5, -1.0, 2.0], dtype=torch.bfloat16)
             x = x[:, None].expand(3, input_size).contiguous()
-            actual = scheme.apply_weights(layer, x)
+            actual = scheme.apply_weights(layer, x, None)
             expected = (x[:, :1].float() * (2 * input_size) * scales.T).to(
                 torch.bfloat16
             )
@@ -86,39 +101,70 @@ def test_channelwise_dense_loading_and_per_token_activation(monkeypatch, input_s
 @pytest.mark.parametrize("per_channel", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("output_dtype", ["float16", "bfloat16"])
-def test_fp8_linear_scales_bias_and_graph_updates(
-    per_token, per_channel, with_bias, output_dtype
+def test_int8_linear_scales_bias_and_graph_updates(
+    monkeypatch, per_token, per_channel, with_bias, output_dtype
 ):
     import torch
 
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
-    from vllm_sail.model_executor.kernels.linear.scaled_mm.ppu import (
-        PPUCutlassFP8ScaledMMLinearKernel,
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+        CompressedTensorsW8A8Int8,
     )
 
+    from vllm_sail.model_executor.kernels.linear.scaled_mm.ppu import (
+        PPUInt8ScaledMMLinearKernel,
+    )
+
+    monkeypatch.setenv("VLLM_SAIL_DENSE_BACKEND", "triton")
+    monkeypatch.setenv("VLLM_SAIL_USE_TRITON_INT8_QUANT", "1")
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
     dtype = getattr(torch, output_dtype)
     generator = torch.Generator().manual_seed(14280)
-    a_cpu = (torch.randn(5, 64, generator=generator) / 8).to(torch.float8_e4m3fn)
-    b_cpu = (torch.randn(17, 64, generator=generator) / 8).to(torch.float8_e4m3fn).T
+    a_cpu = torch.randint(-8, 9, (5, 64), generator=generator, dtype=torch.int8)
+    # Fix each row's amax so dynamic quantization scales match the independent oracle.
+    a_cpu[:, 0] = 127
+    b_cpu = torch.randint(-8, 9, (17, 64), generator=generator, dtype=torch.int8).T
     as_cpu = torch.linspace(0.125, 0.5, 5 if per_token else 1)[:, None]
     bs_cpu = torch.linspace(0.25, 0.75, 17 if per_channel else 1)[:, None]
     bias_cpu = torch.linspace(-0.25, 0.25, 17).to(dtype) if with_bias else None
-    a, b, as_, bs = a_cpu.cuda(), b_cpu.cuda(), as_cpu.cuda(), bs_cpu.cuda()
+    x_cpu = (a_cpu.float() * as_cpu).to(dtype)
+    x = x_cpu.cuda()[None, :, :]
     bias = bias_cpu.cuda() if bias_cpu is not None else None
-    kernel = object.__new__(PPUCutlassFP8ScaledMMLinearKernel)
+    config = VllmConfig()
+    config.model_config = SimpleNamespace(dtype=dtype)
+    with set_current_vllm_config(config), torch.device("cuda"):
+        scheme = CompressedTensorsW8A8Int8(
+            "channel" if per_channel else "tensor",
+            is_static_input_scheme=not per_token,
+            input_symmetric=True,
+        )
+        layer = torch.nn.Module()
+        scheme.create_weights(
+            layer,
+            output_partition_sizes=[17],
+            input_size_per_partition=64,
+            params_dtype=dtype,
+            weight_loader=lambda param, value: param.copy_(value),
+        )
+        layer.weight.data.copy_(b_cpu.T)
+        layer.weight_scale.data.copy_(bs_cpu.reshape_as(layer.weight_scale))
+        if not per_token:
+            layer.input_scale.data.fill_(as_cpu.item())
+        scheme.process_weights_after_loading(layer)
+    assert type(scheme.kernel) is PPUInt8ScaledMMLinearKernel
+    assert layer.weight.dtype == torch.int8
+    assert not scheme.kernel.weight_RowMajor
 
     def step():
-        return kernel.apply_scaled_mm(
-            A=a,
-            B=b,
-            As=as_,
-            Bs=bs,
-            bias=bias,
-            out_dtype=dtype,
-            output_shape=[1, 5, 17],
-        )
+        return scheme.apply_weights(layer, x, bias)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -128,10 +174,15 @@ def test_fp8_linear_scales_bias_and_graph_updates(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = step()
-    for factor in (1.0, 1.25):
-        as_.copy_(as_cpu * factor)
+    for factor in (1.0, 2.0):
+        x.copy_((x_cpu * factor)[None, :, :])
+        if not per_token:
+            layer.input_scale.data.fill_(as_cpu.item() * factor)
+        layer.weight_scale.data.copy_((bs_cpu * factor).reshape_as(layer.weight_scale))
         graph.replay()
-        expected = (a_cpu.float() @ b_cpu.float()) * (as_cpu * factor) * bs_cpu.T
+        expected = (
+            (a_cpu.float() @ b_cpu.float()) * (as_cpu * factor) * (bs_cpu.T * factor)
+        )
         if bias_cpu is not None:
             expected = expected + bias_cpu.float()
         torch.testing.assert_close(
