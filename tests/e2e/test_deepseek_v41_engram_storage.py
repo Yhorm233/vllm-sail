@@ -82,8 +82,12 @@ def test_shared_loader_single_writer_barrier(modules, monkeypatch, rank):
     assert barriers == [{"group": storage.group.cpu_group}]
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_real_constructor_attributes_and_tp_ownership(modules, monkeypatch, shared):
+@pytest.mark.parametrize(
+    "dtype,shared", [("fp8", False), ("int8", False), ("int8", True)]
+)
+def test_real_constructor_attributes_and_tp_ownership(
+    modules, monkeypatch, dtype, shared
+):
     common, upstream, plugin = modules
     monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 1)
@@ -109,9 +113,25 @@ def test_real_constructor_attributes_and_tp_ownership(modules, monkeypatch, shar
         "_allocate_huge_page_storage",
         lambda size: torch.empty(size, dtype=torch.uint8),
     )
-    obj = plugin.Int8ParallelEngramEmbedding(
-        17, 256, (2, 3, 5, 7), cpu_offload=True, dp_shared_memory=shared, use_thp=True
+    empty = torch.empty
+
+    def allocate_cpu(*shape, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate_cpu)
+    kwargs = {"weight_dtype": torch.int8} if dtype == "int8" else {}
+    obj = plugin.ChannelwiseEngramEmbedding(
+        17,
+        256,
+        (2, 3, 5, 7),
+        cpu_offload=True,
+        dp_shared_memory=shared,
+        use_thp=True,
+        **kwargs,
     )
+    assert obj.weight.dtype == (torch.int8 if dtype == "int8" else torch.float8_e4m3fn)
+    assert obj.weight_scale_inv.dtype == torch.float32
     assert (obj.head_start, obj.part_n_hash_cols) == (2, 2)
     assert (obj.vocab_start_idx, obj.vocab_end_idx) == (5, 17)
     assert obj.dp_size == 1
@@ -127,8 +147,21 @@ def test_real_constructor_attributes_and_tp_ownership(modules, monkeypatch, shar
         assert obj.weight.data_ptr() == obj._shared_memory.weight.data_ptr()
         assert obj.weight_scale_inv.weight_loader.__self__ is obj._shared_memory
     else:
-        assert obj._packed is not None
-        assert obj.weight_scale_inv.weight_loader is plugin.load_weight
+        assert (obj._packed is not None) is (dtype == "int8")
+        expected_loader = (
+            plugin.load_weight
+            if dtype == "int8"
+            else common._engram_head_shard_weight_loader
+        )
+        assert obj.weight_scale_inv.weight_loader is expected_loader
+        for target in (obj.weight, obj.weight_scale_inv):
+            loaded = (
+                (torch.arange(17 * target.shape[1]) % 13 - 6)
+                .reshape(17, target.shape[1])
+                .to(target.dtype)
+            )
+            target.weight_loader(target, loaded)
+            assert torch.equal(target.float(), loaded[5:17].float())
     assert obj.weight.device.type == obj.weight_scale_inv.device.type == "cpu"
 
 
@@ -136,14 +169,23 @@ def test_constructor_rejects_invalid_shared_and_uva_settings(modules, monkeypatc
     _, upstream, plugin = modules
     monkeypatch.setattr(upstream, "get_engram_dp_size", lambda: 1)
     with pytest.raises(ValueError, match="cpu_offload"):
-        plugin.Int8ParallelEngramEmbedding(2, 256, (2,), dp_shared_memory=True)
+        plugin.ChannelwiseEngramEmbedding(
+            2, 256, (2,), dp_shared_memory=True, weight_dtype=torch.int8
+        )
     with pytest.raises(ValueError, match="size > 1"):
-        plugin.Int8ParallelEngramEmbedding(
-            2, 256, (2,), cpu_offload=True, dp_shared_memory=True
+        plugin.ChannelwiseEngramEmbedding(
+            2,
+            256,
+            (2,),
+            cpu_offload=True,
+            dp_shared_memory=True,
+            weight_dtype=torch.int8,
         )
     monkeypatch.setattr(upstream, "is_uva_available", lambda: False)
     with pytest.raises(RuntimeError, match="UVA"):
-        plugin.Int8ParallelEngramEmbedding(2, 256, (2,), cpu_offload=True)
+        plugin.ChannelwiseEngramEmbedding(
+            2, 256, (2,), cpu_offload=True, weight_dtype=torch.int8
+        )
     monkeypatch.setattr(upstream, "is_uva_available", lambda: True)
     monkeypatch.setattr(upstream, "get_engram_dp_size", lambda: 2)
     monkeypatch.setattr(plugin, "get_engram_dp_group", lambda: None)
@@ -151,6 +193,11 @@ def test_constructor_rejects_invalid_shared_and_uva_settings(modules, monkeypatc
     monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(common, "get_tensor_model_parallel_rank", lambda: 0)
     with pytest.raises(RuntimeError, match="node-local shared group"):
-        plugin.Int8ParallelEngramEmbedding(
-            2, 256, (2,), cpu_offload=True, dp_shared_memory=True
+        plugin.ChannelwiseEngramEmbedding(
+            2,
+            256,
+            (2,),
+            cpu_offload=True,
+            dp_shared_memory=True,
+            weight_dtype=torch.int8,
         )

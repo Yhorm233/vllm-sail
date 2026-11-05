@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Preserve V4.1 Engram lookup semantics for PPU FP32 per-row scales."""
 
-import sys
-
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.platforms import current_platform
@@ -106,14 +104,14 @@ def _create_embedding(self, layout, layer_hash_index):
     quant = getattr(vllm_config.model_config.hf_config, "quantization_config", None) or {}
     name = f"layers.{layout.layer_ids[layer_hash_index]}.engram.embed"
     if current_platform.is_ppu() and uses_int8_w8a8(vllm_config):
-        from vllm_sail.models.deepseek_v41.engram import Int8ParallelEngramEmbedding
+        from vllm_sail.models.deepseek_v41.engram import ChannelwiseEngramEmbedding
 
         config = vllm_config.engram_config
-        return Int8ParallelEngramEmbedding(
+        return ChannelwiseEngramEmbedding(
             layout.num_embeddings[layer_hash_index], layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=config.cpu_offload, dp_shared_memory=bool(config.dp_shared_memory),
-            use_thp=config.use_thp,
+            use_thp=config.use_thp, weight_dtype=torch.int8,
         )
     if current_platform.is_ppu() and name in (quant.get("fp8_channelwise_layers") or []):
         from vllm_sail.models.deepseek_v41.engram import ChannelwiseEngramEmbedding
@@ -144,32 +142,3 @@ def lookup(self, indices, out, background=False):
         "vllm.models.deepseek_v41.common.engram.ParallelEngramEmbedding.lookup"
     ]
     return original(self, indices, out, background)
-
-
-@patch(
-    _FACTORY, "can_share_engram_tables",
-    reason="INT8 Engram shared storage has FP32 row scales; retain upstream per-rank fallback policy.",
-    affected_versions=_AFFECTED,
-    remove_when="Engram shared-memory capacity calculation follows the selected storage format.",
-)
-def can_share_engram_tables(layout, block_size=32):
-    if current_platform.is_ppu() and uses_int8_w8a8(get_current_vllm_config()):
-        from vllm_sail.models.deepseek_v41.engram import can_share_engram_tables as share
-
-        return share(layout, block_size)
-    original = getattr(can_share_engram_tables, PATCH_MARKER)[f"{_FACTORY}.can_share_engram_tables"]
-    return original(layout, block_size)
-
-
-def _rebind_share_aliases():
-    original = getattr(can_share_engram_tables, PATCH_MARKER)[f"{_FACTORY}.can_share_engram_tables"]
-    for name in ("vllm.models.deepseek_v41.nvidia.model",):
-        module = sys.modules.get(name)
-        if module is not None and getattr(module, "can_share_engram_tables", None) is original:
-            patch(name, "can_share_engram_tables",
-                  reason="Preloaded V4.1 model must use quantization-aware Engram sharing capacity.",
-                  affected_versions=_AFFECTED,
-                  remove_when="V4.1 model resolves Engram sharing through the provider module.")(can_share_engram_tables)
-
-
-_rebind_share_aliases()

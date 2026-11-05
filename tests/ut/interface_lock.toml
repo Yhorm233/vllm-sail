@@ -11,7 +11,7 @@
 schema = 1
 vllm_version_range = ">=0.31.0,<0.32.0"
 key_interface_count = 10
-target_count = 307
+target_count = 305
 
 [[key_interface]]
 symbol = "vllm.platforms.interface.PlatformEnum"
@@ -1826,14 +1826,6 @@ present = true
 fingerprint = "sha256:a6e0b910fddc9e8cb5ff9c0346bf4fd6a1772b22146b49d6a254489873f4ef3f"
 
 [[patch_target]]
-name = "vllm.models.deepseek_v41.nvidia.engram.can_share_engram_tables"
-kind = "module"
-module = "vllm/models/deepseek_v41/nvidia/engram.py"
-symbol = "can_share_engram_tables"
-present = true
-fingerprint = "sha256:c414433259bd4ec517b19f191acbf4d9ffccd0702f37bfec42cbc3f5bfb22ef9"
-
-[[patch_target]]
 name = "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn.dequantize_and_gather_k_cache"
 kind = "module"
 module = "vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py"
@@ -1864,14 +1856,6 @@ module = "vllm/models/deepseek_v41/nvidia/model.py"
 symbol = "_select_dsv4_attn_cls"
 present = true
 fingerprint = "sha256:cd9f420e339d3b9ab68d87165c2a97f241aedc28639e1be8e2606fdd8a69cbdb"
-
-[[patch_target]]
-name = "vllm.models.deepseek_v41.nvidia.model.can_share_engram_tables"
-kind = "module"
-module = "vllm/models/deepseek_v41/nvidia/model.py"
-symbol = "can_share_engram_tables"
-present = true
-fingerprint = "sha256:d981fad5901903a5d8d85c61d2729033ce8d6cb0af543e2c4a4585e62f8f2baf"
 
 [[patch_target]]
 name = "vllm.models.deepseek_v41.nvidia.vl_model._linear_scale_param_name"
