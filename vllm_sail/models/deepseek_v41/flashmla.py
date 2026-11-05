@@ -37,8 +37,6 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         if current_platform.is_ppu():
-            if uses_int8_w8a8(get_current_vllm_config()):
-                return num_heads
             return PPUV4FlashMLAAttention.get_padded_num_q_heads(num_heads)
         return super().get_padded_num_q_heads(num_heads)
 
