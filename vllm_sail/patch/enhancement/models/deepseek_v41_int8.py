@@ -4,7 +4,6 @@
 import sys
 
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.models.deepseek_v41.common import ops
 from vllm.models.deepseek_v41.common.ops import (
     cache_utils,
@@ -13,7 +12,7 @@ from vllm.models.deepseek_v41.common.ops import (
 )
 from vllm.platforms import current_platform
 
-from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
+from vllm_sail.models.deepseek_v41.config import int8_w8a8_enabled
 from vllm_sail.patch.utils import patch
 
 _PREFIX = "vllm.models.deepseek_v41"
@@ -26,10 +25,10 @@ _store = fused_compress_quant_cache.rope_quant_insert
 _gather = cache_utils.dequantize_and_gather_k_cache
 
 
-def _uses_int8(vllm_config=None):
-    if not current_platform.is_ppu():
-        return False
-    return uses_int8_w8a8(vllm_config or get_current_vllm_config())
+def _uses_int8():
+    # These operators have no module receiver; like V4's capability dispatch,
+    # read a decision fixed at model construction rather than the runtime config.
+    return current_platform.is_ppu() and int8_w8a8_enabled()
 
 
 @patch(

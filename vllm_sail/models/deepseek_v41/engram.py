@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Channelwise Engram storage with upstream sharding, UVA and prefetch."""
 
-import os
-import shutil
-
 import torch
-from vllm.distributed import get_engram_dp_group, get_engram_dp_size
-from vllm.distributed.device_communicators.shm_broadcast import SHM_PATH
+from vllm.distributed import get_engram_dp_group
 from vllm.models.deepseek_v41.common.engram import _engram_head_shard_weight_loader
 from vllm.models.deepseek_v41.nvidia.engram import (
     DPSharedEngramStorage,
@@ -40,16 +36,6 @@ def validate_weight(param, loaded_weight):
 def load_weight(param, loaded_weight):
     validate_weight(param, loaded_weight)
     _engram_head_shard_weight_loader(param, loaded_weight)
-
-
-def can_share_engram_tables(layout, block_size=32):
-    if not os.path.isdir(SHM_PATH) or get_engram_dp_size() <= 1:
-        return False
-    num_bytes = sum(layout.num_embeddings) * (layout.head_dim + 4)
-    margin = max(8 * 1024**3, (num_bytes + 9) // 10)
-    if shutil.disk_usage(SHM_PATH).free < num_bytes + margin:
-        return False
-    return True
 
 
 class Int8DPSharedEngramStorage(DPSharedEngramStorage):

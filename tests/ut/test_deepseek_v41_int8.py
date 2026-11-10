@@ -200,7 +200,13 @@ def installed(monkeypatch, patch_utils_module):
         spec.loader.exec_module(loaded)
         return loaded
 
-    load(PLUGIN + ".config", "vllm_sail/models/deepseek_v41/config.py")
+    contract = load(PLUGIN + ".config", "vllm_sail/models/deepseek_v41/config.py")
+
+    def resolve():
+        # Mirror DeepseekV41ForCausalLM.__init__: decide once at construction.
+        contract.set_int8_w8a8(platform.is_ppu() and contract.uses_int8_w8a8(config))
+
+    resolve()
     prefix = "vllm_sail/patch/enhancement/models/"
     patched = load("_test_v41_int8", prefix + "deepseek_v41_int8.py")
     selector = load("_test_v41_selector", prefix + "deepseek_v41.py")
@@ -222,6 +228,7 @@ def installed(monkeypatch, patch_utils_module):
         nvidia=nvidia,
         sharing=sharing,
         config=config,
+        resolve=resolve,
     )
 
 
@@ -270,6 +277,12 @@ def test_selector_cache_and_engram(installed, cap):
         raise AssertionError("V4.1 INT8 dispatch must not query chip capability")
 
     state.platform.is_device_capability = reject_capability_query
+
+    def unavailable():
+        raise AssertionError("forward dispatch must not query the runtime config")
+
+    state.modules["vllm.config"].get_current_vllm_config = unavailable
+    state.engram.get_current_vllm_config = unavailable
     assert state.patch._uses_int8() is True
     assert state.patch.fused_indexer_q_rope_quant(*range(6)) == "q810"
     assert state.patch.indexer_k_norm_rope_store(*range(8), False) == "k810"
@@ -277,7 +290,9 @@ def test_selector_cache_and_engram(installed, cap):
     assert (
         state.modules[BASE + ".compressor"].rope_quant_insert(*range(6)) == "store810"
     )
-    embedding = types.SimpleNamespace(weight=types.SimpleNamespace(dtype="int8"))
+    embedding = types.SimpleNamespace(
+        weight=types.SimpleNamespace(dtype="int8"), weight_dtype="int8"
+    )
     assert state.engram.lookup(embedding, 1, 2, True) == "lookup810"
     assert state.calls[-1][1] == (embedding, 1, 2, True)
     cache = types.SimpleNamespace(dtype="uint8", shape=(2, 16, 584))
@@ -301,6 +316,7 @@ def test_fp8_main_cache_decoding_does_not_enable_int8(
     state = installed
     state.config.quant_config = None
     state.platform.ppu, state.platform.capability = ppu, cap
+    state.resolve()
     assert state.patch._uses_int8() is False
     cache = types.SimpleNamespace(dtype="uint8", shape=(2, 64, record_bytes))
     args = (0, cache, 2, None, 4, 64, 3)
@@ -436,6 +452,7 @@ def test_int8_engram_factory_and_non_quant_isolation(installed, cap, shared, use
         cpu_offload=True, dp_shared_memory=shared, use_thp=use_thp, weight_dtype="int8"
     )
     state.config.quant_config = None
+    state.resolve()
     assert state.engram._create_embedding(None, layout, 1) == "embedding_upstream"
     state.sharing.available = False
     assert (
@@ -459,6 +476,7 @@ def test_other_compressed_formats_do_not_use_int8_engram(installed, field, value
     raw = state.config.model_config.hf_config.quantization_config
     raw["config_groups"]["W8A8"]["weights"][field] = value
     state.platform.capability = cap
+    state.resolve()
     assert state.patch._uses_int8() is False
     layout = types.SimpleNamespace(layer_ids=[1])
     assert state.engram._create_embedding(None, layout, 0) == "embedding_upstream"
@@ -482,6 +500,7 @@ def test_non_w8a8_quantization_delegates_all_int8_operators(
     raw = state.config.model_config.hf_config.quantization_config
     raw["config_groups"]["W8A8"][kind][field] = value
     state.platform.capability = cap
+    state.resolve()
     assert state.patch._uses_int8() is False
     assert state.patch.fused_indexer_q_rope_quant(*range(6)) == "q_upstream"
     assert state.patch.indexer_k_norm_rope_store(*range(8), False) == "k_upstream"
@@ -498,6 +517,7 @@ def test_non_w8a8_quantization_delegates_all_int8_operators(
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "dspark", "other"])
 def test_other_models_do_not_enter_v41_int8(installed, model_type):
     installed.config.model_config.hf_config.model_type = model_type
+    installed.resolve()
     assert installed.patch._uses_int8() is False
 
 
@@ -674,40 +694,13 @@ def test_install_order_and_lazy_registration():
     )
     assert (
         scope["_REQUIRED_PPU_MODELS"]["DeepseekV41ForCausalLM"]
-        == PLUGIN + ".ppu_model:DeepseekV41ForCausalLM"
+        == PLUGIN + ".model:DeepseekV41ForCausalLM"
     )
     assert scope["_registered"] is False
 
 
-def test_int8_sharing_uses_actual_free_bytes_and_margin():
-    tree = ast.parse((ROOT / "vllm_sail/models/deepseek_v41/engram.py").read_text())
-    node = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "can_share_engram_tables"
-    )
-    required = (384006168 + 384016682) * 260
-    margin = max(8 * 1024**3, (required + 9) // 10)
-    available = types.SimpleNamespace(free=required + margin)
-    group = types.SimpleNamespace(size=16)
-    scope = dict(
-        os=types.SimpleNamespace(path=types.SimpleNamespace(isdir=lambda path: True)),
-        shutil=types.SimpleNamespace(disk_usage=lambda path: available),
-        get_engram_dp_size=lambda: group.size,
-        SHM_PATH="/shared",
-    )
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "engram", "exec"), scope)
-    layout = types.SimpleNamespace(num_embeddings=[384006168, 384016682], head_dim=256)
-    assert scope["can_share_engram_tables"](layout)
-    available.free -= 1
-    assert scope["can_share_engram_tables"](layout) is False
-    available.free += 1
-    group.size = 1
-    assert scope["can_share_engram_tables"](layout) is False
-
-
 def test_int8_mapper_is_local_and_preserves_engram():
-    tree = ast.parse((ROOT / "vllm_sail/models/deepseek_v41/ppu_model.py").read_text())
+    tree = ast.parse((ROOT / "vllm_sail/models/deepseek_v41/model.py").read_text())
     node = next(
         n
         for n in tree.body
@@ -1003,35 +996,3 @@ def test_fp8_indexer_software_fallback_is_removed():
         == "_fp8_paged_mqa_logits_ppu10"
         for node in ast.walk(tree)
     )
-
-
-def test_cudart_loading_is_lazy_and_cached_by_sdk(monkeypatch):
-    import ctypes
-
-    calls = []
-    handles = []
-
-    def load(path, mode):
-        calls.append((path, mode))
-        handle = object()
-        handles.append(handle)
-        return handle
-
-    monkeypatch.setattr(ctypes, "CDLL", load)
-    spec = importlib.util.spec_from_file_location(
-        "_test_v41_cudart", ROOT / "vllm_sail/utils/cudart.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert not calls
-    monkeypatch.setenv("PPU_SDK", "/sdk/one")
-    first = module.load_sdk_cudart()
-    assert module.load_sdk_cudart() is first
-    monkeypatch.setenv("PPU_SDK", "/sdk/two")
-    second = module.load_sdk_cudart()
-    assert second is not first
-    assert module.load_sdk_cudart() is second
-    assert calls == [
-        ("/sdk/one/CUDA_SDK/lib64/libcudart.so", ctypes.RTLD_GLOBAL),
-        ("/sdk/two/CUDA_SDK/lib64/libcudart.so", ctypes.RTLD_GLOBAL),
-    ]

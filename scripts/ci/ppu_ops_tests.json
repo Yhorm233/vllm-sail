@@ -28,7 +28,7 @@
       },
       {
         "id": "deepseek-v41-python",
-        "paths": ["vllm_sail/models/deepseek_v41/ops/indexer_tilelang.py", "vllm_sail/models/deepseek_v41/ops/latent_store.py", "vllm_sail/models/deepseek_v41/ops/engram_lookup.py", "vllm_sail/models/deepseek_v41/flashmla.py", "vllm_sail/models/deepseek_v41/ppu_model.py", "vllm_sail/models/deepseek_v41/engram.py", "vllm_sail/patch/enhancement/models/deepseek_v41.py"],
+        "paths": ["vllm_sail/models/deepseek_v41/ops/indexer_tilelang.py", "vllm_sail/models/deepseek_v41/ops/latent_store.py", "vllm_sail/models/deepseek_v41/ops/engram_lookup.py", "vllm_sail/models/deepseek_v41/flashmla.py", "vllm_sail/models/deepseek_v41/model.py", "vllm_sail/models/deepseek_v41/engram.py", "vllm_sail/patch/enhancement/models/deepseek_v41.py"],
         "test_ids": ["deepseek-v41-indexer-int8", "deepseek-v41-fp8", "deepseek-v41-dsa"]
       },
       {

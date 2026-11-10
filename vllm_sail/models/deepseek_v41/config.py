@@ -3,6 +3,20 @@
 
 import re
 
+# Resolved once while constructing the V4.1 target model. Module-free operators
+# read it at forward time instead of querying the global vLLM config.
+_int8_w8a8 = False
+
+
+def set_int8_w8a8(enabled):
+    """Record the construction-time W8A8 decision; the last target model wins."""
+    global _int8_w8a8
+    _int8_w8a8 = bool(enabled)
+
+
+def int8_w8a8_enabled():
+    return _int8_w8a8
+
 
 def uses_int8_w8a8(vllm_config):
     """Accept only V4.1 symmetric W8A8 channel/token compressed-tensors contracts."""

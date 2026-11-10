@@ -7,7 +7,7 @@ from vllm.config import get_current_vllm_config
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
-from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
+from vllm_sail.models.deepseek_v41.config import int8_w8a8_enabled
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
 _AFFECTED = ">=0.31.0,<0.32.0"
@@ -103,25 +103,24 @@ def _create_embedding(self, layout, layer_hash_index):
     vllm_config = get_current_vllm_config()
     quant = getattr(vllm_config.model_config.hf_config, "quantization_config", None) or {}
     name = f"layers.{layout.layer_ids[layer_hash_index]}.engram.embed"
-    if current_platform.is_ppu() and uses_int8_w8a8(vllm_config):
-        from vllm_sail.models.deepseek_v41.engram import ChannelwiseEngramEmbedding
+    if current_platform.is_ppu():
+        # INT8 reuses the decision DeepseekV41ForCausalLM published before
+        # building layers; FP8 channelwise tables are listed per layer.
+        int8 = int8_w8a8_enabled()
+        if int8 or name in (quant.get("fp8_channelwise_layers") or []):
+            from vllm_sail.models.deepseek_v41.engram import ChannelwiseEngramEmbedding
 
-        config = vllm_config.engram_config
-        return ChannelwiseEngramEmbedding(
-            layout.num_embeddings[layer_hash_index], layout.head_dim,
-            tuple(size for order in layout.primes[layer_hash_index] for size in order),
-            cpu_offload=config.cpu_offload, dp_shared_memory=bool(config.dp_shared_memory),
-            use_thp=config.use_thp, weight_dtype=torch.int8,
-        )
-    if current_platform.is_ppu() and name in (quant.get("fp8_channelwise_layers") or []):
-        from vllm_sail.models.deepseek_v41.engram import ChannelwiseEngramEmbedding
-
-        config = vllm_config.engram_config
-        return ChannelwiseEngramEmbedding(
-            layout.num_embeddings[layer_hash_index], layout.head_dim,
-            tuple(size for order in layout.primes[layer_hash_index] for size in order),
-            cpu_offload=config.cpu_offload, dp_shared_memory=config.dp_shared_memory,
-        )
+            config = vllm_config.engram_config
+            # FP8 channelwise keeps the defaults: E4M3 values, no THP packing.
+            int8_storage = (
+                dict(use_thp=config.use_thp, weight_dtype=torch.int8) if int8 else {}
+            )
+            return ChannelwiseEngramEmbedding(
+                layout.num_embeddings[layer_hash_index], layout.head_dim,
+                tuple(size for order in layout.primes[layer_hash_index] for size in order),
+                cpu_offload=config.cpu_offload, dp_shared_memory=bool(config.dp_shared_memory),
+                **int8_storage,
+            )
     original = getattr(_create_embedding, PATCH_MARKER)[f"{_FACTORY}.Engram._create_embedding"]
     return original(self, layout, layer_hash_index)
 
@@ -134,7 +133,12 @@ def _create_embedding(self, layout, layer_hash_index):
 )
 def lookup(self, indices, out, background=False):
     if current_platform.is_ppu():
-        if self.weight.dtype != torch.int8 or uses_int8_w8a8(get_current_vllm_config()):
+        # INT8 tables exist only when the construction-time W8A8 factory chose
+        # ChannelwiseEngramEmbedding(weight_dtype=int8); no runtime config query.
+        if (
+            self.weight.dtype != torch.int8
+            or getattr(self, "weight_dtype", None) == torch.int8
+        ):
             from vllm_sail.models.deepseek_v41.ops.engram_lookup import lookup as ppu_lookup
 
             return ppu_lookup(self, indices, out, background)

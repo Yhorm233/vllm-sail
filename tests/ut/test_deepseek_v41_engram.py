@@ -101,7 +101,7 @@ def test_engram_factory_keeps_offload_and_original_layouts(modules):
         ),
     )
     modules("torch", int8="int8")
-    modules("vllm_sail.models.deepseek_v41.config", uses_int8_w8a8=lambda config: False)
+    modules("vllm_sail.models.deepseek_v41.config", int8_w8a8_enabled=lambda: False)
     modules(
         "vllm.triton_utils",
         tl=SimpleNamespace(constexpr=object()),

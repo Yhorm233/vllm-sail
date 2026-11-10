@@ -4,7 +4,6 @@
 from types import SimpleNamespace
 
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
@@ -18,7 +17,7 @@ from vllm.platforms import current_platform
 from vllm_sail.models.deepseek_v4.flashmla import (
     DeepseekV4FlashMLAAttention as PPUV4FlashMLAAttention,
 )
-from vllm_sail.models.deepseek_v41.config import uses_int8_w8a8
+from vllm_sail.models.deepseek_v41.config import int8_w8a8_enabled
 
 
 class PPUDeepseekV41FlashMLABackend(DeepseekV4FlashMLABackend):
@@ -34,6 +33,12 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
 
     backend_cls = PPUDeepseekV41FlashMLABackend
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # DeepseekV41ForCausalLM publishes the PPU W8A8 decision before building
+        # layers; snapshot it like the PPU V4 recipe instead of re-deriving it.
+        self._ppu_int8 = int8_w8a8_enabled()
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         if current_platform.is_ppu():
@@ -43,10 +48,7 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
     def _o_proj(self, o, positions):
         if not current_platform.is_ppu():
             return super()._o_proj(o, positions)
-        if (
-            uses_int8_w8a8(get_current_vllm_config())
-            and self.wo_a.weight.dtype == torch.int8
-        ):
+        if self._ppu_int8 and self.wo_a.weight.dtype == torch.int8:
             from vllm_sail.models.deepseek_v4.ops.o_proj import deep_gemm_int8_o_proj
 
             return deep_gemm_int8_o_proj(
