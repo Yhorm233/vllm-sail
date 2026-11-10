@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Validate explicit W8A8 INT8 dispatch, loading, scales, bias and graph numerics."""
+"""Exercise channelwise loading through the PPU FP8 kernel and W8A8 INT8 numerics."""
 
 from types import SimpleNamespace
 
@@ -11,6 +11,7 @@ pytestmark = pytest.mark.ppu
 @pytest.mark.parametrize("input_size", [256, 576])
 def test_channelwise_dense_loading_and_per_token_activation(monkeypatch, input_size):
     import torch
+    from compressed_tensors.quantization import QuantizationArgs
     from vllm.config import VllmConfig, set_current_vllm_config
 
     import vllm_sail
@@ -24,71 +25,48 @@ def test_channelwise_dense_loading_and_per_token_activation(monkeypatch, input_s
     monkeypatch.setattr(
         "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
     )
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
-    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
-        CompressedTensorsW8A8Int8,
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+        CompressedTensorsW8A8Fp8,
     )
 
     from vllm_sail.model_executor.kernels.linear.scaled_mm.ppu import (
-        PPUInt8ScaledMMLinearKernel,
+        PPUDeepGemmFP8ScaledMMLinearKernel,
     )
 
+    # SM80 PPUs such as 810E have no FP8 linear kernel; they run the INT8 cases below.
+    supported, reason = PPUDeepGemmFP8ScaledMMLinearKernel.is_supported()
+    if not supported:
+        pytest.skip(reason)
     config = VllmConfig()
     config.model_config = SimpleNamespace(dtype=torch.bfloat16)
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.bfloat16)
         with set_current_vllm_config(config), torch.device("cuda"):
-            quant_config = CompressedTensorsConfig.from_config(
-                {
-                    "format": "int-quantized",
-                    "config_groups": {
-                        "dense": {
-                            "targets": ["re:.*"],
-                            "weights": {
-                                "num_bits": 8,
-                                "type": "int",
-                                "strategy": "channel",
-                                "symmetric": True,
-                            },
-                            "input_activations": {
-                                "num_bits": 8,
-                                "type": "int",
-                                "strategy": "token",
-                                "symmetric": True,
-                                "dynamic": True,
-                            },
-                        },
-                    },
-                    "fp8_channelwise_layers": ["layers.0.attn.wq_a"],
-                }
+            scheme = CompressedTensorsW8A8Fp8(
+                QuantizationArgs(num_bits=8, type="float", strategy="channel"),
+                is_static_input_scheme=False,
             )
             layer = torch.nn.Module()
-            scheme = quant_config.get_scheme(layer, "layers.0.attn.wq_a")
-            assert type(scheme) is CompressedTensorsW8A8Int8
             scheme.create_weights(
                 layer,
-                output_partition_sizes=[128],
-                input_size_per_partition=input_size,
-                params_dtype=torch.bfloat16,
+                input_size,
+                [128],
+                input_size,
+                128,
+                torch.bfloat16,
                 weight_loader=lambda param, value: param.copy_(value),
             )
             scales = torch.linspace(0.125, 0.5, 128, dtype=torch.float32)[:, None]
             layer.weight.data.fill_(2.0)
             layer.weight_scale.data.copy_(scales)
             scheme.process_weights_after_loading(layer)
-            assert type(scheme.kernel) is PPUInt8ScaledMMLinearKernel
-            assert layer.weight.dtype == torch.int8
-            assert layer.weight.shape == (
-                (128, input_size)
-                if scheme.kernel.weight_RowMajor
-                else (input_size, 128)
-            )
+            assert isinstance(scheme.fp8_linear, PPUDeepGemmFP8ScaledMMLinearKernel)
+            assert layer.weight.dtype == torch.float8_e4m3fn
+            assert layer.weight.shape == (128, input_size)
             x = torch.tensor([0.5, -1.0, 2.0], dtype=torch.bfloat16)
             x = x[:, None].expand(3, input_size).contiguous()
-            actual = scheme.apply_weights(layer, x, None)
+            actual = scheme.apply_weights(layer, x)
             expected = (x[:, :1].float() * (2 * input_size) * scales.T).to(
                 torch.bfloat16
             )
