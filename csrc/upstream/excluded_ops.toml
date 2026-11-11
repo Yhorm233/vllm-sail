@@ -218,14 +218,6 @@ reason = "no PPU implementation"
 
 [[op]]
 namespace = "_C"
-name = "fused_deepseek_v4_kv_rope_insert"
-schema = "fused_deepseek_v4_kv_rope_insert(Tensor kv, Tensor! k_cache, Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, int cache_block_size, Tensor? fp8_scale=None, bool kv_mxfp8=False) -> ()"
-kind = "compute"
-tier = "unclaimed"
-reason = "not declared in csrc/upstream/manifest.toml"
-
-[[op]]
-namespace = "_C"
 name = "fused_kda_chunk"
 schema = "fused_kda_chunk(Tensor qg, Tensor w, Tensor u, Tensor kg_t, Tensor aqk, Tensor decay, Tensor? initial_state, Tensor(a!)? final_state, Tensor! out, Tensor cu_seqlens, Tensor chunk_offsets, float scale, Tensor(b!)? group_state, int groups, Tensor(c!)? checkpoint_state=None, Tensor? checkpoint_offsets=None, Tensor? checkpoint_state_indices=None, Tensor(d!)? state_cache=None, Tensor? state_indices=None, Tensor? has_initial_state=None) -> ()"
 kind = "compute"

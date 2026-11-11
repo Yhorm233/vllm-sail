@@ -589,6 +589,27 @@ def test_pruned_bindings_keep_compiled_ops_and_drop_the_rest(ported: Ported) -> 
     assert "brand_new_kernel" not in text
 
 
+def test_dspark_kv_only_binding_is_kept_by_the_shipped_manifest() -> None:
+    """A compiled wrapper must retain both its schema and CUDA implementation."""
+    text = textwrap.dedent("""\
+        STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+          ops.def(
+              "fused_deepseek_v4_kv_rope_insert("
+              "Tensor kv, Tensor! k_cache, Tensor slot_mapping, Tensor position_ids, "
+              "Tensor cos_sin_cache, int cache_block_size, Tensor? fp8_scale=None, "
+              "bool kv_mxfp8=False) -> ()");
+        }
+        STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+          ops.impl("fused_deepseek_v4_kv_rope_insert",
+                   TORCH_BOX(&fused_deepseek_v4_kv_rope_insert));
+        }
+        """)
+    pruner = _pruner(m.load())
+    assert pruner.prune(text) == text
+    assert not pruner.excluded()
+    assert not pruner.unclaimed()
+
+
 def test_an_overload_name_is_extracted_whole(ported: Ported) -> None:
     """``reshape_and_cache.out`` is a distinct op; truncating it would drop it."""
     assert "reshape_and_cache.out" in ported.read("libtorch_stable/torch_bindings.cpp")

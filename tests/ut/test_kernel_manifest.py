@@ -235,6 +235,7 @@ def test_accepted_regressions_are_excluded_and_stubbable(shipped: m.Manifest) ->
         "rms_norm_per_block_quant",
         "silu_and_mul_per_block_quant",
         "fused_qk_norm_rope",
+        "fused_deepseek_v4_kv_rope_insert",
     ],
 )
 def test_model_kernel_dependencies_are_compiled_and_bound(shipped, op):
