@@ -106,7 +106,7 @@ _TRUTHY = ("true", "1", "yes", "on")
 GEMM_BACKENDS = ("deepgemm", "acext", "triton")
 GDN_DECODE_KERNELS = ("auto", "cuda", "pla", "triton")
 KPOOL_DECODE_LOGITS_BACKENDS = ("non_paged",)
-MEGA_MOE_MMA_TYPES = ("fp4xfp4", "fp8xfp4", "bf16xfp4")
+MEGA_MOE_MMA_TYPES = ("fp4xfp4", "fp8xfp4", "bf16xfp4", "int8xint8")
 STEP5_PREFILL_BACKENDS = ("flashinfer", "native")
 
 

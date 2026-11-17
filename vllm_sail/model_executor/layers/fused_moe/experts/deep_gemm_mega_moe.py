@@ -19,11 +19,12 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-import vllm_sail.envs as sail_envs
 from vllm_sail.utils.deep_gemm_mega import (
     MEGA_MOE_FORMATS,
     check_mega_moe_supported,
     mega_moe_api,
+    mma_type_for_expert_dtype,
+    resolve_expert_dtype,
 )
 
 
@@ -52,7 +53,11 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
     ):
         if weight_format != MEGA_MOE_MXFP4:
             raise ValueError("SAIL MegaMoE requires MXFP4 weights.")
-        self.mma_type = sail_envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE
+        # INT8 checkpoints pin the 8.0 kernel; MXFP4 checkpoints keep the
+        # configured mode. The weight-format gate above still sees MXFP4
+        # because the V4 MoE constructor admits INT8 experts through the
+        # same fp4 weight pipeline (see enhancement/models/deepseek_v4.py).
+        self.mma_type = mma_type_for_expert_dtype(resolve_expert_dtype(vllm_config))
         self.mma_format = MEGA_MOE_FORMATS[self.mma_type]
         if activation.name not in self.mma_format.activations:
             raise ValueError(
@@ -200,6 +205,22 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
 
     def _register_weight(self, name, shape, spec):
         experts, n, k = shape
+        if self.mma_format.is_int8:
+            # One int8 per element and one FP32 scale per output channel;
+            # interleaving happens once in transform_weights_for_mega_moe.
+            self.register_parameter(
+                f"{name}_weight",
+                torch.nn.Parameter(
+                    torch.zeros(experts, n, k, dtype=torch.int8), requires_grad=False
+                ),
+            )
+            self.register_parameter(
+                f"{name}_weight_scale",
+                torch.nn.Parameter(
+                    torch.zeros(experts, n, dtype=torch.float32), requires_grad=False
+                ),
+            )
+            return
         self.register_parameter(
             f"{name}_weight",
             torch.nn.Parameter(
@@ -226,6 +247,8 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             )
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"Unsupported expert shard id: {shard_id}")
+        if self.mma_format.is_int8:
+            return self._load_int8_shard(dst, src, shard_id, is_scale)
         if not is_scale:
             src = src.view(torch.uint8)
             rows = dst.shape[0] // (1 if shard_id == "w2" else 2)
@@ -252,6 +275,36 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             else:
                 rows = dst.shape[0] // 2
                 dst = dst[:rows] if shard_id == "w1" else dst[rows:]
+        dst.copy_(src)
+
+    def _load_int8_shard(self, dst, src, shard_id, is_scale):
+        """Copy one INT8 shard into its raw bank.
+
+        The checkpoint stores ``w1``/``w3`` as ``[I, H]`` and ``w2`` as
+        ``[H, I]`` int8 rows with a per-output-channel FP32 scale; the
+        registered ``w13`` bank is the ``[2I, H]`` concatenation the transform
+        expects, so gate and up fill their own half. Interleaving is left to
+        ``transform_weights_for_mega_moe``, which the shared forward runs once
+        in place on the first call.
+        """
+        rows = self.hidden_size if shard_id == "w2" else self.intermediate_size
+        if is_scale:
+            if src.dtype != torch.float32 or src.numel() != rows:
+                raise ValueError(
+                    f"Invalid {shard_id} INT8 channel scale {tuple(src.shape)} "
+                    f"{src.dtype}, expected {rows} FP32 values."
+                )
+            src = src.reshape(rows)
+        else:
+            width = self.intermediate_size if shard_id == "w2" else self.hidden_size
+            if src.dtype != torch.int8 or tuple(src.shape) != (rows, width):
+                raise ValueError(
+                    f"Invalid {shard_id} INT8 weight {tuple(src.shape)} "
+                    f"{src.dtype}, expected ({rows}, {width}) int8."
+                )
+        if shard_id != "w2":
+            split = dst.shape[0] // 2
+            dst = dst[:split] if shard_id == "w1" else dst[split:]
         dst.copy_(src)
 
     def _kernel_kwargs(self):

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 import torch
@@ -288,3 +289,76 @@ def _rebind_indexer_aliases():
 
 
 _rebind_indexer_aliases()
+
+
+# ---------------------------------------------------------------------------
+# INT8 MegaMoE admission: the upstream MoE constructor only accepts fp4 experts
+# ---------------------------------------------------------------------------
+
+_MOE_INIT_TARGET = "vllm.models.deepseek_v4.nvidia.model.DeepseekV4MoE.__init__"
+_MISSING = object()
+
+
+@contextlib.contextmanager
+def _expert_dtype_override(vllm_config, expert_dtype: str):
+    """Temporarily spell ``expert_dtype`` the way the upstream gate reads it.
+
+    The constructor reads ``expert_dtype`` inline, so it has to see ``fp4``
+    to proceed. Every config is restored afterwards: weight loading and the
+    quantization config still resolve the real precision from it.
+    ``hf_text_config`` and ``hf_config`` are usually the same object, so
+    dedupe by identity -- vLLM configs define ``__eq__`` without ``__hash__``
+    and cannot go into a set.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    unique: dict[int, object] = {}
+    for candidate in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        if candidate is not None:
+            unique.setdefault(id(candidate), candidate)
+    saved = [
+        (config, getattr(config, "expert_dtype", _MISSING))
+        for config in unique.values()
+    ]
+    for config, _ in saved:
+        config.expert_dtype = expert_dtype
+    try:
+        yield
+    finally:
+        for config, previous in saved:
+            if previous is _MISSING:
+                delattr(config, "expert_dtype")
+            else:
+                config.expert_dtype = previous
+
+
+@patch(
+    "vllm.models.deepseek_v4.nvidia.model",
+    "DeepseekV4MoE.__init__",
+    reason=(
+        "The upstream constructor rejects MegaMoE unless ``expert_dtype`` is "
+        "'fp4'. The ZW-810E INT8 kernel runs the same dispatch, GEMM and "
+        "combine on INT8 experts, so the gate must accept them; the check is "
+        "inline and has no hook to override."
+    ),
+    affected_versions=_AFFECTED,
+    remove_when=(
+        "vLLM accepts INT8 routed experts for MegaMoE, or lets the selected "
+        "expert backend validate ``expert_dtype`` itself."
+    ),
+)
+def _deepseek_v4_moe_init(self, vllm_config, *args, **kwargs):
+    from vllm_sail.utils.deep_gemm_mega import (
+        mma_type_for_expert_dtype,
+        resolve_expert_dtype,
+    )
+
+    original = getattr(_deepseek_v4_moe_init, PATCH_MARKER)[_MOE_INIT_TARGET]
+    if not current_platform.is_ppu():
+        return original(self, vllm_config, *args, **kwargs)
+    if mma_type_for_expert_dtype(resolve_expert_dtype(vllm_config)) != "int8xint8":
+        return original(self, vllm_config, *args, **kwargs)
+    with _expert_dtype_override(vllm_config, "fp4"):
+        return original(self, vllm_config, *args, **kwargs)

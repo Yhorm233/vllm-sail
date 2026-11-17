@@ -33,6 +33,7 @@ _MEGAMOE_MODE_APIS = {
     "fp4xfp4": ("fp4_fp4_mega_moe",),
     "fp8xfp4": ("fp8_fp4_mega_moe", "transform_weights_for_w4a8_mega_moe"),
     "bf16xfp4": ("bf16_fp4_mega_moe", "transform_weights_for_w4a16_mega_moe"),
+    "int8xint8": ("int8_int8_mega_moe", "transform_weights_for_mega_moe"),
 }
 
 
@@ -392,8 +393,13 @@ def test_megamoe_api_reports_missing_required_functions_and_allows_retry(
     with pytest.raises(RuntimeError, match=missing):
         module.mega_moe_api(mode)
     setattr(api, missing, lambda: None)
-    assert module.mega_moe_api(mode) is api
-    assert module.mega_moe_api(mode) is api
+    view = module.mega_moe_api(mode)
+    assert module.mega_moe_api(mode) is view
+    if mode == "int8xint8":
+        # INT8 wraps the module to pin the pre-dispatch group size.
+        assert view.int8_int8_mega_moe is api.int8_int8_mega_moe
+    else:
+        assert view is api
     assert calls == ["deep_gemm.mega", "deep_gemm.mega"]
 
 
@@ -426,9 +432,14 @@ def test_megamoe_api_reports_all_missing_functions(
         ("bf16xfp4", 2304, 128, True),
         ("bf16xfp4", 2048, 0, False),
         ("bf16xfp4", 0, 128, False),
+        ("int8xint8", 2048, 256, True),
+        ("int8xint8", 5120, 2304, True),
+        ("int8xint8", 1024, 256, False),
+        ("int8xint8", 2048, 128, False),
         ("fp4xfp4", 1, None, True),
         ("fp8xfp4", 1, None, True),
         ("bf16xfp4", 1, None, True),
+        ("int8xint8", 1, None, True),
     ],
 )
 def test_megamoe_geometry_matches_wheel_contract(
@@ -439,6 +450,7 @@ def test_megamoe_geometry_matches_wheel_contract(
         current_platform=SimpleNamespace(
             is_ppu=lambda: True,
             has_device_capability=lambda capability, device_id: capability == 89,
+            get_device_capability=lambda device_id: SimpleNamespace(major=8, minor=0),
         ),
     )
     modules("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: True)
@@ -462,6 +474,7 @@ def test_megamoe_unknown_geometry_still_checks_hardware_and_api(modules, missing
         current_platform=SimpleNamespace(
             is_ppu=lambda: missing != "ppu",
             has_device_capability=lambda *args, **kwargs: missing != "m890",
+            get_device_capability=lambda device_id: SimpleNamespace(major=8, minor=9),
         ),
     )
     modules(
@@ -483,11 +496,15 @@ def megamoe_platform_gate(modules):
     modules(
         "vllm_sail.models.deepseek_v41.config",
         normalize_expert_dtype=lambda config: None,
+        uses_int8_w8a8=lambda config: False,
     )
     envs = modules("vllm_sail.envs", VLLM_SAIL_MEGA_MOE_MMA_TYPE="fp8xfp4")
+    api = load_patch(_MEGAMOE_API)
     modules(
         "vllm_sail.utils.deep_gemm_mega",
         check_mega_moe_supported=lambda *args: calls.append(args),
+        resolve_expert_dtype=api.resolve_expert_dtype,
+        mma_type_for_expert_dtype=api.mma_type_for_expert_dtype,
     )
     modules(
         "torch",
@@ -518,6 +535,8 @@ def test_megamoe_platform_gate_accepts_models_and_eplb(
 ):
     gate, config, envs, calls = megamoe_platform_gate
     text_config = SimpleNamespace(model_type=model_type, hidden_size=2048)
+    if mode == "int8xint8":
+        text_config.expert_dtype = "int8"
     if intermediate is not None:
         text_config.moe_intermediate_size = intermediate
     config.model_config.hf_text_config = text_config
@@ -534,6 +553,75 @@ def test_megamoe_platform_gate_rejects_declared_non_fp4_experts(megamoe_platform
     with pytest.raises(ValueError, match="requires MXFP4 experts"):
         gate(None, config)
     assert calls == []
+
+
+def test_megamoe_platform_gate_pins_int8_mode_for_int8_experts(megamoe_platform_gate):
+    gate, config, envs, calls = megamoe_platform_gate
+    # The configured MXFP4 mode must not leak into an INT8 checkpoint.
+    envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE = "fp8xfp4"
+    config.model_config.hf_text_config = SimpleNamespace(
+        model_type="deepseek_v41", hidden_size=5120, expert_dtype="int8"
+    )
+    gate(None, config)
+    assert calls == [(("cuda", 0), 5120, None, "int8xint8")]
+
+
+def test_megamoe_mma_type_resolution(modules, monkeypatch):
+    modules(
+        "vllm_sail.models.deepseek_v41.config",
+        uses_int8_w8a8=lambda config: getattr(config, "w8a8", False),
+    )
+    envs = modules("vllm_sail.envs", VLLM_SAIL_MEGA_MOE_MMA_TYPE="fp8xfp4")
+    module = load_patch(_MEGAMOE_API)
+    w8a8 = SimpleNamespace(w8a8=True)
+    fp4 = SimpleNamespace(
+        w8a8=False,
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(expert_dtype="fp4")
+        ),
+    )
+    assert module.resolve_expert_dtype(w8a8) == "int8"
+    assert module.resolve_expert_dtype(fp4) == "fp4"
+    assert module.resolve_expert_dtype(SimpleNamespace()) == "fp4"
+    assert module.mma_type_for_expert_dtype("int8") == "int8xint8"
+    assert module.mma_type_for_expert_dtype("fp4") == "fp8xfp4"
+    envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE = "int8xint8"
+    with pytest.raises(ValueError, match="requires INT8 experts"):
+        module.mma_type_for_expert_dtype("fp4")
+
+
+def test_megamoe_api_int8_pins_pre_dispatch_group_size(modules, monkeypatch):
+    module = load_patch(_MEGAMOE_API)
+    seen = []
+
+    def dispatch(*args, **kwargs):
+        seen.append(kwargs)
+
+    required = (
+        *_MEGAMOE_COMMON_APIS,
+        *_MEGAMOE_MODE_APIS["int8xint8"],
+    )
+    api = SimpleNamespace(**{name: lambda: None for name in required})
+    api.mega_moe_pre_dispatch = dispatch
+    monkeypatch.setattr(
+        module, "importlib", SimpleNamespace(import_module=lambda _: api)
+    )
+    view = module.mega_moe_api("int8xint8")
+    assert view.int8_int8_mega_moe is api.int8_int8_mega_moe
+    view.mega_moe_pre_dispatch()
+    view.mega_moe_pre_dispatch(group_size=7)
+    assert seen == [{"group_size": 0}, {"group_size": 7}]
+    # MXFP4 modes keep the raw module so the shared forward stays untouched.
+    mxfp4 = SimpleNamespace(
+        **{
+            name: lambda: None
+            for name in (*_MEGAMOE_COMMON_APIS, *_MEGAMOE_MODE_APIS["fp8xfp4"])
+        }
+    )
+    monkeypatch.setattr(
+        module, "importlib", SimpleNamespace(import_module=lambda _: mxfp4)
+    )
+    assert module.mega_moe_api("fp8xfp4") is mxfp4
 
 
 @pytest.mark.parametrize("tokens", [0, 3])
