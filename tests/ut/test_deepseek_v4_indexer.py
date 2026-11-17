@@ -47,7 +47,13 @@ def installed(monkeypatch, patch_utils_module):
     module("vllm.platforms", current_platform=platform)
     attention_cls = type("Attention", (), {})
     module(f"{BASE}.nvidia.flashmla", DeepseekV4FlashMLAAttention=attention_cls)
-    module(f"{BASE}.nvidia.model", _select_dsv4_attn_cls=lambda _: attention_cls)
+    # The MoE init patch resolves its target class at import time.
+    moe_cls = type("DeepseekV4MoE", (), {"__init__": lambda self, *a, **k: None})
+    module(
+        f"{BASE}.nvidia.model",
+        _select_dsv4_attn_cls=lambda _: attention_cls,
+        DeepseekV4MoE=moe_cls,
+    )
     module("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=object)
     module(
         "vllm_sail.patch.utils",

@@ -85,7 +85,7 @@ def test_defaults_and_canonical_snapshot() -> None:
 def test_mega_moe_mma_type_is_lazy_and_checks_choices(monkeypatch):
     name = "VLLM_SAIL_MEGA_MOE_MMA_TYPE"
     assert getattr(envs, name) == "fp8xfp4"
-    for mode in ("fp8xfp4", "bf16xfp4", "fp4xfp4"):
+    for mode in ("fp8xfp4", "bf16xfp4", "fp4xfp4", "int8xint8"):
         monkeypatch.setenv(name, f" {mode.upper()} ")
         assert getattr(envs, name) == mode
     monkeypatch.setenv(name, "unsupported")

@@ -244,12 +244,18 @@ class PPUPlatform(NvmlCudaPlatform):
         normalize_expert_dtype(vllm_config)
 
         if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
-            from vllm_sail import envs as sail_envs
-            from vllm_sail.utils.deep_gemm_mega import check_mega_moe_supported
+            from vllm_sail.utils.deep_gemm_mega import (
+                check_mega_moe_supported,
+                mma_type_for_expert_dtype,
+                resolve_expert_dtype,
+            )
 
             config = vllm_config.model_config.hf_text_config
-            mma_type = sail_envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE
-            if getattr(config, "expert_dtype", "fp4") != "fp4":
+            # INT8 W8A8 checkpoints pin the 8.0 INT8 kernel; MXFP4 checkpoints
+            # keep the configured mode.
+            mma_type = mma_type_for_expert_dtype(resolve_expert_dtype(vllm_config))
+            expert_dtype = getattr(config, "expert_dtype", "fp4")
+            if expert_dtype != "fp4" and mma_type != "int8xint8":
                 raise ValueError(
                     "SAIL MegaMoE requires MXFP4 experts (expert_dtype=fp4)."
                 )
