@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -77,9 +78,16 @@ def _yaml_files() -> list[Path]:
 
 def test_checked_in_recipes_and_policies_validate_cleanly() -> None:
     files = _yaml_files()
-    assert len(files) == 5
+    assert files
+    assert len(
+        ppu_recipe.validate_paths(files, vllm_parser_mode="skip")["validated_files"]
+    ) == len(files)
+    # The CPU stub covers the pilot flags. The runtime parser validates new recipes.
     report = ppu_recipe.validate_paths(
-        files,
+        [
+            RECIPES_DIR / "zai-org" / "GLM-5.3.yaml",
+            RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Flash.yaml",
+        ],
         vllm_parser_mode="required",
         parser=_sample_vllm_parser(),
     )
@@ -324,6 +332,52 @@ def test_recipe_selector_matrix_and_cli() -> None:
     assert [item["ppu_count"] for item in matrix["include"]] == [4, 8]
     with pytest.raises(ValueError, match="unknown recipe policy key"):
         ppu_e2e_select.build_recipe_matrix("unknown-model")
+
+
+@pytest.mark.parametrize("claims", [[], "legacy", [""], [" "], [1], ["same", "same"]])
+def test_replacement_policy_requires_unique_nonempty_case_ids(claims) -> None:
+    policy = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    policy["replaces_legacy_cases"] = claims
+    with pytest.raises(ValueError, match="nonempty list of unique case IDs"):
+        ppu_recipe.validate_policy_structure(policy, context="test policy")
+
+
+def test_replacement_policy_requires_model_sanity() -> None:
+    policy = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    del policy["tiers"]["model_sanity"]
+    with pytest.raises(ValueError, match="requires tiers.model_sanity"):
+        ppu_recipe.validate_policy_structure(policy, context="test policy")
+
+
+def test_recipe_defaults_include_every_policy_defining_the_requested_tier(
+    tmp_path, monkeypatch
+) -> None:
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    pilot = yaml.safe_load((policy_dir / "glm-5.3.yaml").read_text())
+    for tier in ("fast_sanity", "model_sanity"):
+        single_tier = {**pilot, "tiers": {tier: pilot["tiers"][tier]}}
+        single_tier.pop("replaces_legacy_cases")
+        (policy_dir / f"{tier}-only.yaml").write_text(yaml.safe_dump(single_tier))
+    for tier, other in (
+        ("fast_sanity", "model_sanity"),
+        ("model_sanity", "fast_sanity"),
+    ):
+        expected = [
+            path.stem
+            for path in sorted(policy_dir.glob("*.yaml"))
+            if tier in yaml.safe_load(path.read_text()).get("tiers", {})
+        ]
+        assert tier + "-only" in expected
+        assert other + "-only" not in expected
+        assert [
+            entry["key"]
+            for entry in ppu_e2e_select.build_recipe_matrix("", tier)["include"]
+        ] == expected
+        with pytest.raises(ValueError, match=f"{other}-only.*has no tier {tier!r}"):
+            ppu_e2e_select.build_recipe_matrix(f"{other}-only", tier)
 
 
 def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(

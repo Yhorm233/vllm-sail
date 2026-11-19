@@ -24,6 +24,7 @@ DEFAULT_POLICY_ROOT = REPO_ROOT / "tests" / "ppu" / "policy"
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
+POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
 _UNSET: Any = object()
 
 ALLOWED_ENV_PREFIXES = (
@@ -923,6 +924,7 @@ def validate_policy_structure(
             "measurement",
             "accuracy_gate",
             "eval_defaults",
+            "replaces_legacy_cases",
             "stages",
             "tiers",
         },
@@ -947,9 +949,25 @@ def validate_policy_structure(
     if tiers:
         _check_keys(
             tiers,
-            allowed={"fast_sanity", "model_sanity", "nightly", "release"},
+            allowed=POLICY_TIERS,
             context=f"{context}.tiers",
         )
+    if "replaces_legacy_cases" in policy:
+        cases = policy["replaces_legacy_cases"]
+        if (
+            not isinstance(cases, list)
+            or not cases
+            or any(not isinstance(case, str) or not case.strip() for case in cases)
+            or len(set(cases)) != len(cases)
+        ):
+            raise ValidationError(
+                f"{context}.replaces_legacy_cases must be a nonempty list of unique case IDs"
+            )
+        if "model_sanity" not in tiers:
+            raise ValidationError(
+                f"{context}.replaces_legacy_cases requires tiers.model_sanity"
+            )
+    if tiers:
         if "fast_sanity" in tiers:
             fs = _check_keys(
                 tiers["fast_sanity"],

@@ -2,6 +2,7 @@ schema_version: ppu-test-policy/v1
 model_id: zai-org/GLM-5.3
 recipe: tests/ppu/recipes/zai-org/GLM-5.3.yaml
 hardware: zhenwu_m890
+replaces_legacy_cases: [glm-5.3-mxfp4-tp4]
 accuracy_gate:
   method: golden_band
   golden_band_abs: 0.02

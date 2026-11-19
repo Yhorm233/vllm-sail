@@ -2,6 +2,7 @@ schema_version: ppu-test-policy/v1
 model_id: deepseek-ai/DeepSeek-V4-Flash
 recipe: tests/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml
 hardware: zhenwu_m890
+replaces_legacy_cases: [deepseek-v4-mxfp4]
 accuracy_gate:
   method: golden_band
   golden_band_abs: 0.02

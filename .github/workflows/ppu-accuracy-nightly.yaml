@@ -2,11 +2,11 @@ name: PPU accuracy nightly
 
 # Nightly GSM8K accuracy regression for the model-precision E2E gate
 # (CI plan category 3). Accuracy stays outside the per-PR gate: this entry
-# point builds wheels from the main commit it was triggered on and calls
-# _ppu-accuracy-tests.yaml once per accuracy entry in the checked-in catalog.
+# point builds wheels for the triggering commit and runs the legacy and Recipe
+# accuracy lanes without scheduling the migrated cases twice.
 #
 #   build    -- after validating model selection, call ppu-build-and-test.yaml
-#               with skip_device_tests so the pin-UT and model-smoke
+#               with skip_device_tests so the pin-UT and Fast Sanity
 #               lanes stay with the per-PR gate instead of competing for the
 #               same 8-ppu-m890p hosts the accuracy lane needs.
 #               Resolving "the newest successful build" instead does not work:
@@ -15,8 +15,8 @@ name: PPU accuracy nightly
 #               the only rows it lists are pull_request previews. Picking the
 #               newest of those pinned this lane to a preview from days ago,
 #               whose checkout predates every fix merged since.
-#   select   -- expand the legacy accuracy matrix or select only explicit
-#               Recipe slugs on manual runs.
+#   select   -- on schedule, route migrated cases to Recipe when enabled.
+#               Manual runs keep their legacy or explicit recipe: selection.
 #   accuracy -- one reusable call per model. A single model already needs all
 #               eight devices and ppu_runtime_container.sh takes an exclusive
 #               flock on the runner, so max-parallel stays at 1; the catalog
@@ -83,6 +83,8 @@ jobs:
     name: Select accuracy models
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      SELECT_RECIPES: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && (github.event_name == 'schedule' || startsWith(inputs.models, 'recipe:')) }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       recipe_models: ${{ steps.select.outputs.recipe_models }}
@@ -92,11 +94,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/setup-python@v5
+        if: env.SELECT_RECIPES == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install Recipe selector dependency
+        if: env.SELECT_RECIPES == 'true'
+        run: python -m pip install --no-cache-dir PyYAML==6.0.3
+
       - name: Select accuracy models
         id: select
         env:
           MODELS: ${{ inputs.models }}
           RECIPE_PUBLIC_ENABLED: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}
+          SCHEDULED_RECIPE_ENABLED: ${{ github.event_name == 'schedule' && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' }}
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -129,22 +141,25 @@ jobs:
               sys.exit(0)
 
           catalog = json.loads(select.CATALOG.read_text())
+          scheduled_recipes = os.environ["SCHEDULED_RECIPE_ENABLED"] == "true"
           try:
               selected = select.build_accuracy_matrix(catalog, requested)["include"]
+              if scheduled_recipes:
+                  legacy_cases = select.scheduled_legacy_accuracy_cases(selected)
+              else:
+                  # Use catalog case IDs as keys to distinguish serving variants.
+                  legacy_cases = [entry["case_id"] for entry in selected]
           except ValueError as error:
-              # A typo in the dispatch input must fail the run, not crash it.
               sys.exit(str(error))
-          # The reusable call takes catalog keys, so hand it the case id: it is
-          # the catalog key and the only label that stays unique when two cases
-          # exercise one checkpoint with different serve arguments.
-          include = [{"model": entry["case_id"]} for entry in selected]
-          if not include:
+          if not legacy_cases and not scheduled_recipes:
               sys.exit(f"no accuracy model selected by MODELS={requested!r}")
 
-          matrix = json.dumps({"include": include}, separators=(",", ":"))
-          print(f"accuracy matrix: {matrix}")
-          with output.open("a", encoding="utf-8") as handle:
-              handle.write(f"matrix={matrix}\n")
+          if legacy_cases:
+              include = [{"model": case_id} for case_id in legacy_cases]
+              matrix = json.dumps({"include": include}, separators=(",", ":"))
+              print(f"accuracy matrix: {matrix}")
+              with output.open("a", encoding="utf-8") as handle:
+                  handle.write(f"matrix={matrix}\n")
           PY
 
   accuracy:

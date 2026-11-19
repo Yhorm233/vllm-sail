@@ -436,9 +436,14 @@ def test_ci_uses_separate_pinned_build_and_runtime_stacks():
     assert build["env"]["VLLM_SAIL_BUILD_IMAGE"] == build["container"]["image"]
     pipeline = yaml.safe_load((WORKFLOW.parent / "ppu-build-and-test.yaml").read_text())
     assert "runtime_image" not in pipeline[True]["workflow_call"]["inputs"]
-    for job in ("pin-unit-tests", "model-tests"):
+    for job in ("pin-unit-tests", "model-tests", "recipe-sanity"):
         assert "image" not in pipeline["jobs"][job]["with"]
-    for name in ("_ppu-pin-ut.yaml", "_ppu-model-tests.yaml", "ppu-debug.yaml"):
+    for name in (
+        "_ppu-pin-ut.yaml",
+        "_ppu-model-tests.yaml",
+        "_ppu-recipe-fast-sanity.yaml",
+        "ppu-debug.yaml",
+    ):
         triggers = yaml.safe_load((WORKFLOW.parent / name).read_text())[True]
         for trigger in triggers.values():
             assert "image" not in trigger["inputs"]

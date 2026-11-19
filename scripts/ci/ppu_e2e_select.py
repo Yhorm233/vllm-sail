@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
-CATALOG = Path(__file__).resolve().parent / "ppu_e2e_models.json"
+CI_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CI_DIR.parents[1]
+CATALOG = CI_DIR / "ppu_e2e_models.json"
 
 
 def _category(entry: dict) -> str:
@@ -101,15 +104,14 @@ def build_accuracy_matrix(catalog: list[dict], models: str) -> dict:
     return {"include": include}
 
 
-def build_recipe_matrix(models: str, tier: str = "fast_sanity") -> dict:
-    """Build a matrix from ``tests/ppu/policy/models/*.yaml`` using ``ppu_recipe``."""
-    repo_root = Path(__file__).resolve().parents[2]
-    ci_dir = Path(__file__).resolve().parent
-    if str(ci_dir) not in sys.path:
-        sys.path.insert(0, str(ci_dir))
+def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], dict]]:
+    if str(CI_DIR) not in sys.path:
+        sys.path.insert(0, str(CI_DIR))
     import ppu_recipe
 
-    policy_dir = repo_root / "tests" / "ppu" / "policy" / "models"
+    if tier not in ppu_recipe.POLICY_TIERS:
+        raise ValueError(f"unknown recipe tier {tier!r}")
+    policy_dir = REPO_ROOT / "tests" / "ppu" / "policy" / "models"
     policy_files = sorted(policy_dir.glob("*.yaml"))
     by_slug = {path.stem: path for path in policy_files}
     requested = [item.strip() for item in models.split(",") if item.strip()]
@@ -120,28 +122,90 @@ def build_recipe_matrix(models: str, tier: str = "fast_sanity") -> dict:
             f"unknown recipe policy key(s): {', '.join(unknown)}; available: {available}"
         )
     selected_keys = requested if requested else list(by_slug)
-    include = []
     for slug in selected_keys:
         pol_path = by_slug[slug]
         pol_doc = ppu_recipe._load_yaml(pol_path)
         ppu_recipe.validate_policy_structure(
-            pol_doc, context=str(pol_path), base_dir=repo_root
+            pol_doc, context=str(pol_path), base_dir=REPO_ROOT
         )
+        if tier not in pol_doc.get("tiers", {}):
+            if requested:
+                raise ValueError(f"recipe policy {slug!r} has no tier {tier!r}")
+            continue
         rec_rel = Path(pol_doc["recipe"])
-        rec_path = rec_rel if rec_rel.is_absolute() else (repo_root / rec_rel)
+        rec_path = rec_rel if rec_rel.is_absolute() else (REPO_ROOT / rec_rel)
         resolved = ppu_recipe.resolve_recipe(rec_path, policy_path=pol_path, tier=tier)
-        include.append(
+        yield (
             {
                 "key": slug,
-                "policy_path": pol_path.relative_to(repo_root).as_posix(),
-                "recipe_path": rec_path.relative_to(repo_root).as_posix(),
+                "policy_path": pol_path.relative_to(REPO_ROOT).as_posix(),
+                "recipe_path": rec_path.relative_to(REPO_ROOT).as_posix(),
                 "model_id": resolved["hf_model_id"],
                 "golden_model_key": resolved["golden_model_key"],
                 "ppu_count": int(resolved["ppu_count"]),
                 "config_digest": resolved["config_digest"],
-            }
+            },
+            pol_doc.get("replaces_legacy_cases", []),
+            resolved,
         )
-    return {"include": include}
+
+
+def build_recipe_matrix(models: str, tier: str = "fast_sanity") -> dict:
+    """Select all policies defining the tier, or require it for each explicit key."""
+    return {"include": [entry for entry, _, _ in _recipe_entries(models, tier)]}
+
+
+def _parallelism(flags: list[str]) -> tuple[int, int, bool]:
+    from ppu_recipe import _parse_flag_entries
+
+    values = {name: value for name, value, _ in _parse_flag_entries(flags)}
+    return (
+        int(values.get("--tensor-parallel-size", "1") or ""),
+        int(values.get("--data-parallel-size", "1") or ""),
+        "--enable-expert-parallel" in values,
+    )
+
+
+def scheduled_legacy_accuracy_cases(selected: list[dict]) -> list[str]:
+    """Keep legacy cases not covered by the scheduled default Recipe matrix."""
+    catalog = build_accuracy_matrix(json.loads(CATALOG.read_text()), "")["include"]
+    by_case = {entry["case_id"]: entry for entry in catalog}
+    replacements: dict[str, str] = {}
+    for recipe, case_ids, resolved in _recipe_entries("", "model_sanity"):
+        slug = recipe["key"]
+        for case_id in case_ids:
+            if case_id in replacements:
+                raise ValueError(
+                    f"legacy accuracy case {case_id!r} is claimed by "
+                    f"{replacements[case_id]!r} and {slug!r}"
+                )
+            if case_id not in by_case:
+                raise ValueError(
+                    f"recipe policy {slug!r} claims unknown legacy accuracy case {case_id!r}"
+                )
+            legacy = by_case[case_id]
+            # The evaluator uses the case's device count as TP when no command is supplied.
+            command = legacy["server_cmd"]
+            legacy_parallelism = (
+                _parallelism(command[3:])
+                if command
+                else (legacy["ppu_count"], 1, False)
+            )
+            if not (
+                resolved["hardware"] == "zhenwu_m890"
+                and legacy["board"] == "ZW-M890P"
+                and legacy["model_id"] == recipe["model_id"]
+                and legacy["model_key"] == recipe["golden_model_key"]
+                and legacy["ppu_count"] == recipe["ppu_count"]
+                and legacy_parallelism == _parallelism(resolved["flags"])
+            ):
+                raise ValueError(
+                    f"recipe policy {slug!r} does not match legacy accuracy case {case_id!r}"
+                )
+            replacements[case_id] = slug
+    return [
+        entry["case_id"] for entry in selected if entry["case_id"] not in replacements
+    ]
 
 
 def main(argv: list[str]) -> int:

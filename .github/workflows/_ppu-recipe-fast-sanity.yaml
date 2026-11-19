@@ -34,7 +34,7 @@ concurrency:
 jobs:
   prepare:
     name: Resolve fast sanity matrix
-    if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+    if: vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

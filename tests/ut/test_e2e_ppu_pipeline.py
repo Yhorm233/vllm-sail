@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -97,6 +98,62 @@ def test_catalog_keeps_smoke_and_accuracy_subsets_exact() -> None:
         "qwen3.8-flash-next-tp4",
         "qwen3.8-flash-next-dp-ep",
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("board", "OAM-810E"),
+        ("model_id", "other/checkpoint"),
+        ("model_key", "other_golden"),
+        ("ppu_count", 4),
+    ],
+)
+def test_scheduled_recipe_rejects_mismatched_legacy_identity(
+    tmp_path, monkeypatch, field, value
+) -> None:
+    select = _load_select()
+    catalog = _catalog()
+    candidate = next(entry for entry in catalog if entry["key"] == "deepseek-v4-mxfp4")
+    candidate[field] = value
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(catalog))
+    monkeypatch.setattr(select, "CATALOG", path)
+    # Validate every claim even when the selected subset excludes that key.
+    selected = select.build_accuracy_matrix(catalog, "minimax-m3-fp8")["include"]
+    with pytest.raises(ValueError, match="does not match.*deepseek-v4-mxfp4"):
+        select.scheduled_legacy_accuracy_cases(selected)
+
+
+@pytest.mark.parametrize(
+    "claim,error",
+    [
+        ("does-not-exist", "unknown legacy accuracy case"),
+        ("qwen3.8-27b", "unknown legacy accuracy case"),
+        ("deepseek-v4-mxfp4-dp-ep", "does not match"),
+        ("deepseek-v4-mxfp4", "claimed by"),
+    ],
+)
+def test_scheduled_recipe_rejects_invalid_policy_claims(
+    tmp_path, monkeypatch, claim, error
+) -> None:
+    select = _load_select()
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    monkeypatch.syspath_prepend(str(SELECT.parent))
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    path = policy_dir / "deepseek-v4-flash.yaml"
+    policy = yaml.safe_load(path.read_text())
+    policy["replaces_legacy_cases"] = [claim]
+    if error == "claimed by":
+        path = policy_dir / "second-deepseek.yaml"
+    path.write_text(yaml.safe_dump(policy))
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    with pytest.raises(ValueError, match=error):
+        select.scheduled_legacy_accuracy_cases(selected)
 
 
 @pytest.mark.parametrize(
@@ -781,7 +838,8 @@ def test_nightly_select_step_labels_jobs_with_the_case_id() -> None:
     never runs.
     """
     text = NIGHTLY_WORKFLOW.read_text()
-    assert '{"model": entry["case_id"]}' in text
+    assert 'legacy_cases = [entry["case_id"] for entry in selected]' in text
+    assert '{"model": case_id} for case_id in legacy_cases' in text
     assert "ACCURACY_MODEL_KEYS" not in text
 
 
