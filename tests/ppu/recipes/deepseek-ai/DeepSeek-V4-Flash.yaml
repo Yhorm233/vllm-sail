@@ -1,0 +1,105 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: deepseek-v4-mxfp4
+    tokenizer: deepseek-v4-mxfp4
+  hf_model_id: T-HEAD/DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: deepseek_v4_mxfp4
+  served_name: deepseek-v4-mxfp4
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  default_features: []
+  external_env: []
+model:
+  model_id: deepseek-ai/DeepSeek-V4-Flash
+  base_args:
+    - --tensor-parallel-size
+    - "8"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --max-model-len
+    - "16384"
+    - --trust-remote-code
+    - --seed
+    - "0"
+  base_env: {}
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - deepseek_v4
+  reasoning:
+    args:
+      - --tokenizer-mode
+      - deepseek_v4
+      - --reasoning-parser
+      - deepseek_v4
+      - --reasoning-config
+      - '{"reasoning_parser": "deepseek_v4", "reasoning_start_str": "", "reasoning_end_str": ""}'
+  spec_decoding:
+    default_mode: dspark
+    modes:
+      dspark:
+        args:
+          - --speculative-config
+          - '{"method": "dspark", "num_speculative_tokens": 7, "draft_sample_method": "probabilistic"}'
+variants:
+  default:
+    precision: mxfp4
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  dp_ep_low_latency:
+    hardware: zhenwu_m890
+    remove_args:
+      - --tensor-parallel-size
+      - --seed
+    select:
+      features:
+        tool_calling: true
+        reasoning: true
+        spec_decoding: true
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --max-num-batched-tokens
+      - "1024"
+      - --max-num-seqs
+      - "128"
+      - --kv-cache-dtype
+      - fp8
+      - --block-size
+      - "256"
+      - --distributed-timeout-seconds
+      - "3600"
+      - --cpu-distributed-timeout-seconds
+      - "3600"
+      - --compilation-config
+      - '{"cudagraph_mode": "FULL_DECODE_ONLY", "custom_ops": ["all"]}'
+    env:
+      VLLM_ENGINE_READY_TIMEOUT_S: "6000"
+  prefill_long:
+    hardware: zhenwu_m890
+    select:
+      features:
+        spec_decoding: false
+    args: []
+  eval_longctx:
+    hardware: zhenwu_m890
+    args: []
+notes: >-
+  Default baseline matches the deepseek-v4-mxfp4 catalog entry (TP8 on 8
+  Zhenwu M890 cards). Preset dp_ep_low_latency matches deepseek-v4-mxfp4-dp-ep.

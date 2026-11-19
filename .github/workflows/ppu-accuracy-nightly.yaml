@@ -5,8 +5,8 @@ name: PPU accuracy nightly
 # point builds wheels from the main commit it was triggered on and calls
 # _ppu-accuracy-tests.yaml once per accuracy entry in the checked-in catalog.
 #
-#   build    -- reuse ppu-build-and-test.yaml for the wheel build alone. It is
-#               called with skip_device_tests so the pin-UT and model-smoke
+#   build    -- after validating model selection, call ppu-build-and-test.yaml
+#               with skip_device_tests so the pin-UT and model-smoke
 #               lanes stay with the per-PR gate instead of competing for the
 #               same 8-ppu-m890p hosts the accuracy lane needs.
 #               Resolving "the newest successful build" instead does not work:
@@ -15,12 +15,14 @@ name: PPU accuracy nightly
 #               the only rows it lists are pull_request previews. Picking the
 #               newest of those pinned this lane to a preview from days ago,
 #               whose checkout predates every fix merged since.
-#   select   -- expand the catalog into the accuracy matrix. It depends on
-#               nothing but the repository, so it runs alongside the build.
+#   select   -- expand the legacy accuracy matrix or select only explicit
+#               Recipe slugs on manual runs.
 #   accuracy -- one reusable call per model. A single model already needs all
 #               eight devices and ppu_runtime_container.sh takes an exclusive
 #               flock on the runner, so max-parallel stays at 1; the catalog
-#               currently has eight accuracy cases, i.e. most of a day.
+#               can occupy a runner for much of a day.
+#   recipe   -- scheduled after the legacy lane, or run on its own with the
+#               recipe: prefix. The public Recipe gate applies to both paths.
 #
 # What the lane gates on
 #   * the reviewed golden under tests/e2e/models/_golden when one exists
@@ -45,7 +47,7 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: "Comma-separated accuracy catalog keys (blank = every accuracy entry)"
+        description: "Comma-separated legacy catalog keys (blank = all legacy), or recipe:<comma-separated policy slugs> for Recipe-only"
         required: false
         default: ""
         type: string
@@ -57,6 +59,7 @@ permissions:
   contents: read
   # Downloading the wheels the build job of this same run uploaded needs this.
   actions: read
+cache-mode: none
 
 concurrency:
   # Cancelling would throw away a finished build and the serial model runs
@@ -67,6 +70,7 @@ concurrency:
 jobs:
   build:
     name: Build nightly wheels
+    needs: select
     uses: ./.github/workflows/ppu-build-and-test.yaml
     with:
       # github.sha is the main commit this run was triggered on, and the same
@@ -81,6 +85,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
+      recipe_models: ${{ steps.select.outputs.recipe_models }}
     steps:
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
@@ -91,6 +96,7 @@ jobs:
         id: select
         env:
           MODELS: ${{ inputs.models }}
+          RECIPE_PUBLIC_ENABLED: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -105,8 +111,24 @@ jobs:
           select = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(select)
 
-          catalog = json.loads(select.CATALOG.read_text())
           requested = os.environ.get("MODELS", "")
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          if requested.startswith("recipe:"):
+              if os.environ["RECIPE_PUBLIC_ENABLED"] != "true":
+                  sys.exit("Recipe accuracy is disabled: PPU_RECIPE_PUBLIC_ENABLED must be true")
+              slugs = [slug.strip() for slug in requested.removeprefix("recipe:").split(",")]
+              if any(not slug for slug in slugs) or len(slugs) != len(set(slugs)):
+                  sys.exit("Specify one or more distinct, nonempty Recipe policy slugs")
+              models = ",".join(slugs)
+              try:
+                  select.build_recipe_matrix(models, "model_sanity")
+              except ValueError as error:
+                  sys.exit(str(error))
+              with output.open("a", encoding="utf-8") as handle:
+                  handle.write(f"recipe_models={models}\n")
+              sys.exit(0)
+
+          catalog = json.loads(select.CATALOG.read_text())
           try:
               selected = select.build_accuracy_matrix(catalog, requested)["include"]
           except ValueError as error:
@@ -121,13 +143,14 @@ jobs:
 
           matrix = json.dumps({"include": include}, separators=(",", ":"))
           print(f"accuracy matrix: {matrix}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+          with output.open("a", encoding="utf-8") as handle:
               handle.write(f"matrix={matrix}\n")
           PY
 
   accuracy:
     name: Accuracy ${{ matrix.model }}
     needs: [build, select]
+    if: needs.select.outputs.matrix != ''
     permissions:
       contents: read
       actions: read
@@ -148,3 +171,21 @@ jobs:
       # which for a workflow_call is this nightly run.
       build_run_id: ${{ github.run_id }}
       models: ${{ matrix.model }}
+
+  recipe-model-sanity:
+    name: Recipe model sanity & micro-E2E
+    needs: [build, select, accuracy]
+    if: >-
+      ${{ !cancelled() && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
+      needs.build.result == 'success' && needs.select.result == 'success' &&
+      (github.event_name == 'schedule' || needs.select.outputs.recipe_models != '') }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-recipe-model-sanity.yaml
+    with:
+      pr_mode: false
+      pr_head_sha: ${{ github.sha }}
+      wheel_source_sha: ${{ github.sha }}
+      build_run_id: ${{ github.run_id }}
+      models: ${{ needs.select.outputs.recipe_models }}

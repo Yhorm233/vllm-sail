@@ -1,0 +1,41 @@
+name: PPU recipe fast sanity dispatch
+run-name: "PPU recipe fast_sanity: ${{ inputs.models || 'all' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: Comma-separated recipe policy slugs (blank = all)
+        required: false
+        default: glm-5.3,deepseek-v4-flash
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+jobs:
+  build:
+    name: Build PPU wheels
+    if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+    uses: ./.github/workflows/_ppu-build.yaml
+    with:
+      pr_head_sha: ${{ github.sha }}
+
+  recipe-fast-sanity:
+    name: Recipe fast sanity
+    needs: build
+    if: >-
+      ${{ !cancelled() && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
+      needs.build.result == 'success' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-recipe-fast-sanity.yaml
+    with:
+      pr_mode: false
+      pr_head_sha: ${{ github.sha }}
+      wheel_source_sha: ${{ github.sha }}
+      build_run_id: ${{ github.run_id }}
+      models: ${{ inputs.models }}

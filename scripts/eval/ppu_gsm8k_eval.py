@@ -575,13 +575,16 @@ def run_evalscope(
     generation_config: dict[str, Any] | None = None,
     limit: int | None = None,
     work_dir: Path | None = None,
+    seed: int = 42,
+    eval_batch_size: int = 128,
+    dataset_options: dict[str, Any] | None = None,
 ) -> Any:
     """Run evalscope GSM8K (runtime import).
 
     ``generation_config`` is the sampling contract of the weights under test;
     it is passed through to ``TaskConfig`` untouched so every case over one
-    checkpoint samples identically.  The benchmark settings around it --
-    dataset, few-shot, batch size, seed -- stay shared by all cases.
+    checkpoint samples identically. Callers without a versioned dataset retain
+    the legacy benchmark options.
     """
     from evalscope import TaskConfig, run_task  # type: ignore[import-untyped]
 
@@ -596,16 +599,17 @@ def run_evalscope(
         datasets=["gsm8k"],
         dataset_args={
             "gsm8k": {
-                "dataset_id": gsm8k_path,
                 "few_shot_num": 4,
                 "few_shot_random": False,
                 "subset_list": ["main"],
+                **(dataset_options or {}),
+                "dataset_id": gsm8k_path,
             }
         },
         generation_config=generation,
-        eval_batch_size=128,
+        eval_batch_size=eval_batch_size,
         limit=limit,
-        seed=42,
+        seed=seed,
         work_dir=str(work_dir) if work_dir else None,
     )
     return run_task(task_cfg=cfg)

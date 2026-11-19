@@ -296,6 +296,18 @@ def check_score_threshold(
     return (True, None)
 
 
+def golden_score_bounds(golden: dict[str, Any]) -> tuple[float, float | None]:
+    tolerance = golden.get("tolerance", DEFAULT_TOLERANCE)
+    golden_score = golden["score"]
+    abs_tol = tolerance.get("abs", 0.02)
+    if tolerance.get("mode", "band") == "lower_bound":
+        hard_floor = tolerance.get("hard_floor", DEFAULT_THRESHOLD)
+        rel_tol = tolerance.get("rel", 0.99)
+        delta = max(abs_tol, (1.0 - rel_tol) * golden_score)
+        return max(hard_floor, golden_score - delta), None
+    return golden_score - abs_tol, golden_score + abs_tol
+
+
 def check_accuracy_golden(
     score: float,
     num: int,
@@ -322,33 +334,28 @@ def check_accuracy_golden(
 
     tolerance = golden.get("tolerance", DEFAULT_TOLERANCE)
     golden_score = golden["score"]
-    abs_tol = tolerance.get("abs", 0.02)
+    lower, upper = golden_score_bounds(golden)
 
     # 2a. Legacy one-sided mode.
-    if tolerance.get("mode", "band") == "lower_bound":
+    if upper is None:
         hard_floor = tolerance.get("hard_floor", DEFAULT_THRESHOLD)
         if score < hard_floor:
             return (
                 False,
                 f"hard floor gate failed: accuracy {score:.4f} < {hard_floor}",
             )
-        rel_tol = tolerance.get("rel", 0.99)
-        delta = max(abs_tol, (1.0 - rel_tol) * golden_score)
-        lower_bound = golden_score - delta
-        if score < lower_bound:
+        if score < lower:
             return (
                 False,
                 f"regression gate failed: accuracy {score:.4f} "
-                f"< lower bound {lower_bound:.4f} "
-                f"(golden={golden_score:.4f}, "
-                f"delta={delta:.4f})",
+                f"< lower bound {lower:.4f} "
+                f"(golden={golden_score:.4f}, delta={golden_score - lower:.4f})",
             )
         return (True, None)
 
     # 2b. Symmetric band around the golden.
-    lower = golden_score - abs_tol
-    upper = golden_score + abs_tol
     if not lower <= score <= upper:
+        abs_tol = tolerance.get("abs", 0.02)
         return (
             False,
             f"band gate failed: accuracy {score:.4f} outside "

@@ -1,0 +1,78 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: glm-5.3-mxfp4
+    tokenizer: glm-5.3-mxfp4
+  hf_model_id: T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: glm_5_3_mxfp4
+  served_name: glm-5.3-mxfp4
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 4
+  default_features:
+    - tool_calling
+    - reasoning
+  external_env: []
+model:
+  model_id: zai-org/GLM-5.3
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "4"
+    - --max-model-len
+    - "16384"
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "3600"
+  base_env: {}
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - glm47
+  reasoning:
+    args:
+      - --reasoning-parser
+      - glm45
+  spec_decoding:
+    default_mode: mtp
+    modes:
+      mtp:
+        args:
+          - --speculative-config
+          - '{"method":"mtp","num_speculative_tokens":2}'
+variants:
+  default:
+    precision: mxfp4
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  tp8:
+    hardware: zhenwu_m890
+    tp: 8
+    args: []
+  prefill_long:
+    hardware: zhenwu_m890
+    tp: 4
+    select:
+      features:
+        spec_decoding: false
+    args: []
+  eval_longctx:
+    hardware: zhenwu_m890
+    args: []
+notes: >-
+  Serving parameters follow the checked-in glm-5.3-mxfp4-tp4 catalog entry
+  (TP4 on 4 Zhenwu M890 cards with glm47 tool-call and glm45 reasoning
+  parsers). The committed 890p golden records a historical BF16 TP8 reference
+  score; use preset tp8 when reproducing an 8-card layout.

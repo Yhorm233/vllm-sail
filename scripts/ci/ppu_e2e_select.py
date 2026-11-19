@@ -101,7 +101,56 @@ def build_accuracy_matrix(catalog: list[dict], models: str) -> dict:
     return {"include": include}
 
 
+def build_recipe_matrix(models: str, tier: str = "fast_sanity") -> dict:
+    """Build a matrix from ``tests/ppu/policy/models/*.yaml`` using ``ppu_recipe``."""
+    repo_root = Path(__file__).resolve().parents[2]
+    ci_dir = Path(__file__).resolve().parent
+    if str(ci_dir) not in sys.path:
+        sys.path.insert(0, str(ci_dir))
+    import ppu_recipe
+
+    policy_dir = repo_root / "tests" / "ppu" / "policy" / "models"
+    policy_files = sorted(policy_dir.glob("*.yaml"))
+    by_slug = {path.stem: path for path in policy_files}
+    requested = [item.strip() for item in models.split(",") if item.strip()]
+    unknown = [key for key in requested if key not in by_slug]
+    if unknown:
+        available = ", ".join(by_slug)
+        raise ValueError(
+            f"unknown recipe policy key(s): {', '.join(unknown)}; available: {available}"
+        )
+    selected_keys = requested if requested else list(by_slug)
+    include = []
+    for slug in selected_keys:
+        pol_path = by_slug[slug]
+        pol_doc = ppu_recipe._load_yaml(pol_path)
+        ppu_recipe.validate_policy_structure(
+            pol_doc, context=str(pol_path), base_dir=repo_root
+        )
+        rec_rel = Path(pol_doc["recipe"])
+        rec_path = rec_rel if rec_rel.is_absolute() else (repo_root / rec_rel)
+        resolved = ppu_recipe.resolve_recipe(rec_path, policy_path=pol_path, tier=tier)
+        include.append(
+            {
+                "key": slug,
+                "policy_path": pol_path.relative_to(repo_root).as_posix(),
+                "recipe_path": rec_path.relative_to(repo_root).as_posix(),
+                "model_id": resolved["hf_model_id"],
+                "golden_model_key": resolved["golden_model_key"],
+                "ppu_count": int(resolved["ppu_count"]),
+                "config_digest": resolved["config_digest"],
+            }
+        )
+    return {"include": include}
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--recipes":
+        models = argv[1] if len(argv) > 1 else ""
+        tier = argv[2] if len(argv) > 2 else "fast_sanity"
+        recipe_matrix = build_recipe_matrix(models, tier=tier)
+        print(f"recipe_matrix={json.dumps(recipe_matrix, separators=(',', ':'))}")
+        return 0
     models = argv[0] if argv else ""
     catalog = json.loads(CATALOG.read_text())
     matrix = build_matrix(catalog, models)

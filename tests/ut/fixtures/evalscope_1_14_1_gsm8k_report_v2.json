@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "name": "cpu-format-stub@gsm8k",
+  "dataset_name": "gsm8k",
+  "model_name": "cpu-format-stub",
+  "metrics": [
+    {
+      "identity": {"name": "accuracy", "aggregation": "mean", "dimensions": {}},
+      "num": 12,
+      "score": 0.5,
+      "categories": [
+        {
+          "name": ["default"],
+          "num": 12,
+          "score": 0.5,
+          "subsets": [
+            {"name": "main", "score": 0.5, "num": 12, "is_aggregate": false}
+          ]
+        }
+      ],
+      "semantics": {
+        "semantic_id": "quality.accuracy.ratio",
+        "metric_name": "Accuracy",
+        "display_name": null,
+        "kind": "quality",
+        "direction": "higher_is_better",
+        "raw_unit": null,
+        "value_range": {"min": 0.0, "max": 1.0},
+        "display_kind": "percent",
+        "display_multiplier": 100.0,
+        "display_unit": "%",
+        "display_precision": 1
+      }
+    }
+  ],
+  "primary_metric_identity": {"name": "accuracy", "aggregation": "mean", "dimensions": {}},
+  "execution_summary": {
+    "requested": 12,
+    "succeeded": 12,
+    "errored": 0,
+    "incomplete": false,
+    "subsets": {"main": {"requested": 12, "succeeded": 12, "errored": 0}}
+  },
+  "num": 12
+}

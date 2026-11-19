@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import itertools
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import types
@@ -381,6 +383,7 @@ def test_pr_pipeline_structure():
         "build",
         "pin-unit-tests",
         "model-tests",
+        "recipe-sanity",
         "upstream-reuse",
         "gate",
     }
@@ -411,6 +414,7 @@ def test_pr_pipeline_structure():
         "build",
         "pin-unit-tests",
         "model-tests",
+        "recipe-sanity",
         "upstream-reuse",
     ]
     assert "always()" in jobs["gate"]["if"]
@@ -420,6 +424,7 @@ def test_pr_pipeline_structure():
         "JOB_RESULTS": "${{ toJSON(needs) }}",
         "SKIP_PPU": "${{ inputs.skip_ppu }}",
         "SKIP_DEVICE_TESTS": "${{ inputs.skip_device_tests }}",
+        "RECIPE_PUBLIC_ENABLED": "${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}",
         "EXISTING_BUILD_RUN_ID": "${{ inputs.existing_build_run_id || '' }}",
         "WHEEL_SOURCE_SHA": "${{ inputs.wheel_source_sha || '' }}",
     }
@@ -428,6 +433,7 @@ def test_pr_pipeline_structure():
     for job_id, name, target in (
         ("pin-unit-tests", "PPU pin UT", "_ppu-pin-ut.yaml"),
         ("model-tests", "PPU model tests", "_ppu-model-tests.yaml"),
+        ("recipe-sanity", "PPU recipe fast sanity", "_ppu-recipe-fast-sanity.yaml"),
         ("upstream-reuse", "PPU upstream reuse", "_ppu-upstream-reuse.yaml"),
     ):
         job = jobs[job_id]
@@ -462,6 +468,7 @@ def test_docs_only_call_uses_hosted_gate_without_ppu_jobs():
         "build",
         "pin-unit-tests",
         "model-tests",
+        "recipe-sanity",
         "upstream-reuse",
     ):
         assert not expression(jobs[job_id]["if"], context)
@@ -481,6 +488,7 @@ def test_docs_only_call_uses_hosted_gate_without_ppu_jobs():
                         "build",
                         "pin-unit-tests",
                         "model-tests",
+                        "recipe-sanity",
                         "upstream-reuse",
                     )
                 }
@@ -510,7 +518,7 @@ def test_skip_device_tests_guards_the_device_lanes():
     }
     # Building wheels for a lane that tests elsewhere must not also allocate
     # the pin-UT and model-smoke hosts.
-    for job_id in ("pin-unit-tests", "model-tests", "upstream-reuse"):
+    for job_id in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
         assert not expression(jobs[job_id]["if"], context)
     assert expression(jobs["build"]["if"], context)
     assert expression(jobs["gate"]["if"], context)
@@ -530,6 +538,7 @@ def test_gate_honours_skip_device_tests(skip_device_tests, returncode):
                 "build": {"result": "success"},
                 "pin-unit-tests": {"result": "skipped"},
                 "model-tests": {"result": "skipped"},
+                "recipe-sanity": {"result": "skipped"},
                 "upstream-reuse": {"result": "skipped"},
             }
         ),
@@ -892,6 +901,7 @@ def test_removing_ci_preview_cancels_active_preview_without_starting_jobs():
         ("build", "_ppu-build.yaml", ["build"]),
         ("pin-unit-tests", "_ppu-pin-ut.yaml", ["pin-unit-tests"]),
         ("model-tests", "_ppu-model-tests.yaml", ["prepare", "e2e"]),
+        ("recipe-sanity", "_ppu-recipe-fast-sanity.yaml", ["prepare", "sanity"]),
         ("upstream-reuse", "_ppu-upstream-reuse.yaml", ["upstream-reuse"]),
     ],
 )
@@ -1142,7 +1152,7 @@ def expression(value, context):
     """Evaluate only the Boolean/context subset used by these workflow guards."""
     value = value.removeprefix("${{").removesuffix("}}").strip()
     value = re.sub(
-        r"\b(?:inputs|github|needs|steps)(?:\.[\w*-]+)+",
+        r"\b(?:inputs|github|needs|steps|vars)(?:\.[\w*-]+)+",
         lambda match: repr(context.get(match[0])),
         value,
     )
@@ -1150,8 +1160,8 @@ def expression(value, context):
     value = value.replace("contains(", "contains_value(")
     value = value.replace("&&", " and ").replace("||", " or ")
     value = re.sub(r"!(?!=)", "not ", value)
-    value = re.sub(r"\btrue\b", "True", value)
-    value = re.sub(r"\bfalse\b", "False", value)
+    value = re.sub(r"(?<!['\"])\btrue\b(?!['\"])", "True", value)
+    value = re.sub(r"(?<!['\"])\bfalse\b(?!['\"])", "False", value)
 
     def contains_value(values, item):
         return item in values
@@ -1226,10 +1236,11 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
         "needs.runtime-image.result": "success",
         "needs.runtime-image.outputs.upstream_reuse": "true",
         "needs.build.result": build,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
     }
     reuse = bool(run_id) and bool(source)
     eligible = build == "success" or (build == "skipped" and reuse)
-    for job_id in ("pin-unit-tests", "model-tests", "upstream-reuse"):
+    for job_id in ("pin-unit-tests", "model-tests", "recipe-sanity", "upstream-reuse"):
         assert bool(expression(build_jobs[job_id]["if"], context)) == eligible
     assert bool(expression(build_jobs["build"]["if"], context)) == (not run_id)
     # Gate must execute even after failed/cancelled/skipped dependencies.
@@ -1238,7 +1249,7 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
 
 @pytest.mark.parametrize(
     "states",
-    itertools.product(["success", "failure", "cancelled", "skipped"], repeat=4),
+    itertools.product(["success", "failure", "cancelled", "skipped"], repeat=5),
 )
 @pytest.mark.parametrize(
     "run_id,source", [("", ""), ("123", "a" * 40), ("999", ""), ("", "a" * 40)]
@@ -1252,6 +1263,7 @@ def test_gate_executes_fail_closed_truth_table(
         "inputs.skip_device_tests": False,
         "inputs.existing_build_run_id": run_id,
         "inputs.wheel_source_sha": source,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
     }
     for key, value in step["env"].items():
         if key != "JOB_RESULTS":
@@ -1262,7 +1274,13 @@ def test_gate_executes_fail_closed_truth_table(
     results = {"runtime-image": {"result": "success"}}
     results.update(
         zip(
-            ("build", "pin-unit-tests", "model-tests", "upstream-reuse"),
+            (
+                "build",
+                "pin-unit-tests",
+                "model-tests",
+                "recipe-sanity",
+                "upstream-reuse",
+            ),
             ({"result": state} for state in states),
             strict=False,
         )
@@ -1278,7 +1296,7 @@ def test_gate_executes_fail_closed_truth_table(
     expected = (
         states[0] == "success"
         or (states[0] == "skipped" and bool(run_id) and bool(source))
-    ) and states[1:] == ("success", "success", "success")
+    ) and states[1:] == ("success", "success", "success", "success")
     assert passed is expected
 
 
@@ -1347,6 +1365,7 @@ def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
     results = {
         "runtime-image": {"result": "success", "outputs": outputs},
         "build": {"result": "success"},
+        "recipe-sanity": {"result": "success"},
     }
     results.update(
         (job, {"result": state})
@@ -1368,6 +1387,662 @@ def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
         text=True,
     )
     assert (result.returncode == 0) is passed, result.stderr
+
+
+@pytest.mark.parametrize("enabled", ["", "false", "true"])
+def test_recipe_public_flag_controls_callers_and_gate(build_jobs, enabled):
+    context = {
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": enabled,
+        "github.event_name": "workflow_dispatch",
+        "inputs.existing_build_run_id": "",
+        "inputs.wheel_source_sha": "",
+        "needs.runtime-image.result": "success",
+        "needs.build.result": "success",
+        "needs.select.result": "success",
+        "needs.select.outputs.recipe_models": "glm-5.3",
+    }
+    fast_manual = workflow("ppu-recipe-fast-sanity.yaml")["jobs"]
+    fast_leaf = workflow("_ppu-recipe-fast-sanity.yaml")["jobs"]
+    model_leaf = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]
+    accuracy_nightly = workflow("ppu-accuracy-nightly.yaml")["jobs"]
+    for job in (
+        fast_manual["build"],
+        fast_manual["recipe-fast-sanity"],
+        fast_leaf["prepare"],
+        model_leaf["prepare"],
+        accuracy_nightly["recipe-model-sanity"],
+        build_jobs["recipe-sanity"],
+    ):
+        assert bool(expression(job["if"], context)) == (enabled == "true")
+    assert (
+        fast_manual["recipe-fast-sanity"]["with"]["wheel_source_sha"]
+        == "${{ github.sha }}"
+    )
+    assert (
+        fast_manual["recipe-fast-sanity"]["with"]["build_run_id"]
+        == "${{ github.run_id }}"
+    )
+    assert (
+        accuracy_nightly["recipe-model-sanity"]["with"]["wheel_source_sha"]
+        == "${{ github.sha }}"
+    )
+    assert (
+        accuracy_nightly["recipe-model-sanity"]["with"]["build_run_id"]
+        == "${{ github.run_id }}"
+    )
+    gate = build_jobs["gate"]["steps"][0]["run"].replace(
+        "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
+    )
+    results = {key: {"result": "success"} for key in build_jobs["gate"]["needs"]}
+    env = {
+        **os.environ,
+        "SKIP_PPU": "false",
+        "SKIP_DEVICE_TESTS": "false",
+        "EXISTING_BUILD_RUN_ID": "",
+        "WHEEL_SOURCE_SHA": "",
+        "RECIPE_PUBLIC_ENABLED": enabled,
+    }
+    for outcome in ("skipped", "success", "failure"):
+        results["recipe-sanity"]["result"] = outcome
+        result = subprocess.run(
+            ["bash", "-e", "-c", gate],
+            env={**env, "JOB_RESULTS": json.dumps(results)},
+            capture_output=True,
+            text=True,
+        )
+        assert (result.returncode == 0) == (
+            outcome == "success" or (outcome == "skipped" and enabled != "true")
+        )
+
+
+def test_recipe_model_sanity_has_one_scheduled_entry():
+    callers = []
+    for path in WORKFLOWS.iterdir():
+        if path.suffix not in {".yaml", ".yml"}:
+            continue
+        config = workflow(path.name)
+        if "schedule" not in config[True]:
+            continue
+        if any(
+            job.get("uses") == "./.github/workflows/_ppu-recipe-model-sanity.yaml"
+            for job in config["jobs"].values()
+        ):
+            callers.append(path.name)
+    assert callers == ["ppu-accuracy-nightly.yaml"]
+
+
+@pytest.mark.parametrize(
+    "event,models,enabled,legacy_cases,recipe_slugs,error",
+    [
+        ("schedule", "", "true", None, "", ""),
+        ("schedule", "", "false", None, None, ""),
+        ("workflow_dispatch", "", "true", None, None, ""),
+        (
+            "workflow_dispatch",
+            "glm-5.3-mxfp4-tp4",
+            "true",
+            ["glm-5.3-mxfp4-tp4"],
+            None,
+            "",
+        ),
+        (
+            "workflow_dispatch",
+            "recipe:glm-5.3, deepseek-v4-flash",
+            "true",
+            [],
+            "glm-5.3,deepseek-v4-flash",
+            "",
+        ),
+        (
+            "workflow_dispatch",
+            "recipe:glm-5.3",
+            "",
+            [],
+            None,
+            "Recipe accuracy is disabled",
+        ),
+        (
+            "workflow_dispatch",
+            "recipe: ,",
+            "true",
+            [],
+            None,
+            "nonempty Recipe policy slugs",
+        ),
+        ("workflow_dispatch", "recipe:glm-5.3,glm-5.3", "true", [], None, "distinct"),
+        (
+            "workflow_dispatch",
+            "recipe:typo",
+            "true",
+            [],
+            None,
+            "unknown recipe policy key",
+        ),
+    ],
+)
+def test_accuracy_nightly_routes_selected_models(
+    tmp_path, event, models, enabled, legacy_cases, recipe_slugs, error
+):
+    jobs = workflow("ppu-accuracy-nightly.yaml")["jobs"]
+    selector = next(
+        step for step in jobs["select"]["steps"] if step.get("id") == "select"
+    )
+    output = tmp_path / "github-output"
+    script = selector["run"].replace("python3 -", f'"{sys.executable}" -', 1)
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "MODELS": models,
+            "RECIPE_PUBLIC_ENABLED": enabled,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert jobs["build"]["needs"] == "select"
+    if error:
+        assert result.returncode != 0 and error in result.stderr
+        assert not output.exists()
+        return
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    legacy_matrix = values.get("matrix", "")
+    context = {
+        "github.event_name": event,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": enabled,
+        "needs.build.result": "success",
+        "needs.select.result": "success",
+        "needs.select.outputs.recipe_models": values.get("recipe_models", ""),
+        "needs.select.outputs.matrix": legacy_matrix,
+    }
+    assert expression(jobs["accuracy"]["if"], context) == (legacy_cases != [])
+    if legacy_cases is None:
+        assert len(json.loads(legacy_matrix)["include"]) > 1
+    elif legacy_cases:
+        assert [
+            entry["model"] for entry in json.loads(legacy_matrix)["include"]
+        ] == legacy_cases
+    recipe = jobs["recipe-model-sanity"]
+    assert "accuracy" in recipe["needs"]
+    assert bool(expression(recipe["if"], context)) == (recipe_slugs is not None)
+    assert recipe["with"]["models"] == "${{ needs.select.outputs.recipe_models }}"
+    assert values.get("recipe_models", "") == (recipe_slugs or "")
+
+
+@pytest.mark.parametrize(
+    "leaf_name,pr_mode,tier,build_run,allowed",
+    [
+        ("_ppu-recipe-model-sanity.yaml", "false", "model_sanity", "101", True),
+        ("_ppu-recipe-model-sanity.yaml", "false", "model_sanity", "100", False),
+        ("_ppu-recipe-fast-sanity.yaml", "false", "fast_sanity", "100", False),
+        ("_ppu-recipe-fast-sanity.yaml", "true", "fast_sanity", "100", True),
+        ("_ppu-recipe-model-sanity.yaml", "true", "model_sanity", "101", False),
+    ],
+)
+def test_recipe_workflow_refuses_arbitrary_wheel_run(
+    leaf_name, pr_mode, tier, build_run, allowed
+):
+    prepare = workflow(leaf_name)["jobs"]["prepare"]
+    select = next(step for step in prepare["steps"] if step.get("id") == "select")
+    script = select["run"].partition("python3 scripts/ci/ppu_e2e_select.py")[0]
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        env={
+            **os.environ,
+            "TIER": tier,
+            "PR_MODE": pr_mode,
+            "BUILD_RUN_ID": build_run,
+            "GITHUB_RUN_ID": "101",
+        },
+    )
+    assert (result.returncode == 0) is allowed
+
+
+@pytest.mark.parametrize(
+    "leaf_name,tier",
+    [
+        ("_ppu-recipe-fast-sanity.yaml", "fast_sanity"),
+        ("_ppu-recipe-model-sanity.yaml", "model_sanity"),
+    ],
+)
+@pytest.mark.parametrize("exit_code,status", [(0, "pass"), (3, "fail")])
+@pytest.mark.parametrize(
+    "retention_case",
+    [
+        "configured",
+        "shared_root",
+        "writable_root",
+        "public_subtree",
+        "unset",
+        "empty",
+        "copy_error",
+        "retry",
+        "unsafe_source",
+        "ephemeral",
+    ],
+)
+def test_recipe_retention_and_publication(
+    tmp_path, leaf_name, tier, exit_code, status, retention_case
+):
+    steps = workflow(leaf_name)["jobs"]["sanity"]["steps"]
+    runtime = next(step for step in steps if step.get("id") == "recipe")
+    retain = next(step for step in steps if step.get("id") == "retain")
+    publish = next(step for step in steps if step.get("id") == "publish")
+    upload = next(
+        step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    assert upload["with"]["path"] == "${{ steps.runtime.outputs.public }}/summary.json"
+    assert steps.index(runtime) < steps.index(retain) < steps.index(publish)
+    assert retain["if"] == "always() && steps.runtime.outcome == 'success'"
+    assert retain["env"]["TIER"] == tier
+    assert all(
+        "PPU_CI_PRIVATE_RESULTS_ROOT" not in step.get("env", {}) for step in steps
+    )
+    assert (
+        not {"PPU_CI_HF_HOME", "GSM8K_DATASET_PATH", "PPU_CI_DG_CACHE_DIR"}
+        & runtime["env"].keys()
+    )
+
+    launcher_path = tmp_path / "scripts/ci/ppu_runtime_container.sh"
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_text(
+        'echo "synthetic-private-stdout"\necho "synthetic-private-stderr" >&2\n'
+        'mkdir "$PPU_CI_ARTIFACT_DIR/results"\n'
+        'printf "%s\\n" "$FAKE_PRIVATE_SUMMARY" > "$PPU_CI_ARTIFACT_DIR/results/summary.json"\n'
+        f"exit {exit_code}\n"
+    )
+    private_dir, public_dir = tmp_path / "private", tmp_path / "public"
+    private_dir.mkdir()
+    public_dir.mkdir()
+    runner_temp = tmp_path / "runner-temp"
+    retention_root = (
+        runner_temp if retention_case == "ephemeral" else tmp_path
+    ) / "mock-intranet-retention"
+    retention_root.mkdir(parents=True)
+    retention_root.chmod(
+        {"shared_root": 0o755, "writable_root": 0o777}.get(retention_case, 0o700)
+    )
+    if retention_case in {"shared_root", "public_subtree"}:
+        subtree = retention_root / "vllm-sail"
+        subtree.mkdir()
+        subtree.chmod(0o700 if retention_case == "shared_root" else 0o755)
+    attempt_dir = retention_root / "vllm-sail" / "101-2" / tier
+    retained_dir = attempt_dir / "glm-5.3"
+    if retention_case == "retry":
+        for directory in (
+            retention_root / "vllm-sail",
+            attempt_dir.parent,
+            attempt_dir,
+            retained_dir,
+        ):
+            directory.mkdir(mode=0o700)
+        (retained_dir / "index.json").write_text("original index")
+    job_summary = tmp_path / "job-summary.md"
+    private_summary = {
+        "path": str(retention_root),
+        "accuracy": {
+            "score": 0.96,
+            "num": 1319,
+            "expected_num": 1319,
+            "golden_score": 0.97,
+            "minimum_score": 0.95,
+            "maximum_score": 0.99,
+            "within_band": True,
+            "error": "synthetic-private-error",
+            "per_question": {
+                "status": "baseline_established",
+                "source_file": "synthetic-private-review.jsonl",
+            },
+        },
+        "micro_e2e_passed": exit_code == 0,
+        "bench": {"c1": {"status": "synthetic-private-bench"}},
+    }
+    launch_result = subprocess.run(
+        ["bash", "-e", "-c", runtime["run"]],
+        env={
+            **os.environ,
+            "PPU_CI_SOURCE_DIR": str(tmp_path),
+            "PPU_CI_ARTIFACT_DIR": str(private_dir),
+            "FAKE_PRIVATE_SUMMARY": json.dumps(private_summary),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert launch_result.returncode == exit_code
+    assert not launch_result.stdout and not launch_result.stderr
+    assert (private_dir / "launcher.log").read_text().splitlines() == [
+        "synthetic-private-stdout",
+        "synthetic-private-stderr",
+    ]
+    results_dir = private_dir / "results"
+    if retention_case == "unsafe_source":
+        (private_dir / "provenance.json").symlink_to(results_dir / "summary.json")
+    elif retention_case != "copy_error":
+        (private_dir / "provenance.json").write_text("private provenance")
+    retained_sources = {
+        "summary.json": results_dir / "summary.json",
+        "provenance.json": private_dir / "provenance.json",
+        "launcher.log": private_dir / "launcher.log",
+    }
+    if tier == "model_sanity":
+        per_question = results_dir / "gsm8k_per_question.jsonl"
+        per_question.write_text("private scores")
+        retained_sources[per_question.name] = per_question
+    (private_dir / "summary.json").write_text('{"accuracy":{"score":0.01}}')
+    runtime_log = private_dir / "runtime.log"
+    runtime_log.write_text(f"{retention_root}\n")
+    retained_sources[runtime_log.name] = runtime_log
+    phase_file = private_dir / "recipe-phase.txt"
+    phase_file.write_text("micro_e2e\n" if tier == "model_sanity" else "chat_probe\n")
+    retained_sources[phase_file.name] = phase_file
+    (private_dir / "unlisted.log").write_text("not on the retention allowlist")
+    outputs = tmp_path / "retention-output"
+    retention_env = os.environ.copy()
+    if retention_case == "unset":
+        retention_env.pop("PPU_CI_PRIVATE_RESULTS_ROOT", None)
+    else:
+        retention_env["PPU_CI_PRIVATE_RESULTS_ROOT"] = (
+            "" if retention_case == "empty" else str(retention_root)
+        )
+    retain_result = subprocess.run(
+        ["bash", "-e", "-c", retain["run"]],
+        env={
+            **retention_env,
+            "PPU_CI_SOURCE_DIR": str(ROOT),
+            "PPU_CI_SOURCE_SHA": "a" * 40,
+            "PPU_CI_ARTIFACT_DIR": str(private_dir),
+            "TIER": tier,
+            "MODEL_KEY": "glm-5.3",
+            "RECIPE_OUTCOME": "failure" if exit_code else "success",
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_WORKSPACE": str(tmp_path / "workspace"),
+            "GITHUB_RUN_ID": "101",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_OUTPUT": str(outputs),
+        },
+        capture_output=True,
+        text=True,
+    )
+    expected_retention = {
+        "configured": "retained",
+        "shared_root": "retained",
+        "unset": "not_configured",
+        "empty": "not_configured",
+    }.get(
+        retention_case,
+        "retained" if retention_case == "copy_error" and exit_code else "failed",
+    )
+    retention = outputs.read_text().removeprefix("retention=").strip()
+    assert retention == expected_retention
+    expected_error = expected_retention == "failed"
+    assert retain_result.returncode == int(expected_error)
+    assert retain_result.stderr == ""
+    if expected_retention == "retained":
+        if retention_case == "copy_error":
+            del retained_sources["provenance.json"]
+        assert {
+            file.name for file in retained_dir.iterdir()
+        } == retained_sources.keys() | {"index.json"}
+        assert json.loads((retained_dir / "index.json").read_text()) == {
+            "checkout_sha": "a" * 40,
+            "tier": tier,
+            "model_key": "glm-5.3",
+            "run_id": "101",
+            "attempt": "2",
+            "files": {
+                name: hashlib.sha256(source.read_bytes()).hexdigest()
+                for name, source in retained_sources.items()
+            },
+        }
+        for entry in retention_root.rglob("*"):
+            assert stat.S_IMODE(entry.stat().st_mode) == (
+                0o700 if entry.is_dir() else 0o600
+            )
+        for name, source in retained_sources.items():
+            assert (retained_dir / name).read_bytes() == source.read_bytes()
+    elif retention_case == "retry":
+        assert (retained_dir / "index.json").read_text() == "original index"
+    else:
+        assert not retained_dir.exists()
+    assert not list(retention_root.rglob(".staging-*"))
+    if expected_retention == "not_configured":
+        assert (
+            retain_result.stdout
+            == "::warning::private results retention not configured\n"
+        )
+    else:
+        assert retain_result.stdout == ""
+
+    publish_result = subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **os.environ,
+            "RECIPE_OUTCOME": "failure" if exit_code else "success",
+            "RETENTION_OUTCOME": "failure" if retain_result.returncode else "success",
+            "RETENTION": retention,
+            "MODEL_KEY": "glm-5.3",
+            "TIER": tier,
+            "PPU_CI_SOURCE_DIR": str(ROOT),
+            "PRIVATE_DIR": str(private_dir),
+            "PUBLIC_DIR": str(public_dir),
+            "GITHUB_STEP_SUMMARY": str(job_summary),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if expected_error:
+        status = "fail"
+    public_summary = (public_dir / "summary.json").read_text()
+    reason = (
+        {"model_sanity": "micro_e2e_failed", "fast_sanity": "chat_probe_failed"}[tier]
+        if exit_code
+        else "not_applicable"
+    )
+    assert publish_result.stdout == (
+        f"Recipe sanity: {status}\nretention: {retention}\nfailure_reason: {reason}\n"
+    )
+    assert not publish_result.stderr
+    expected_public = {
+        "status": status,
+        "retention": retention,
+        "failure_reason": reason,
+    }
+    if tier == "model_sanity":
+        micro_e2e = "fail" if exit_code else "pass"
+        expected_public.update(
+            model_key="glm-5.3",
+            gsm8k={
+                "score": 0.96,
+                "evaluated_samples": 1319,
+                "expected_samples": 1319,
+                "golden_score": 0.97,
+                "minimum_score": 0.95,
+                "maximum_score": 0.99,
+                "gate": "pass",
+            },
+            baseline_completeness="baseline_established",
+            micro_e2e=micro_e2e,
+        )
+        assert f"**Result:** {status}" in job_summary.read_text()
+        assert f"**Private retention:** {retention}" in job_summary.read_text()
+        assert f"**Recipe failure reason:** {reason}" in job_summary.read_text()
+        assert "96.00% (golden: 97.00%)" in job_summary.read_text()
+        assert "1319 / 1319" in job_summary.read_text()
+        assert "min: 95.00%, max: 99.00%" in job_summary.read_text()
+        assert f"**Micro-E2E:** {micro_e2e}" in job_summary.read_text()
+    else:
+        assert job_summary.read_text() == publish_result.stdout
+    assert json.loads(public_summary) == expected_public
+    for public_output in (
+        retain_result.stdout + retain_result.stderr + publish_result.stdout,
+        job_summary.read_text(),
+        public_summary,
+    ):
+        assert str(retention_root) not in public_output
+        assert "mock-intranet-retention" not in public_output
+        assert "synthetic-private-" not in public_output
+
+
+@pytest.mark.parametrize(
+    "tier,server_label,error,reason",
+    [
+        ("fast_sanity", None, None, "runtime_setup_failed"),
+        (
+            "model_sanity",
+            "model_sanity",
+            "The size of tensor a (2) must match the size of tensor b (4)"
+            " at non-singleton dimension 1",
+            "mla_metadata_shape_mismatch",
+        ),
+        (
+            "model_sanity",
+            "model_sanity",
+            "The expanded size of the tensor (2) must match the existing size (4)"
+            " at non-singleton dimension 1. Target sizes: [313, 2]. Tensor sizes: [630, 4]",
+            "mla_metadata_shape_mismatch",
+        ),
+    ],
+)
+def test_failed_recipe_retains_logs_without_summary(
+    tmp_path, tier, server_label, error, reason
+):
+    leaf = f"_ppu-recipe-{tier.replace('_', '-')}.yaml"
+    steps = workflow(leaf)["jobs"]["sanity"]["steps"]
+    retain = next(step for step in steps if step.get("id") == "retain")
+    publish = next(step for step in steps if step.get("id") == "publish")
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    retention_root = tmp_path / "synthetic-private-retention"
+    retention_root.mkdir(mode=0o700)
+    logs = {"launcher.log": f"synthetic-private-launcher {retention_root}\n"}
+    if server_label:
+        (private_dir / "results").mkdir()
+        logs["runtime.log"] = f"synthetic-private-runtime {retention_root}\n"
+        logs["recipe-phase.txt"] = "server_startup\n"
+        logs[f"results/vllm_serve_{server_label}.log"] = (
+            f'File "{retention_root}/mla_indexer.py", line 315\n'
+            "    self.scheduler_metadata_buffer.copy_(schedule_metadata)\n"
+            f"RuntimeError: {error}\n"
+        )
+    for name, content in logs.items():
+        (private_dir / name).write_text(content)
+    outputs = tmp_path / "retention-output"
+    summary = tmp_path / "job-summary.md"
+    env = {
+        **os.environ,
+        "PPU_CI_SOURCE_DIR": str(ROOT),
+        "PPU_CI_SOURCE_SHA": "a" * 40,
+        "PPU_CI_ARTIFACT_DIR": str(private_dir),
+        "PPU_CI_PRIVATE_RESULTS_ROOT": str(retention_root),
+        "TIER": tier,
+        "MODEL_KEY": "test-model",
+        "RUNNER_TEMP": str(tmp_path / "runner-temp"),
+        "GITHUB_WORKSPACE": str(tmp_path / "workspace"),
+        "GITHUB_RUN_ID": "101",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_OUTPUT": str(outputs),
+        "RECIPE_OUTCOME": "failure",
+    }
+    retained = subprocess.run(
+        ["bash", "-e", "-c", retain["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert outputs.read_text() == "retention=retained\n"
+    destination = retention_root / "vllm-sail" / "101-2" / tier / "test-model"
+    index = json.loads((destination / "index.json").read_text())
+    assert index["files"] == {
+        Path(name).name: hashlib.sha256(value.encode()).hexdigest()
+        for name, value in logs.items()
+    }
+    assert not (destination / "summary.json").exists()
+    for name, value in logs.items():
+        assert (destination / Path(name).name).read_text() == value
+    published = subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **env,
+            "RETENTION_OUTCOME": "success",
+            "RETENTION": "retained",
+            "PRIVATE_DIR": str(private_dir),
+            "PUBLIC_DIR": str(tmp_path),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    public_json = (tmp_path / "summary.json").read_text()
+    assert json.loads(public_json)["failure_reason"] == reason
+    assert json.loads(public_json)["status"] == "fail"
+    assert f"failure_reason: {reason}" in published.stdout
+    assert reason in summary.read_text()
+    assert "synthetic-private-" not in (
+        retained.stdout
+        + retained.stderr
+        + published.stdout
+        + published.stderr
+        + public_json
+        + summary.read_text()
+    )
+
+
+@pytest.mark.parametrize(
+    "private_summary",
+    [
+        None,
+        b'{"token":"synthetic-private-value"',
+        b"\xffsynthetic-private-value",
+        b'{"accuracy":{"score":NaN,"num":true,"expected_num":1319.5,'
+        b'"within_band":"pass","golden_score":"synthetic-private-value",'
+        b'"per_question":{"status":"synthetic-private-value"}},'
+        b'"micro_e2e_passed":"pass"}',
+    ],
+)
+def test_nightly_public_summary_drops_missing_and_unsafe_metrics(
+    tmp_path, private_summary
+):
+    steps = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]["steps"]
+    publish = next(step for step in steps if step.get("id") == "publish")
+    private_dir = tmp_path / "private"
+    results_dir = private_dir / "results"
+    results_dir.mkdir(parents=True)
+    if private_summary is not None:
+        (results_dir / "summary.json").write_bytes(private_summary)
+    job_summary = tmp_path / "job-summary.md"
+    result = subprocess.run(
+        ["bash", "-e", "-c", publish["run"]],
+        env={
+            **os.environ,
+            "RECIPE_OUTCOME": "failure",
+            "RETENTION_OUTCOME": "failure",
+            "RETENTION": "failed",
+            "MODEL_KEY": "deepseek-v4-flash",
+            "TIER": "model_sanity",
+            "PPU_CI_SOURCE_DIR": str(ROOT),
+            "PRIVATE_DIR": str(private_dir),
+            "PUBLIC_DIR": str(tmp_path),
+            "GITHUB_STEP_SUMMARY": str(job_summary),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    public_summary = (tmp_path / "summary.json").read_text()
+    public = json.loads(public_summary)
+    assert public["status"] == "fail"
+    assert public["model_key"] == "deepseek-v4-flash"
+    assert public["micro_e2e"] == public["baseline_completeness"] == "not_available"
+    assert public["gsm8k"].pop("gate") == "not_available"
+    assert all(value is None for value in public["gsm8k"].values())
+    assert "synthetic-private-value" not in (
+        result.stdout + result.stderr + job_summary.read_text() + public_summary
+    )
 
 
 def test_runtime_workflows_use_the_checked_in_docker_wrapper():

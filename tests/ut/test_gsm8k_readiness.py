@@ -217,6 +217,31 @@ def test_evalscope_passes_the_weight_contract_through(
     assert captured["generation_config"] == contract
 
 
+def test_evalscope_applies_explicit_recipe_options(evaluator, monkeypatch):
+    captured = _capture_task_config(evaluator, monkeypatch)
+    evaluator.run_evalscope(
+        "model",
+        9985,
+        "/data/gsm8k",
+        seed=7,
+        eval_batch_size=13,
+        dataset_options={
+            "few_shot_num": 2,
+            "few_shot_random": True,
+            "filters": {"remove_until": "</think>"},
+        },
+    )
+    assert captured["seed"] == 7
+    assert captured["eval_batch_size"] == 13
+    assert captured["dataset_args"]["gsm8k"] == {
+        "dataset_id": "/data/gsm8k",
+        "few_shot_num": 2,
+        "few_shot_random": True,
+        "subset_list": ["main"],
+        "filters": {"remove_until": "</think>"},
+    }
+
+
 def _capture_task_config(
     evaluator: Any, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, Any]:

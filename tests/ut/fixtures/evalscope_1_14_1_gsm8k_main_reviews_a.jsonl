@@ -1,0 +1,12 @@
+{"index": 6, "sample_score": {"score": {"value": {"accuracy": 1.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 6, "group_id": 6, "generation_index": 0}}
+{"index": 1, "sample_score": {"score": {"value": {"accuracy": 0.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 1, "group_id": 1, "generation_index": 0}}
+{"index": 11, "sample_score": {"score": {"value": {"accuracy": 0.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 11, "group_id": 11, "generation_index": 0}}
+{"index": 3, "sample_score": {"score": {"value": {"accuracy": 0.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 3, "group_id": 3, "generation_index": 0}}
+{"index": 2, "sample_score": {"score": {"value": {"accuracy": 1.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 2, "group_id": 2, "generation_index": 0}}
+{"index": 0, "sample_score": {"score": {"value": {"accuracy": 1.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 0, "group_id": 0, "generation_index": 0}}
+{"index": 5, "sample_score": {"score": {"value": {"accuracy": 0.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 5, "group_id": 5, "generation_index": 0}}
+{"index": 4, "sample_score": {"score": {"value": {"accuracy": 1.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 4, "group_id": 4, "generation_index": 0}}
+{"index": 9, "sample_score": {"score": {"value": {"accuracy": 0.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 9, "group_id": 9, "generation_index": 0}}
+{"index": 10, "sample_score": {"score": {"value": {"accuracy": 1.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 10, "group_id": 10, "generation_index": 0}}
+{"index": 7, "sample_score": {"score": {"value": {"accuracy": 0.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 7, "group_id": 7, "generation_index": 0}}
+{"index": 8, "sample_score": {"score": {"value": {"accuracy": 1.0}, "status": "success", "main_score_name": "accuracy"}, "sample_id": 8, "group_id": 8, "generation_index": 0}}

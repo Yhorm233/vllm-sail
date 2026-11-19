@@ -1,0 +1,293 @@
+name: PPU recipe model sanity
+
+on:
+  workflow_call:
+    inputs:
+      pr_mode:
+        type: boolean
+        default: false
+      pr_head_sha:
+        type: string
+        default: ""
+      wheel_source_sha:
+        description: Validated SAIL source of the reused wheels
+        type: string
+        default: ""
+      build_run_id:
+        description: Run supplying the ppu-wheels artifact
+        required: true
+        type: string
+      models:
+        description: Comma-separated recipe policy slugs (blank = all)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+concurrency:
+  group: recipe-model-sanity-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.models }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve model sanity matrix
+    if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.recipe_matrix }}
+      ready_epoch: ${{ steps.select.outputs.ready_epoch }}
+    steps:
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Select recipe model sanity models
+        id: select
+        env:
+          MODELS: ${{ inputs.models }}
+          TIER: model_sanity
+          PR_MODE: ${{ inputs.pr_mode }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          test "$PR_MODE" != true
+          test "$BUILD_RUN_ID" = "$GITHUB_RUN_ID"
+          python3 scripts/ci/ppu_e2e_select.py --recipes "${MODELS}" "${TIER}" >> "$GITHUB_OUTPUT"
+          printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+
+  sanity:
+    name: Model sanity & micro-E2E ${{ matrix.model.key }}
+    needs: prepare
+    runs-on: 8-ppu-m890p
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
+    env:
+      GIT_CONFIG_NOSYSTEM: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare private runtime directories and Git configuration
+        id: runtime
+        env:
+          READY_EPOCH: ${{ needs.prepare.outputs.ready_epoch }}
+        run: |
+          now_epoch="$(date +%s)"
+          queue_s=$(( now_epoch > READY_EPOCH ? now_epoch - READY_EPOCH : 0 ))
+          config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
+          wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-wheels.XXXXXX")"
+          artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-artifacts.XXXXXX")"
+          public="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-public.XXXXXX")"
+          source_rel=".ppu-recipe-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source="${GITHUB_WORKSPACE}/${source_rel}"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
+            printf 'wheels=%s\n' "$wheels"
+            printf 'artifacts=%s\n' "$artifacts"
+            printf 'public=%s\n' "$public"
+            printf 'source_rel=%s\n' "$source_rel"
+            printf 'source=%s\n' "$source"
+            printf 'queue_s=%s\n' "$queue_s"
+          } >> "$GITHUB_OUTPUT"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          path: ${{ steps.runtime.outputs.source_rel }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+        run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Download CI-built wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ inputs.build_run_id }}
+          path: ${{ steps.runtime.outputs.wheels }}
+          run-id: ${{ inputs.build_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Run recipe model sanity and micro-E2E in the PPU runtime container
+        id: recipe
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
+          PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || inputs.pr_head_sha || github.sha }}
+          MODEL_ID: ${{ matrix.model.model_id }}
+          RECIPE_PATH: ${{ matrix.model.recipe_path }}
+          POLICY_PATH: ${{ matrix.model.policy_path }}
+          TIER: model_sanity
+          PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
+        run: |
+          umask 077
+          bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity \
+            >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1
+
+      - name: Retain private recipe results on the runner
+        id: retain
+        if: always() && steps.runtime.outcome == 'success'
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          TIER: model_sanity
+          MODEL_KEY: ${{ matrix.model.key }}
+          RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
+        run: |
+          umask 077
+          python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
+
+      - name: Publish public recipe sanity summary
+        id: publish
+        if: always() && steps.runtime.outcome == 'success'
+        env:
+          RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
+          RETENTION_OUTCOME: ${{ steps.retain.outcome }}
+          RETENTION: ${{ steps.retain.outputs.retention }}
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          MODEL_KEY: ${{ matrix.model.key }}
+          PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PUBLIC_DIR: ${{ steps.runtime.outputs.public }}
+          TIER: model_sanity
+        run: |
+          case "$RECIPE_OUTCOME" in
+            success) if [[ "$RETENTION_OUTCOME" == success ]]; then status=pass; else status=fail; fi ;;
+            failure) status=fail ;;
+            cancelled) status=cancelled ;;
+            *) status=not_run ;;
+          esac
+          case "$RETENTION" in
+            retained|not_configured|failed) retention="$RETENTION" ;;
+            *) retention=failed ;;
+          esac
+          reason=not_applicable
+          if [[ "$RECIPE_OUTCOME" == failure ]]; then
+            reason=$(python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py")
+          fi
+          printf 'Recipe sanity: %s\nretention: %s\nfailure_reason: %s\n' "$status" "$retention" "$reason"
+          python3 -I - "$status" "$retention" "$reason" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          def mapping(value):
+              return value if isinstance(value, dict) else {}
+
+          def number(value, low, high):
+              return value if type(value) in (int, float) and low <= value <= high else None
+
+          def count(value):
+              return value if type(value) is int and 0 <= value <= 1_000_000 else None
+
+          def verdict(value):
+              return {True: "pass", False: "fail"}[value] if type(value) is bool else "not_available"
+
+          def percent(value):
+              return f"{value:.2%}" if value is not None else "—"
+
+          def display_count(value):
+              return value if value is not None else "—"
+
+          source = Path(os.environ["PRIVATE_DIR"]) / "results" / "summary.json"
+          private = {}
+          try:
+              if stat.S_ISDIR(source.parent.lstat().st_mode):
+                  info = source.lstat()
+                  if stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024:
+                      private = mapping(json.loads(source.read_text(encoding="utf-8")))
+          except (OSError, ValueError, RecursionError):
+              pass
+          accuracy = mapping(private.get("accuracy"))
+          baseline = mapping(accuracy.get("per_question")).get("status")
+          model = os.environ["MODEL_KEY"]
+          if baseline not in ("baseline_established", "baseline_incomplete"):
+              baseline = "not_available"
+          public = {
+              "model_key": model if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", model) else None,
+              "status": sys.argv[1],
+              "retention": sys.argv[2],
+              "failure_reason": sys.argv[3],
+              "gsm8k": {
+                  "score": number(accuracy.get("score"), 0, 1),
+                  "evaluated_samples": count(accuracy.get("num")),
+                  "expected_samples": count(accuracy.get("expected_num")),
+                  "golden_score": number(accuracy.get("golden_score"), 0, 1),
+                  "minimum_score": number(accuracy.get("minimum_score"), -1, 2),
+                  "maximum_score": number(accuracy.get("maximum_score"), -1, 2),
+                  "gate": verdict(accuracy.get("within_band")),
+              },
+              "baseline_completeness": baseline,
+              "micro_e2e": verdict(private.get("micro_e2e_passed")),
+          }
+          (Path(os.environ["PUBLIC_DIR"]) / "summary.json").write_text(
+              json.dumps(public, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+          )
+          gsm8k = public["gsm8k"]
+          summary = [
+              f"### Recipe model sanity: {public['model_key'] or 'unknown model'}",
+              "",
+              f"- **Result:** {public['status']} · **Private retention:** {public['retention']}",
+              f"- **Recipe failure reason:** {public['failure_reason']}",
+              f"- **GSM8K accuracy:** {percent(gsm8k['score'])} (golden: {percent(gsm8k['golden_score'])})",
+              "- **GSM8K samples (evaluated / expected):** "
+              f"{display_count(gsm8k['evaluated_samples'])} / {display_count(gsm8k['expected_samples'])}",
+              f"- **GSM8K gate:** {gsm8k['gate']} (min: {percent(gsm8k['minimum_score'])}, max: {percent(gsm8k['maximum_score'])})",
+              f"- **Micro-E2E:** {public['micro_e2e']}",
+              f"- **Per-question baseline completeness:** {public['baseline_completeness']}",
+          ]
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+      - name: Upload public recipe sanity summary
+        if: always() && steps.publish.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-recipe-model_sanity-${{ matrix.model.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.runtime.outputs.public }}/summary.json
+          if-no-files-found: error
+          retention-days: 14

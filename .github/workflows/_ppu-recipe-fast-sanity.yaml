@@ -1,0 +1,220 @@
+name: PPU recipe fast sanity
+
+on:
+  workflow_call:
+    inputs:
+      pr_mode:
+        type: boolean
+        default: false
+      pr_head_sha:
+        type: string
+        default: ""
+      wheel_source_sha:
+        description: Validated SAIL source of the reused wheels
+        type: string
+        default: ""
+      build_run_id:
+        description: Run supplying the ppu-wheels artifact
+        required: true
+        type: string
+      models:
+        description: Comma-separated recipe policy slugs (blank = all)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+concurrency:
+  group: recipe-fast-sanity-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.models }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve fast sanity matrix
+    if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.recipe_matrix }}
+      ready_epoch: ${{ steps.select.outputs.ready_epoch }}
+    steps:
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+        run: test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Select recipe fast sanity models
+        id: select
+        env:
+          MODELS: ${{ inputs.models }}
+          TIER: fast_sanity
+          PR_MODE: ${{ inputs.pr_mode }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          if [[ "$PR_MODE" == true ]]; then
+            test "$TIER" = fast_sanity
+          else
+            test "$BUILD_RUN_ID" = "$GITHUB_RUN_ID"
+          fi
+          python3 scripts/ci/ppu_e2e_select.py --recipes "${MODELS}" "${TIER}" >> "$GITHUB_OUTPUT"
+          printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+
+  sanity:
+    name: Fast sanity ${{ matrix.model.key }}
+    needs: prepare
+    runs-on: 8-ppu-m890p
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
+    env:
+      GIT_CONFIG_NOSYSTEM: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare private runtime directories and Git configuration
+        id: runtime
+        env:
+          READY_EPOCH: ${{ needs.prepare.outputs.ready_epoch }}
+        run: |
+          now_epoch="$(date +%s)"
+          queue_s=$(( now_epoch > READY_EPOCH ? now_epoch - READY_EPOCH : 0 ))
+          config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
+          wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-wheels.XXXXXX")"
+          artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-artifacts.XXXXXX")"
+          public="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-public.XXXXXX")"
+          source_rel=".ppu-recipe-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source="${GITHUB_WORKSPACE}/${source_rel}"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
+            printf 'wheels=%s\n' "$wheels"
+            printf 'artifacts=%s\n' "$artifacts"
+            printf 'public=%s\n' "$public"
+            printf 'source_rel=%s\n' "$source_rel"
+            printf 'source=%s\n' "$source"
+            printf 'queue_s=%s\n' "$queue_s"
+          } >> "$GITHUB_OUTPUT"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Require disabled cache access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (process.env.ACTIONS_CACHE_MODE !== 'none') {
+              core.setFailed('PPU CI requires cache-mode: none');
+            }
+
+      - name: Check out vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          path: ${{ steps.runtime.outputs.source_rel }}
+          persist-credentials: false
+
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+        run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Download CI-built wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-wheels-${{ inputs.build_run_id }}
+          path: ${{ steps.runtime.outputs.wheels }}
+          run-id: ${{ inputs.build_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Run recipe fast sanity in the PPU runtime container
+        id: recipe
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
+          PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || inputs.pr_head_sha || github.sha }}
+          MODEL_ID: ${{ matrix.model.model_id }}
+          RECIPE_PATH: ${{ matrix.model.recipe_path }}
+          POLICY_PATH: ${{ matrix.model.policy_path }}
+          TIER: fast_sanity
+          PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
+        run: |
+          umask 077
+          bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity \
+            >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1
+
+      - name: Retain private recipe results on the runner
+        id: retain
+        if: always() && steps.runtime.outcome == 'success'
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          TIER: fast_sanity
+          MODEL_KEY: ${{ matrix.model.key }}
+          RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
+        run: |
+          umask 077
+          python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
+
+      - name: Publish recipe sanity status
+        id: publish
+        if: always() && steps.runtime.outcome == 'success'
+        env:
+          RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
+          RETENTION_OUTCOME: ${{ steps.retain.outcome }}
+          RETENTION: ${{ steps.retain.outputs.retention }}
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PUBLIC_DIR: ${{ steps.runtime.outputs.public }}
+          TIER: fast_sanity
+        run: |
+          case "$RECIPE_OUTCOME" in
+            success) if [[ "$RETENTION_OUTCOME" == success ]]; then status=pass; else status=fail; fi ;;
+            failure) status=fail ;;
+            cancelled) status=cancelled ;;
+            *) status=not_run ;;
+          esac
+          case "$RETENTION" in
+            retained|not_configured|failed) retention="$RETENTION" ;;
+            *) retention=failed ;;
+          esac
+          reason=not_applicable
+          if [[ "$RECIPE_OUTCOME" == failure ]]; then
+            reason=$(python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py")
+          fi
+          printf 'Recipe sanity: %s\nretention: %s\nfailure_reason: %s\n' "$status" "$retention" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf '{"status":"%s","retention":"%s","failure_reason":"%s"}\n' "$status" "$retention" "$reason" > "$PUBLIC_DIR/summary.json"
+
+      - name: Upload recipe sanity status
+        if: always() && steps.publish.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-recipe-fast_sanity-${{ matrix.model.key }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.runtime.outputs.public }}/summary.json
+          if-no-files-found: error
+          retention-days: 14
