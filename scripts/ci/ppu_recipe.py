@@ -10,7 +10,9 @@ import copy
 import hashlib
 import importlib
 import json
+import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RECIPES_ROOT = REPO_ROOT / "tests" / "ppu" / "recipes"
 DEFAULT_POLICY_ROOT = REPO_ROOT / "tests" / "ppu" / "policy"
+DEFAULT_MATRIX_DOC = REPO_ROOT / "tests" / "ppu" / "README.md"
 
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
@@ -394,11 +397,13 @@ def resolve_recipe(
         enabled_features[feat_name] = bool(flag_on)
 
     features_blk = recipe.get("features", {})
+    active_features: list[str] = []
     for feat_name, is_enabled in enabled_features.items():
         if not is_enabled:
             continue
         if feat_name not in features_blk:
             raise ValidationError(f"{recipe_path}: unknown feature {feat_name!r}")
+        active_features.append(feat_name)
         feat = features_blk[feat_name]
         if "modes" in feat:
             mode_name = feat.get("default_mode") or next(iter(feat["modes"]))
@@ -509,6 +514,7 @@ def resolve_recipe(
         "preset": eff_preset,
         "variant": variant,
         "hardware": hardware,
+        "enabled_features": active_features,
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
     }
@@ -1263,6 +1269,279 @@ def _discover_default_paths() -> list[Path]:
     return paths
 
 
+def _md_cell(value: str) -> str:
+    return (
+        value.strip().replace("|", "&#124;").replace("\r\n", "\n").replace("\n", "<br>")
+    )
+
+
+def _md_code(value: str) -> str:
+    if "`" in value:
+        return f"`` {value} ``"
+    return f"`{value}`"
+
+
+def _md_link(label: str, repo_relative_path: str, *, base_dir: Path) -> str:
+    rel = os.path.relpath(
+        (REPO_ROOT / repo_relative_path).resolve(), base_dir.resolve()
+    )
+    posix_rel = Path(rel).as_posix()
+    return f"[{_md_code(label)}]({posix_rel})"
+
+
+def _format_preset(resolved: dict[str, Any]) -> str:
+    preset = resolved.get("preset")
+    variant = resolved.get("variant", "default")
+    preset_text = _md_code(preset) if preset else f"{_md_code('default')} (none)"
+    if variant != "default":
+        return f"variant {_md_code(variant)}, {preset_text}"
+    return preset_text
+
+
+def _format_features(resolved: dict[str, Any]) -> str:
+    features = resolved.get("enabled_features") or []
+    if not features:
+        return _md_code("none")
+    return ", ".join(_md_code(name) for name in features)
+
+
+def _format_flags_and_env(flags: list[str], server_env: dict[str, str]) -> str:
+    parts: list[str] = []
+    if flags:
+        parts.append(_md_code(shlex.join(flags)))
+    else:
+        parts.append(_md_code("none"))
+    if server_env:
+        env_items = ", ".join(
+            _md_code(f"{k}={v}") for k, v in sorted(server_env.items())
+        )
+        parts.append(f"env: {env_items}")
+    return "<br>".join(parts)
+
+
+def _format_fast_sanity_weights(
+    policy_doc: dict[str, Any], resolved: dict[str, Any]
+) -> str:
+    weight = _md_code("dummy") if resolved.get("dummy_weights") else "real"
+    layer_override = resolved.get("layer_override")
+    if layer_override is None:
+        return f"{weight}, full layers"
+    fs_cfg = policy_doc.get("tiers", {}).get("fast_sanity", {})
+    suffix = " (fallback: full)" if fs_cfg.get("fallback_full_layers") else ""
+    return f"{weight}, {layer_override} layers{suffix}"
+
+
+def _format_model_sanity_stages(policy_doc: dict[str, Any]) -> str:
+    stages = policy_doc.get("tiers", {}).get("model_sanity", {}).get("stages", [])
+    gate = policy_doc.get("accuracy_gate") or {}
+    band = gate.get("golden_band_abs")
+    items: list[str] = []
+    for stage in stages:
+        stage_id = str(stage["id"])
+        kind = stage["kind"]
+        if kind == "evalscope":
+            limit = stage.get("limit")
+            scope = "full" if limit is None else f"limit={limit}"
+            if band is not None:
+                items.append(f"{_md_code(stage_id)} ({scope}, ±{band})")
+            else:
+                items.append(f"{_md_code(stage_id)} ({scope})")
+        elif kind == "bench":
+            concs = stage.get("concurrencies") or []
+            if concs:
+                conc_str = ",".join(str(c) for c in concs)
+                items.append(f"{_md_code(stage_id)} ({_md_code(f'C={conc_str}')})")
+            else:
+                items.append(_md_code(stage_id))
+        else:
+            items.append(_md_code(stage_id))
+    return ", ".join(items) if items else _md_code("none")
+
+
+def _legacy_serve_flags(server_cmd: list[str]) -> list[str]:
+    if not server_cmd:
+        return []
+    first_flag = next(
+        (idx for idx, tok in enumerate(server_cmd) if str(tok).startswith("--")),
+        len(server_cmd),
+    )
+    entries = _parse_flag_entries([str(tok) for tok in server_cmd[first_flag:]])
+    filtered = _remove_flag_entries(
+        entries, ["--served-model-name", "--host", "--port"]
+    )
+    return _render_entries(filtered)
+
+
+def _render_md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    lines = [
+        "| " + " | ".join(_md_cell(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_md_cell(cell) for cell in row) + " |")
+    return lines
+
+
+def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
+    """Render the PR and Nightly PPU CI recipe matrix Markdown document."""
+    ci_dir = str(Path(__file__).resolve().parent)
+    if ci_dir not in sys.path:
+        sys.path.insert(0, ci_dir)
+    select = importlib.import_module("ppu_e2e_select")
+    doc_dir = base_dir if base_dir is not None else DEFAULT_MATRIX_DOC.parent
+
+    fast_rows: list[list[str]] = []
+    for entry, _replaces, resolved in select._recipe_entries("", "fast_sanity"):
+        pol_doc = _load_yaml(REPO_ROOT / entry["policy_path"])
+        fast_rows.append(
+            [
+                _md_link(entry["key"], entry["policy_path"], base_dir=doc_dir),
+                _md_link(
+                    Path(entry["recipe_path"]).name,
+                    entry["recipe_path"],
+                    base_dir=doc_dir,
+                ),
+                f"{_md_code(resolved['hardware'])} / {resolved['ppu_count']}",
+                _format_preset(resolved),
+                _format_features(resolved),
+                _format_fast_sanity_weights(pol_doc, resolved),
+                _format_flags_and_env(resolved["flags"], resolved["server_env"]),
+            ]
+        )
+
+    nightly_rows: list[list[str]] = []
+    for entry, replaces, resolved in select._recipe_entries("", "model_sanity"):
+        pol_doc = _load_yaml(REPO_ROOT / entry["policy_path"])
+        replaces_text = (
+            ", ".join(_md_code(case_id) for case_id in replaces)
+            if replaces
+            else _md_code("none")
+        )
+        nightly_rows.append(
+            [
+                _md_link(entry["key"], entry["policy_path"], base_dir=doc_dir),
+                _md_link(
+                    Path(entry["recipe_path"]).name,
+                    entry["recipe_path"],
+                    base_dir=doc_dir,
+                ),
+                f"{_md_code(resolved['hardware'])} / {resolved['ppu_count']}",
+                _format_preset(resolved),
+                _format_features(resolved),
+                _format_model_sanity_stages(pol_doc),
+                replaces_text,
+                _format_flags_and_env(resolved["flags"], resolved["server_env"]),
+            ]
+        )
+
+    catalog = json.loads(select.CATALOG.read_text(encoding="utf-8"))
+    acc_entries = select.build_accuracy_matrix(catalog, "")["include"]
+    remaining_ids = set(select.scheduled_legacy_accuracy_cases(acc_entries))
+    legacy_rows: list[list[str]] = []
+    for item in sorted(
+        (e for e in acc_entries if e["case_id"] in remaining_ids),
+        key=lambda e: e["case_id"],
+    ):
+        legacy_flags = _legacy_serve_flags(item.get("server_cmd") or [])
+        legacy_env = item.get("server_env") or {}
+        if legacy_flags or legacy_env:
+            serve_config = _format_flags_and_env(legacy_flags, legacy_env)
+        else:
+            serve_config = "built-in evaluator defaults"
+        legacy_rows.append(
+            [
+                _md_code(item["case_id"]),
+                f"{_md_code(item['board'])} / {item['ppu_count']}",
+                _md_code(item["model_id"]),
+                serve_config,
+            ]
+        )
+
+    lines = [
+        "<!-- Generated by `python3 scripts/ci/ppu_recipe.py render-matrix --output tests/ppu/README.md`. Do not edit manually. -->",
+        "",
+        "# PPU Recipe CI Matrix",
+        "",
+        "This document is generated from `tests/ppu/recipes/`, `tests/ppu/policy/models/`,",
+        "and `scripts/ci/ppu_e2e_models.json` using the same selector logic as GitHub Actions.",
+        "",
+        "## Configuration Resolution Rules",
+        "",
+        "- **Resolution order**: `model.base_args` -> `variants.<variant>` (default: `default`) -> `hardware_overrides.<hardware>` -> `ppu.default_features` -> optional `presets.<preset>` -> policy runtime switches (`--enable-prefix-caching`, `--load-format dummy`, `--hf-overrides`).",
+        "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `dp_ep_low_latency`) are not applied unless explicitly selected by a policy or `--preset`.",
+        "- **Shared server in `model_sanity`**: All stages in `model_sanity` run against one server process; when a `bench` stage is present, the runner injects `VLLM_SERVER_DEV_MODE=1` into the server process environment for cache resets between concurrency points.",
+        "- **Regenerate / verify**:",
+        "  ```bash",
+        "  python3 scripts/ci/ppu_recipe.py render-matrix --output tests/ppu/README.md",
+        "  python3 scripts/ci/ppu_recipe.py render-matrix --check",
+        "  ```",
+        "",
+        "## PR CI (`fast_sanity`)",
+        "",
+    ]
+    if fast_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Policy",
+                    "Recipe",
+                    "Hardware / Cards",
+                    "Preset",
+                    "Features",
+                    "Weights / Layers",
+                    "Effective serve flags",
+                ],
+                fast_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    lines.extend(["", "## Nightly CI — Recipe (`model_sanity`)", ""])
+    if nightly_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Policy",
+                    "Recipe",
+                    "Hardware / Cards",
+                    "Preset",
+                    "Features",
+                    "Stages",
+                    "Replaces legacy",
+                    "Effective serve flags",
+                ],
+                nightly_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    lines.extend(
+        [
+            "",
+            "## Nightly CI — Remaining Legacy Accuracy Cases",
+            "",
+            "These entries in `scripts/ci/ppu_e2e_models.json` still run in scheduled Nightly",
+            "until replaced by a model policy's `replaces_legacy_cases` declaration.",
+            "",
+        ]
+    )
+    if legacy_rows:
+        lines.extend(
+            _render_md_table(
+                ["Case ID", "Board / Cards", "Model ID", "Serve config"],
+                legacy_rows,
+            )
+        )
+    else:
+        lines.append(
+            "_None — all scheduled Nightly accuracy cases have migrated to recipes._"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve and validate ppu-serving/v1")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1292,6 +1571,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     val.add_argument("--require-vllm-parser", action="store_true")
 
+    rmat = sub.add_parser(
+        "render-matrix",
+        help="Render or check the generated PR/Nightly CI recipe matrix Markdown",
+    )
+    rmat.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Target Markdown path (default: stdout, or tests/ppu/README.md with --check)"
+        ),
+    )
+    rmat.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify the target Markdown file matches the generated matrix",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "resolve":
         result = resolve_recipe(
@@ -1310,6 +1607,35 @@ def main(argv: list[str] | None = None) -> int:
             served_model_name=args.served_model_name,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "render-matrix":
+        target = args.output
+        expected = render_ci_matrix_markdown()
+        if args.check:
+            check_path = target if target is not None else DEFAULT_MATRIX_DOC
+            if not check_path.is_file():
+                print(
+                    f"matrix doc missing: {check_path}. Regenerate with:\n"
+                    "  python3 scripts/ci/ppu_recipe.py render-matrix "
+                    "--output tests/ppu/README.md",
+                    file=sys.stderr,
+                )
+                return 1
+            actual = check_path.read_text(encoding="utf-8")
+            if actual != expected:
+                print(
+                    f"matrix doc out of date: {check_path}. Regenerate with:\n"
+                    "  python3 scripts/ci/ppu_recipe.py render-matrix "
+                    "--output tests/ppu/README.md",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
+        if target is None:
+            print(expected, end="")
+        else:
+            target.write_text(expected, encoding="utf-8")
         return 0
 
     target_paths = list(args.paths)

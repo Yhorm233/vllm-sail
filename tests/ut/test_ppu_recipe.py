@@ -1014,6 +1014,67 @@ def test_empty_per_question_baseline_is_incomplete() -> None:
     assert result["count"] == result["unique_ids"] == result["correct_sum"] == 0
 
 
+def test_resolve_recipe_reports_enabled_features() -> None:
+    dsv4_recipe = RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Flash.yaml"
+    dsv4_policy = POLICY_DIR / "models" / "deepseek-v4-flash.yaml"
+    assert (
+        ppu_recipe.resolve_recipe(
+            dsv4_recipe, policy_path=dsv4_policy, tier="model_sanity"
+        )["enabled_features"]
+        == []
+    )
+    assert ppu_recipe.resolve_recipe(
+        dsv4_recipe, preset="dp_ep_low_latency", cache="enabled"
+    )["enabled_features"] == ["tool_calling", "reasoning", "spec_decoding"]
+
+    glm_recipe = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
+    glm_policy = POLICY_DIR / "models" / "glm-5.3.yaml"
+    assert ppu_recipe.resolve_recipe(
+        glm_recipe, policy_path=glm_policy, tier="fast_sanity"
+    )["enabled_features"] == ["tool_calling", "reasoning"]
+
+
+def test_checked_in_recipe_matrix_doc_is_up_to_date() -> None:
+    expected = ppu_recipe.render_ci_matrix_markdown()
+    assert ppu_recipe.DEFAULT_MATRIX_DOC.is_file()
+    actual = ppu_recipe.DEFAULT_MATRIX_DOC.read_text(encoding="utf-8")
+    assert actual == expected, (
+        "tests/ppu/README.md is out of date; regenerate with: "
+        "python3 scripts/ci/ppu_recipe.py render-matrix --output tests/ppu/README.md"
+    )
+    assert ppu_recipe._scan_text(actual, context="tests/ppu/README.md") == []
+    assert "## PR CI (`fast_sanity`)" in actual
+    assert "## Nightly CI — Recipe (`model_sanity`)" in actual
+    assert "## Nightly CI — Remaining Legacy Accuracy Cases" in actual
+    assert "`default` (none)" in actual
+    assert "`tool_calling`, `reasoning`" in actual
+    legacy_section = actual.split("## Nightly CI — Remaining Legacy Accuracy Cases", 1)[
+        1
+    ]
+    assert "| `deepseek-v4-mxfp4` |" not in legacy_section
+    assert "| `glm-5.3-mxfp4-tp4` |" not in legacy_section
+    assert "| `deepseek-v4-mxfp4-dp-ep` |" in legacy_section
+
+
+def test_render_matrix_cli_check_passes_and_detects_drift(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert ppu_recipe.main(["render-matrix", "--check"]) == 0
+
+    missing = tmp_path / "missing.md"
+    assert ppu_recipe.main(["render-matrix", "--output", str(missing), "--check"]) == 1
+    assert "matrix doc missing" in capsys.readouterr().err
+
+    target = tmp_path / "README.md"
+    target.write_text("# stale\n", encoding="utf-8")
+    assert ppu_recipe.main(["render-matrix", "--output", str(target), "--check"]) == 1
+    assert "matrix doc out of date" in capsys.readouterr().err
+
+    assert ppu_recipe.main(["render-matrix", "--output", str(target)]) == 0
+    assert ppu_recipe.main(["render-matrix", "--output", str(target), "--check"]) == 0
+    assert target.read_text(encoding="utf-8") == ppu_recipe.render_ci_matrix_markdown()
+
+
 @pytest.mark.requires_runtime
 def test_runtime_vllm_parser_validates_checked_in_recipes() -> None:
     pytest.importorskip("vllm")

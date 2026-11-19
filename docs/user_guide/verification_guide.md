@@ -117,6 +117,9 @@ cases, including DeepSeek INT8 and DP+EP, still run. With recipes disabled,
 the full legacy matrix runs; manual legacy case selection is unchanged.
 Each replacement is declared in the model policy's `replaces_legacy_cases`
 list and requires a matching legacy accuracy case and a `model_sanity` tier.
+See [PPU Recipe CI Matrix](../../tests/ppu/README.md) for the generated table
+of active PR `fast_sanity`, Nightly `model_sanity`, and remaining legacy
+Nightly configurations.
 
 The runner administrator must
 set `PPU_CI_PRIVATE_RESULTS_ROOT` in the runner service environment on every
