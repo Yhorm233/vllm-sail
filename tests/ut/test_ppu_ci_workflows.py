@@ -380,6 +380,7 @@ def test_pr_pipeline_structure():
     jobs = config["jobs"]
     assert set(jobs) == {
         "runtime-image",
+        "preview-donor",
         "build",
         "pin-unit-tests",
         "model-tests",
@@ -407,9 +408,11 @@ def test_pr_pipeline_structure():
     assert build["uses"] == "./.github/workflows/_ppu-build.yaml"
     assert build["with"] == {
         "pr_head_sha": "${{ inputs.pr_head_sha || github.sha }}",
-        "native_reuse_run_id": "${{ inputs.native_reuse_run_id || '' }}",
+        "native_reuse_run_id": (
+            "${{ inputs.native_reuse_run_id || needs.preview-donor.outputs.run_id || '' }}"
+        ),
     }
-    assert build["needs"] == "runtime-image"
+    assert build["needs"] == ["runtime-image", "preview-donor"]
     assert jobs["gate"]["needs"] == [
         "runtime-image",
         "build",
@@ -706,10 +709,6 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
     assert "needs" not in build
     caller = workflow("ppu-build-and-test.yaml")["jobs"]["build"]
     assert caller["uses"] == "./.github/workflows/_ppu-build.yaml"
-    assert caller["with"] == {
-        "pr_head_sha": "${{ inputs.pr_head_sha || github.sha }}",
-        "native_reuse_run_id": "${{ inputs.native_reuse_run_id || '' }}",
-    }
     download = next(
         step
         for step in build["steps"]
@@ -783,12 +782,56 @@ def test_preview_route_requires_the_ci_preview_label():
         "paths": [".github/workflows/**", "scripts/ci/**"],
     }
     assert not (WORKFLOWS / "ppu-pr-preview.yaml").exists()
-    for job in config["jobs"].values():
+    for name, job in config["jobs"].items():
+        if name == "preview-donor":
+            assert job["needs"] == "runtime-image"
+            continue  # Inherits preview admission from runtime-image.
         guard = job["if"]
         assert "github.event_name != 'pull_request'" in guard
         assert "!github.event.pull_request.draft" in guard
         assert "ci-preview" in guard
         assert "github.event.label.name == 'ci-preview'" in guard
+
+
+@pytest.mark.parametrize(
+    "event,lookup,donor,formal,expected",
+    [
+        ("pull_request", "success", "100", "", "100"),
+        ("pull_request", "success", "", "", ""),
+        ("pull_request", "failure", "", "", ""),
+        ("workflow_dispatch", "skipped", "", "101", "101"),
+    ],
+)
+def test_preview_reuses_native_donor_without_skipping_candidate_build(
+    event, lookup, donor, formal, expected
+):
+    jobs = workflow("ppu-build-and-test.yaml")["jobs"]
+    selection = jobs["preview-donor"]
+    context = {
+        "github.event_name": event,
+        "github.event.action": "synchronize",
+        "github.event.pull_request.draft": False,
+        "github.event.pull_request.labels.*.name": ["ci-preview"],
+        "github.sha": "a" * 40,
+        "github.run_id": "200",
+        "needs.runtime-image.result": "success",
+        "needs.preview-donor.result": lookup,
+        "needs.preview-donor.outputs.run_id": donor,
+        "inputs.native_reuse_run_id": formal,
+    }
+    assert bool(expression(selection["if"], context)) == (event == "pull_request")
+    assert selection["runs-on"] == "ubuntu-24.04"
+    assert selection["continue-on-error"] is True
+    assert selection["permissions"] == {"contents": "read", "actions": "read"}
+    assert selection["outputs"] == {"run_id": "${{ steps.select.outputs.run_id }}"}
+    checkout = checkouts(selection)[0]
+    assert expression(checkout["with"]["ref"], context) == context["github.sha"]
+    assert checkout["with"]["persist-credentials"] is False
+    select = next(step for step in selection["steps"] if step.get("id") == "select")
+    assert select["run"] == "python3 -m scripts.ci.ppu_preview_wheel_donor"
+    assert expression(jobs["build"]["if"], context)
+    assert expression(jobs["build"]["with"]["native_reuse_run_id"], context) == expected
+    assert expression(jobs["recipe-sanity"]["with"]["build_run_id"], context) == "200"
 
 
 def test_preview_label_is_distinct_from_formal_ready_authorization():

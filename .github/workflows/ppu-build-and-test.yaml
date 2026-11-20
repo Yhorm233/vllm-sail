@@ -144,10 +144,34 @@ jobs:
             echo supported=false >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  preview-donor:
+    name: Find a Nightly wheel donor for Preview
     needs: runtime-image
+    if: github.event_name == 'pull_request' && needs.runtime-image.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run_id: ${{ steps.select.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Find matching wheels on the default branch
+        id: select
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -m scripts.ci.ppu_preview_wheel_donor
+
+  build:
+    needs: [runtime-image, preview-donor]
     if: >-
-      ${{ (github.event_name != 'pull_request' ||
+      ${{ !cancelled() &&
+      (github.event_name != 'pull_request' ||
       ((((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'ci-preview')) &&
       !github.event.pull_request.draft &&
@@ -160,7 +184,7 @@ jobs:
     uses: ./.github/workflows/_ppu-build.yaml
     with:
       pr_head_sha: ${{ inputs.pr_head_sha || github.sha }}
-      native_reuse_run_id: ${{ inputs.native_reuse_run_id || '' }}
+      native_reuse_run_id: ${{ inputs.native_reuse_run_id || needs.preview-donor.outputs.run_id || '' }}
 
   pin-unit-tests:
     name: PPU pin UT

@@ -11,6 +11,8 @@ from urllib.error import HTTPError
 import pytest
 import yaml
 
+from scripts.ci.ppu_preview_wheel_donor import select_donor
+
 REPO = "t-head/vllm-sail"
 ROOT = f"/repos/{REPO}"
 SHA = "a" * 40
@@ -2080,6 +2082,94 @@ def test_native_selection_continues_to_an_older_matching_donor(github_output):
     assert validate_pair(control, gh, github_output) == reuse_result(
         "native", run_id="554", source=SHA
     )
+
+
+@pytest.mark.parametrize(
+    "build_success,expired", [(True, False), (False, False), (True, True)]
+)
+def test_preview_uses_only_a_successful_nightly_build_with_a_live_artifact(
+    build_success, expired, github_output, capsys
+):
+    control, gh, _ = make_controller()
+    old_source = "d" * 40
+    matching = {
+        "id": 555,
+        "event": "schedule",
+        "status": "completed",
+        "conclusion": "failure",  # The publication job may fail independently.
+        "path": ".github/workflows/nightly-wheels.yaml",
+        "head_branch": "main",
+        "head_sha": SHA,
+        "repository": {"full_name": REPO},
+        "head_repository": {"full_name": REPO},
+    }
+    gh.page(
+        "/actions/workflows/nightly-wheels.yaml/runs",
+        [
+            {**matching, "id": 900},  # Current run.
+            {**matching, "id": 559, "event": "workflow_dispatch"},
+            {**matching, "id": 558, "head_repository": {"full_name": "fork/vllm-sail"}},
+            {**matching, "id": 556, "head_sha": old_source},
+            matching,
+        ],
+        "workflow_runs",
+        branch="main",
+        event="schedule",
+        status="completed",
+    )
+    base = [tree_entry("csrc/kernel.cu")]
+    add_tree(gh, old_source, tree_payload([tree_entry("csrc/kernel.cu", oid=CHANGED)]))
+    add_tree(gh, SHA, tree_payload(base))
+    add_tree(
+        gh,
+        ENV["GITHUB_SHA"],
+        tree_payload([*base, tree_entry("scripts/ci/preview.py")]),
+    )
+    gh.page(
+        "/actions/runs/555/jobs",
+        [
+            {
+                "name": "build / PPU wheel build",
+                "conclusion": "success" if build_success else "failure",
+            }
+        ],
+        "jobs",
+        filter="latest",
+    )
+    if build_success:
+        gh.page(
+            "/actions/runs/555/artifacts",
+            [{"name": "ppu-wheels-555", "expired": expired}],
+            "artifacts",
+        )
+
+    select_donor(control)
+
+    assert github_output.read_text() == (
+        "run_id=555\n" if build_success and not expired else "run_id=\n"
+    )
+    assert not capsys.readouterr().err
+    assert all(call[0] == "GET" for call in gh.calls)
+
+
+def test_preview_donor_lookup_failure_has_no_build_dependency(github_output):
+    control, gh, _ = make_controller()
+    gh.add(
+        "GET",
+        ROOT + "/actions/workflows/nightly-wheels.yaml/runs",
+        http_error(503),
+        params={
+            "page": 1,
+            "per_page": 100,
+            "branch": "main",
+            "event": "schedule",
+            "status": "completed",
+        },
+    )
+
+    select_donor(control)
+
+    assert github_output.read_text() == "run_id=\n"
 
 
 def test_tree_cache_is_shared_across_donors_and_current_main(github_output):
