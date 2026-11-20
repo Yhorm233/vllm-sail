@@ -51,11 +51,19 @@ def checkouts(job):
 )
 def test_control_jobs_only_execute_trusted_code(name, job_id, ref):
     job = workflow(name)["jobs"][job_id]
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-slim"
+    assert job["timeout-minutes"] <= 15
     assert len(checkouts(job)) == 1
     checkout = checkouts(job)[0]
     assert checkout["with"]["ref"] == ref
+    assert checkout["with"]["sparse-checkout"] == "scripts/ci"
     assert checkout["with"]["persist-credentials"] is False
+    assert not any(
+        step.get("uses", "").startswith("actions/setup-python@")
+        for step in job["steps"]
+    )
+    run_steps = [step["run"] for step in job["steps"] if "run" in step]
+    assert f"python3 -m scripts.ci.ppu_ci_command {job_id}" in run_steps
     if name == "ppu-pr-ci.yaml":
         assert DEFAULT_REF_GUARD in job.get("if", checkout.get("if", "")) or (
             job_id == "report"
@@ -196,7 +204,7 @@ def test_executor_separates_read_only_pr_execution_and_always_reporting():
         "statuses": "write",
     }
     step = next(step for step in validate["steps"] if "run" in step)
-    assert step["run"] == "python -m scripts.ci.ppu_ci_command validate"
+    assert step["run"] == "python3 -m scripts.ci.ppu_ci_command validate"
     assert "continue-on-error" not in step
     assert validate["outputs"] == {
         key: "${{ steps." + step["id"] + ".outputs." + key + " }}"
@@ -215,7 +223,7 @@ def test_executor_separates_read_only_pr_execution_and_always_reporting():
     step = next(step for step in report["steps"] if "run" in step)
     assert step["env"]["NEEDS"] == "${{ toJSON(needs) }}"
     assert "continue-on-error" not in step
-    assert step["run"] == "python -m scripts.ci.ppu_ci_command report"
+    assert step["run"] == "python3 -m scripts.ci.ppu_ci_command report"
 
 
 @pytest.mark.parametrize(
@@ -820,13 +828,19 @@ def test_preview_reuses_native_donor_without_skipping_candidate_build(
         "inputs.native_reuse_run_id": formal,
     }
     assert bool(expression(selection["if"], context)) == (event == "pull_request")
-    assert selection["runs-on"] == "ubuntu-24.04"
+    assert selection["runs-on"] == "ubuntu-slim"
+    assert selection["timeout-minutes"] <= 15
     assert selection["continue-on-error"] is True
     assert selection["permissions"] == {"contents": "read", "actions": "read"}
     assert selection["outputs"] == {"run_id": "${{ steps.select.outputs.run_id }}"}
     checkout = checkouts(selection)[0]
     assert expression(checkout["with"]["ref"], context) == context["github.sha"]
+    assert checkout["with"]["sparse-checkout"] == "scripts/ci"
     assert checkout["with"]["persist-credentials"] is False
+    assert not any(
+        step.get("uses", "").startswith("actions/setup-python@")
+        for step in selection["steps"]
+    )
     select = next(step for step in selection["steps"] if step.get("id") == "select")
     assert select["run"] == "python3 -m scripts.ci.ppu_preview_wheel_donor"
     assert expression(jobs["build"]["if"], context)
