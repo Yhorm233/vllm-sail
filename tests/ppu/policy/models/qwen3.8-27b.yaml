@@ -1,0 +1,17 @@
+schema_version: ppu-test-policy/v1
+model_id: Qwen/Qwen3.8-27B
+recipe: tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml
+hardware: zhenwu_m890
+tiers:
+  fast_sanity:
+    dummy_weights: true
+    layer_override: 2
+    fallback_full_layers: true
+    cache: enabled
+    probe:
+      prompt: "Compute 6 * 7 and reply with the integer only."
+      max_tokens: 16
+      temperature: 0.0
+      stream:
+        max_tokens: 64
+        enable_thinking: false

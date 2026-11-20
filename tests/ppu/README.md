@@ -22,6 +22,7 @@ and `scripts/ci/ppu_e2e_models.json` using the same selector logic as GitHub Act
 | --- | --- | --- | --- | --- | --- | --- |
 | [`deepseek-v4-flash`](policy/models/deepseek-v4-flash.yaml) | [`DeepSeek-V4-Flash.yaml`](recipes/deepseek-ai/DeepSeek-V4-Flash.yaml) | `zhenwu_m890` / 8 | `default` (none) | `none` | `dummy`, 2 layers (fallback: full) | `--tensor-parallel-size 8 --gpu-memory-utilization 0.9 --max-model-len 16384 --trust-remote-code --seed 0 --enable-prefix-caching --load-format dummy --hf-overrides '{"num_hidden_layers":2}'` |
 | [`glm-5.3`](policy/models/glm-5.3.yaml) | [`GLM-5.3.yaml`](recipes/zai-org/GLM-5.3.yaml) | `zhenwu_m890` / 4 | `default` (none) | `tool_calling`, `reasoning` | `dummy`, 2 layers (fallback: full) | `--trust-remote-code --tensor-parallel-size 4 --max-model-len 16384 --distributed-timeout-seconds 3600 --cpu-distributed-timeout-seconds 3600 --enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm45 --enable-prefix-caching --load-format dummy --hf-overrides '{"num_hidden_layers":2}'` |
+| [`qwen3.8-27b`](policy/models/qwen3.8-27b.yaml) | [`Qwen3.8-27B.yaml`](recipes/Qwen/Qwen3.8-27B.yaml) | `zhenwu_m890` / 2 | `default` (none) | `none` | `dummy`, 2 layers (fallback: full) | `--tensor-parallel-size 2 --max-model-len 16384 --trust-remote-code --enable-prefix-caching --load-format dummy --hf-overrides '{"num_hidden_layers":2}'` |
 
 ## Nightly CI — Recipe (`model_sanity`)
 

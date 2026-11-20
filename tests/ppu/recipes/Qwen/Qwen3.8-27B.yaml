@@ -1,0 +1,25 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: qwen3.8-27b
+    tokenizer: qwen3.8-27b
+  hf_model_id: Qwen/Qwen3.8-27B
+  served_name: qwen3.8-27b
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 2
+model:
+  model_id: Qwen/Qwen3.8-27B
+  base_args:
+    - --tensor-parallel-size
+    - "2"
+    - --max-model-len
+    - "16384"
+    - --trust-remote-code
+variants:
+  default:
+    precision: bf16

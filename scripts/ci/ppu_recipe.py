@@ -992,6 +992,29 @@ def validate_policy_structure(
                 raise ValidationError(
                     f"{context}.tiers.fast_sanity.cache must be 'enabled'"
                 )
+            probe_context = f"{context}.tiers.fast_sanity.probe"
+            if not isinstance(fs["probe"], dict):
+                raise ValidationError(f"{probe_context} must be mapping")
+            if "stream" in fs["probe"]:
+                stream_context = f"{probe_context}.stream"
+                stream = _check_keys(
+                    fs["probe"]["stream"],
+                    allowed={"max_tokens", "enable_thinking"},
+                    required={"max_tokens"},
+                    context=stream_context,
+                )
+                budget = stream["max_tokens"]
+                if type(budget) is not int or not 1 <= budget <= 128:
+                    raise ValidationError(
+                        f"{stream_context}.max_tokens must be an integer in [1, 128]"
+                    )
+                if (
+                    "enable_thinking" in stream
+                    and type(stream["enable_thinking"]) is not bool
+                ):
+                    raise ValidationError(
+                        f"{stream_context}.enable_thinking must be boolean"
+                    )
         if "model_sanity" in tiers:
             ms = _check_keys(
                 tiers["model_sanity"],

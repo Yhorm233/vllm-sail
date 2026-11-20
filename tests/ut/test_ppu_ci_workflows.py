@@ -1904,6 +1904,15 @@ def test_recipe_retention_and_publication(
         },
         "micro_e2e_passed": exit_code == 0,
         "bench": {"c1": {"status": "synthetic-private-bench"}},
+        "timings": {
+            "queue_s": 1,
+            "cold_start_s": 2.5,
+            "eval_s": "synthetic-private-timing",
+            "bench_s": False,
+            "nonstream_s": float("nan"),
+            "stream_s": 0.25,
+            "extra_s": 9999,
+        },
     }
     launch_result = subprocess.run(
         ["bash", "-e", "-c", runtime["run"]],
@@ -2080,7 +2089,17 @@ def test_recipe_retention_and_publication(
         assert "min: 95.00%, max: 99.00%" in job_summary.read_text()
         assert f"**Micro-E2E:** {micro_e2e}" in job_summary.read_text()
     else:
-        assert job_summary.read_text() == publish_result.stdout
+        expected_public["timings"] = {
+            "queue_s": 1,
+            "cold_start_s": 2.5,
+            "eval_s": None,
+            "bench_s": None,
+            "nonstream_s": None,
+            "stream_s": 0.25,
+        }
+        assert job_summary.read_text() == (
+            publish_result.stdout + "queue_s: 1\ncold_start_s: 2.5\nstream_s: 0.25\n"
+        )
     assert json.loads(public_summary) == expected_public
     for public_output in (
         retain_result.stdout + retain_result.stderr + publish_result.stdout,

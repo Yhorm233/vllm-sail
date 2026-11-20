@@ -208,7 +208,45 @@ jobs:
             reason=$(python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py")
           fi
           printf 'Recipe sanity: %s\nretention: %s\nfailure_reason: %s\n' "$status" "$retention" "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
-          printf '{"status":"%s","retention":"%s","failure_reason":"%s"}\n' "$status" "$retention" "$reason" > "$PUBLIC_DIR/summary.json"
+          python3 -I - "$status" "$retention" "$reason" <<'PYTHON'
+          import json
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+
+          source = Path(os.environ["PRIVATE_DIR"]) / "results" / "summary.json"
+          timings = {}
+          try:
+              if stat.S_ISDIR(source.parent.lstat().st_mode):
+                  info = source.lstat()
+                  if stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024:
+                      private = json.loads(source.read_text(encoding="utf-8"))
+                      if isinstance(private, dict) and isinstance(private.get("timings"), dict):
+                          timings = private["timings"]
+          except (OSError, ValueError, RecursionError):
+              pass
+          keys = ("queue_s", "cold_start_s", "eval_s", "bench_s", "nonstream_s", "stream_s")
+          public_timings = {}
+          for key in keys:
+              value = timings.get(key)
+              public_timings[key] = (
+                  value if type(value) in (int, float) and 0 <= value <= 86400 else None
+              )
+          public = {
+              "status": sys.argv[1],
+              "retention": sys.argv[2],
+              "failure_reason": sys.argv[3],
+              "timings": public_timings,
+          }
+          (Path(os.environ["PUBLIC_DIR"]) / "summary.json").write_text(
+              json.dumps(public, allow_nan=False) + "\n", encoding="utf-8"
+          )
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as output:
+              for key, value in public_timings.items():
+                  if value is not None:
+                      output.write(f"{key}: {value}\n")
+          PYTHON
 
       - name: Upload recipe sanity status
         if: always() && steps.publish.outcome == 'success'

@@ -9,6 +9,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -380,6 +383,197 @@ def test_recipe_defaults_include_every_policy_defining_the_requested_tier(
             ppu_e2e_select.build_recipe_matrix(f"{other}-only", tier)
 
 
+def test_qwen_fast_sanity_is_selected_at_tp2() -> None:
+    matrix = ppu_e2e_select.build_recipe_matrix("", tier="fast_sanity")
+    qwen = next(item for item in matrix["include"] if item["key"] == "qwen3.8-27b")
+    assert qwen["ppu_count"] == 2
+    assert qwen["model_id"] == "Qwen/Qwen3.8-27B"
+    nightly = ppu_e2e_select.build_recipe_matrix("", tier="model_sanity")
+    assert "qwen3.8-27b" not in {item["key"] for item in nightly["include"]}
+
+
+@pytest.mark.parametrize("value", [False, {"max_tokens": True}, {"max_tokens": 129}])
+def test_fast_sanity_stream_policy_checks_token_budget(value) -> None:
+    policy = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
+    policy["tiers"]["fast_sanity"]["probe"]["stream"] = value
+    with pytest.raises(ppu_recipe.ValidationError, match=r"fast_sanity\.probe\.stream"):
+        ppu_recipe.validate_policy_structure(policy, context="test policy")
+
+
+def _stream_event(delta, finish=None):
+    chunk = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    return f"data: {json.dumps(chunk)}\r\n\r\n".encode()
+
+
+_CONTENT = _stream_event({"role": "assistant", "content": "42"})
+_FINISH = _stream_event({}, finish="stop")
+_DONE = b"data: [DONE]\r\n\r\n"
+
+
+@pytest.fixture
+def probe_server():
+    calls = []
+
+    def start(stream_body, *, status=200, keep_sending=False):
+        stopped = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                calls.append((self.path, body))
+                if not body.get("stream"):
+                    completed = {
+                        "choices": [
+                            {"message": {"content": "42"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"completion_tokens": 1},
+                    }
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps(completed).encode())
+                    return
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.end_headers()
+                try:
+                    self.wfile.write(stream_body)
+                    if keep_sending:
+                        while not stopped.wait(0.01):
+                            self.wfile.write(b": keepalive\n\n")
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        return server, thread, stopped
+
+    servers = []
+
+    def listen(*args, **kwargs):
+        server, thread, stopped = start(*args, **kwargs)
+        servers.append((server, thread, stopped))
+        return server.server_port, calls
+
+    yield listen
+    for server, thread, stopped in servers:
+        stopped.set()
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "reason"),
+    [
+        (_CONTENT + _FINISH + _DONE, 200, None),
+        (_CONTENT + _FINISH, 200, "missing_done"),
+        (_CONTENT, 200, "truncated_stream"),
+        (_CONTENT + _DONE, 200, "truncated_stream"),
+        (
+            _stream_event({"reasoning": "42", "content": "  "}) + _FINISH + _DONE,
+            200,
+            "empty_stream_content",
+        ),
+        (b"data: {synthetic-private-response}\n\n", 200, "invalid_stream_chunk"),
+        (b": " + b"x" * 65536, 200, "stream_response_too_large"),
+        (b"synthetic-private-response", 500, "stream_http_error"),
+    ],
+)
+def test_stream_chat_probe_validates_loopback_http(probe_server, body, status, reason):
+    port, calls = probe_server(body, status=status)
+    kwargs = {
+        "port": port,
+        "served_name": "dummy",
+        "probe": {
+            "prompt": "Say 42",
+            "stream": {"max_tokens": 64, "enable_thinking": False},
+        },
+    }
+    if reason is None:
+        result = ppu_recipe_runner._send_stream_chat_probe(**kwargs)
+        assert result["status"] == "pass"
+        assert result["content_chars"] == 2
+    else:
+        with pytest.raises(ppu_recipe_runner._StreamProbeError, match=f"^{reason}$"):
+            ppu_recipe_runner._send_stream_chat_probe(**kwargs)
+    assert calls == [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "dummy",
+                "messages": [{"role": "user", "content": "Say 42"}],
+                "stream": True,
+                "temperature": 0.0,
+                "max_tokens": 64,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    ]
+
+
+def test_stream_probe_deadline_includes_keepalive_traffic(probe_server):
+    port, _ = probe_server(_CONTENT, keep_sending=True)
+    started = time.monotonic()
+    with pytest.raises(ppu_recipe_runner._StreamProbeError, match="^stream_timeout$"):
+        ppu_recipe_runner._send_stream_chat_probe(
+            port=port,
+            served_name="dummy",
+            probe={"prompt": "Say 42", "stream": {"max_tokens": 16}},
+            timeout=0.15,
+        )
+    assert time.monotonic() - started < 2
+
+
+def test_missing_done_fails_fast_sanity_without_restarting_server(
+    tmp_path, monkeypatch, probe_server
+):
+    port, calls = probe_server(
+        _stream_event({"content": "synthetic-private-value"}) + _FINISH
+    )
+    launches = []
+    monkeypatch.setattr(
+        ppu_recipe_runner, "_launch_resolved_server", lambda *a, **k: launches.append(a)
+    )
+    monkeypatch.setattr(ppu_recipe_runner, "_wait_server_ready", lambda *a, **k: 10.0)
+    phases = tmp_path / "phase.txt"
+    monkeypatch.setenv("PPU_RECIPE_PHASE_FILE", str(phases))
+
+    exit_code = ppu_recipe_runner.main(
+        [
+            "--recipe",
+            str(RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml"),
+            "--policy",
+            str(POLICY_DIR / "models" / "qwen3.8-27b.yaml"),
+            "--tier",
+            "fast_sanity",
+            "--results-dir",
+            str(tmp_path),
+            "--port",
+            str(port),
+            "--vllm-parser",
+            "skip",
+        ]
+    )
+    assert exit_code == 1
+    assert len(launches) == 1
+    assert [body.get("stream", False) for _, body in calls] == [False, True]
+    assert calls[0][1]["model"] == calls[1][1]["model"]
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["status"] == "fail"
+    assert summary["attempts"][0]["stream_probe"]["error"] == "missing_done"
+    assert summary["timings"]["cold_start_s"] == 10.0
+    assert "stream_s" in summary["timings"] and "nonstream_s" in summary["timings"]
+    assert phases.read_text().strip() == "missing_done"
+    assert "synthetic-private-value" not in json.dumps(summary)
+    ppu_recipe.redact_and_verify_public_payload(summary, allow_loopback=True)
+
+
 def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -426,6 +620,7 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
         "cold_start_s": 45.0,
         "eval_s": 1.2,
         "bench_s": 0.0,
+        "nonstream_s": 1.2,
     }
     assert (tmp_path / "out" / "summary.json").is_file()
 
