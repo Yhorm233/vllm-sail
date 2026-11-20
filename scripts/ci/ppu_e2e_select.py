@@ -145,6 +145,11 @@ def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], d
                 "golden_model_key": resolved["golden_model_key"],
                 "ppu_count": int(resolved["ppu_count"]),
                 "config_digest": resolved["config_digest"],
+                **(
+                    {"preset": resolved["preset"]}
+                    if tier == "model_sanity" and resolved["preset"] is not None
+                    else {}
+                ),
             },
             pol_doc.get("replaces_legacy_cases", []),
             resolved,

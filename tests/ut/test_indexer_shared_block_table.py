@@ -387,8 +387,8 @@ def test_upstream_copies_exact_schedule_shape_and_reuses_buffer(modules, shape):
     )
     namespace, _, _ = _paged_namespace(modules, ppu=True, builder=builder)
     metadata = Schedule(shape)
-    namespace["_ppu_deep_gemm"].get_paged_mqa_logits_metadata = lambda *args, **kwargs: (
-        metadata
+    namespace["_ppu_deep_gemm"].get_paged_mqa_logits_metadata = (
+        lambda *args, **kwargs: (metadata)
     )
     metadata.new_empty = Schedule
     paged = function(PATCH, "_ppu_paged_metadata", namespace)

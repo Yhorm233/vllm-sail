@@ -212,6 +212,48 @@ def test_resolve_dsv4_matches_catalog_and_dpep_preset() -> None:
     assert "--enable-prefix-caching" not in resolved_dpep["flags"]
 
 
+def test_model_sanity_policy_selects_eight_card_dp_ep_preset() -> None:
+    base_slug = "deepseek-v4-flash"
+    slug = f"{base_slug}-dp-ep"
+    legacy_case = "deepseek-v4-mxfp4-dp-ep"
+    matrix = ppu_e2e_select.build_recipe_matrix(slug, "model_sanity")
+    (entry,) = matrix["include"]
+    recipe = ROOT / entry["recipe_path"]
+    resolved = ppu_recipe.resolve_recipe(
+        recipe,
+        policy_path=ROOT / entry["policy_path"],
+        tier="model_sanity",
+        preset=entry["preset"],
+    )
+    base = ppu_recipe.resolve_recipe(
+        recipe,
+        policy_path=POLICY_DIR / "models" / f"{base_slug}.yaml",
+        tier="model_sanity",
+    )
+    legacy = next(
+        case
+        for case in json.loads((CI_DIR / "ppu_e2e_models.json").read_text())
+        if case["key"] == legacy_case
+    )
+    assert entry["ppu_count"] == resolved["ppu_count"] == 8
+    assert entry["preset"] == resolved["preset"] == "dp_ep_low_latency"
+    assert entry["config_digest"] == resolved["config_digest"] != base["config_digest"]
+    assert set(legacy["server_env"].items()) <= set(resolved["server_env"].items())
+
+    def flags(args):
+        return {name: value for name, value, _ in ppu_recipe._parse_flag_entries(args)}
+
+    effective = flags(resolved["flags"])
+    assert "--tensor-parallel-size" not in effective
+    for key, value in flags(legacy["server_cmd"][9:]).items():
+        if key.endswith("-config"):
+            assert json.loads(effective[key]) == json.loads(value)
+        else:
+            assert effective[key] == value
+    fast_matrix = ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    assert slug not in {item["key"] for item in fast_matrix["include"]}
+
+
 def test_resolve_and_validate_variant_overrides_and_policy_variant(
     tmp_path: Path,
 ) -> None:
@@ -1017,6 +1059,7 @@ def test_recipe_workflows_follow_security_and_shell_contracts() -> None:
         if step.get("id") == "recipe"
     )
     assert model_recipe["env"]["TIER"] == "model_sanity"
+    assert model_recipe["env"]["PRESET"] == "${{ matrix.model.preset || '' }}"
     pr_wf = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "ppu-build-and-test.yaml").read_text()
     )
@@ -1430,7 +1473,8 @@ def test_checked_in_recipe_matrix_doc_is_up_to_date() -> None:
     ]
     assert "| `deepseek-v4-mxfp4` |" not in legacy_section
     assert "| `glm-5.3-mxfp4-tp4` |" not in legacy_section
-    assert "| `deepseek-v4-mxfp4-dp-ep` |" in legacy_section
+    assert "| `deepseek-v4-mxfp4-dp-ep` |" not in legacy_section
+    assert "| `deepseek-v4-int8-dp-ep` |" in legacy_section
 
 
 def test_render_matrix_cli_check_passes_and_detects_drift(

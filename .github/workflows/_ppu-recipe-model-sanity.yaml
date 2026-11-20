@@ -158,6 +158,7 @@ jobs:
           RECIPE_PATH: ${{ matrix.model.recipe_path }}
           POLICY_PATH: ${{ matrix.model.policy_path }}
           TIER: model_sanity
+          PRESET: ${{ matrix.model.preset || '' }}
           PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
         run: |
           umask 077
@@ -259,6 +260,10 @@ jobs:
                   "minimum_score": number(accuracy.get("minimum_score"), -1, 2),
                   "maximum_score": number(accuracy.get("maximum_score"), -1, 2),
                   "gate": verdict(accuracy.get("within_band")),
+              },
+              "timings": {
+                  key: number(mapping(private.get("timings")).get(key), 0, 86400)
+                  for key in ("queue_s", "cold_start_s", "eval_s", "bench_s")
               },
               "baseline_completeness": baseline,
               "micro_e2e": verdict(private.get("micro_e2e_passed")),

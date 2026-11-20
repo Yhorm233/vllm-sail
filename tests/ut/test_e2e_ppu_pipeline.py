@@ -145,6 +145,7 @@ def test_scheduled_recipe_rejects_invalid_policy_claims(
 
     monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
     policy_dir = tmp_path / "tests/ppu/policy/models"
+    (policy_dir / "deepseek-v4-flash-dp-ep.yaml").unlink()
     path = policy_dir / "deepseek-v4-flash.yaml"
     policy = yaml.safe_load(path.read_text())
     policy["replaces_legacy_cases"] = [claim]
@@ -154,6 +155,26 @@ def test_scheduled_recipe_rejects_invalid_policy_claims(
     selected = select.build_accuracy_matrix(_catalog(), "")["include"]
     with pytest.raises(ValueError, match=error):
         select.scheduled_legacy_accuracy_cases(selected)
+
+
+def test_scheduled_recipe_dp_ep_removes_only_its_legacy_case(
+    tmp_path, monkeypatch
+) -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    (policy_dir / "deepseek-v4-flash-dp-ep.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    before_dp_ep = select.scheduled_legacy_accuracy_cases(selected)
+    retired = "deepseek-v4-mxfp4-dp-ep"
+    assert retired in before_dp_ep
+    assert remaining == [key for key in before_dp_ep if key != retired]
 
 
 @pytest.mark.parametrize(
