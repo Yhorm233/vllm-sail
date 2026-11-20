@@ -288,7 +288,7 @@ first run cannot silently become the baseline. Promote it by either:
 | `deepseek_v4_mxfp4` | 890p | 8 | `DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9689 seeded |
 | `minimax-m3-fp8` | 890p | 8 | `MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9735 seeded |
 | `glm_5_3_mxfp4` | 890p | 4 | `GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9689 seeded |
-| `glm_5_3_flash_mxfp4` | 890p | 2 | `GLM-5.3-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | none |
+| `glm_5_3_flash_mxfp4` | 890p | 2 | `GLM-5.3-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9697 measured |
 | `kimi_k2_6_mxfp4` | 890p | 8 | `Kimi-K2.6-MXFP4-FP8` | 0.9788 seeded |
 | `qwen3.8-flash-next` | 890p | 4 | `Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9742 seeded |
 
@@ -301,9 +301,9 @@ another TP without touching its baseline.
 real 810E host looks for `accuracy_deepseek_v4_int8_810e.json`, finds none,
 and gates on the threshold instead of the wrong board's band.
 
-`glm_5_3_flash_mxfp4` has no golden because the shared summary has no row for
-that weight. It runs on the `score >= 0.9` fallback and uploads a pending-review
-artifact; import the first one you accept. `qwen3.8-flash-next` is seeded from
+The `glm_5_3_flash_mxfp4` golden comes from the full 1,319-question
+[GSM8K capture on Zhenwu M890 TP2](https://github.com/vllm-project/vllm-sail/actions/runs/44549040525).
+`qwen3.8-flash-next` is seeded from
 the GSM8K number the checkpoint README publishes for this quantized export
 (97.42), measured under the same sampling contract this lane runs.
 

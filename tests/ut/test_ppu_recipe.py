@@ -98,6 +98,34 @@ def test_checked_in_recipes_and_policies_validate_cleanly() -> None:
     assert report["checked_flag_sets"] >= 10
 
 
+def test_glm53_flash_matches_legacy_tp2_and_default_fast_sanity() -> None:
+    recipe = RECIPES_DIR / "zai-org" / "GLM-5.3-Flash.yaml"
+    policy = POLICY_DIR / "models" / "glm-5.3-flash.yaml"
+    legacy = next(
+        case
+        for case in json.loads((CI_DIR / "ppu_e2e_models.json").read_text())
+        if case["key"] == "glm-5.3-flash-mxfp4-tp2"
+    )
+    resolved = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="model_sanity"
+    )
+    assert resolved["ppu_count"] == legacy["ppu_count"] == 2
+    assert resolved["hf_model_id"] == legacy["model_id"]
+    assert resolved["golden_model_key"] == legacy["model_key"]
+    assert {
+        flag: value
+        for flag, value, _ in ppu_recipe._parse_flag_entries(resolved["flags"])
+        if flag != "--enable-prefix-caching"
+    } == {
+        flag: value
+        for flag, value, _ in ppu_recipe._parse_flag_entries(legacy["server_cmd"][9:])
+    }
+    fast = ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    assert any(
+        item["key"] == "glm-5.3-flash" and item["ppu_count"] == 2 for item in fast
+    )
+
+
 def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
     recipe = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
     policy = POLICY_DIR / "models" / "glm-5.3.yaml"

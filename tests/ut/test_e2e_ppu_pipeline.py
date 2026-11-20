@@ -174,6 +174,24 @@ def test_qwen_smoke_catalog_targets_both_boards(key: str, board: str) -> None:
     assert qwen["extra_serve_flags"] == "--trust-remote-code"
 
 
+def test_scheduled_recipe_replaces_only_the_glm53_flash_legacy_case(
+    tmp_path, monkeypatch
+) -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    (tmp_path / "tests/ppu/policy/models/glm-5.3-flash.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    legacy = "glm-5.3-flash-mxfp4-tp2"
+    without_flash = select.scheduled_legacy_accuracy_cases(selected)
+    assert legacy in without_flash
+    assert remaining == [case for case in without_flash if case != legacy]
+
+
 def test_accuracy_catalog_keeps_model_ids_and_per_model_card_count() -> None:
     accuracy = {
         entry["key"]: entry for entry in _catalog() if entry["category"] == "accuracy"
@@ -596,20 +614,25 @@ def test_sibling_cases_over_one_weight_share_the_contract() -> None:
     assert len(contracts) == 1
 
 
-def test_golden_coverage_names_the_weight_without_a_baseline() -> None:
-    """Every accuracy weight has a golden except the one with no reference.
-
-    GLM-5.3-Flash is deliberately absent: the shared GSM8K summary has no row
-    for it, so the case runs on the threshold gate and uploads a
-    pending-review artifact until a real number exists.
-    """
+def test_accuracy_catalog_checkpoints_have_goldens() -> None:
     covered = {
         json.loads(path.read_text())["model"] for path in GOLDEN.glob("accuracy_*.json")
     }
     catalog_keys = {
         entry["model_key"] for entry in _catalog() if entry["category"] == "accuracy"
     }
-    assert covered == catalog_keys - {"glm_5_3_flash_mxfp4"}
+    assert covered == catalog_keys
+
+
+def test_glm_flash_890p_golden_uses_a_logical_dataset_id() -> None:
+    record = json.loads((GOLDEN / "accuracy_glm_5_3_flash_mxfp4_890p.json").read_text())
+    assert record["dataset"]["dataset_id"] == "gsm8k@2026-11"
+    assert record["dataset"]["num_expected"] == 1319
+    assert record["tolerance"] == {"mode": "band", "abs": 0.02}
+    assert (
+        round(record["score"] * record["dataset"]["num_expected"])
+        == record["score_num"]
+    )
 
 
 def test_accuracy_matrix_rejects_entry_without_model_key() -> None:
