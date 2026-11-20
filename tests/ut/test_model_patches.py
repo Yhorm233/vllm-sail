@@ -47,6 +47,7 @@ EXPECTED_MODULES = {
     "deepseek_v41_int8",
     "deepseek_v41_mega_mhc",
     "glm5_next",
+    "glm5_next_indexer",
     "glm5_next_mtp",
     "kimi_k3",
     "llama4",
@@ -714,9 +715,9 @@ def test_step5_store_value_modes_on_cpu(dtype):
     torch = pytest.importorskip("torch")
     namespace = dict(
         tl=SimpleNamespace(float16=torch.float16),
-        encode_e4m3=lambda x: x.clamp(-448, 448)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8),
+        encode_e4m3=lambda x: (
+            x.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+        ),
         e4m3_to_fp16=lambda x: x.view(torch.float8_e4m3fn).to(torch.float16),
     )
     _load_step5_soft_bodies(["_indexer_store_value"], namespace)

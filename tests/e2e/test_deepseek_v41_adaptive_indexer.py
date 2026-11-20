@@ -64,6 +64,101 @@ def test_adaptive_indexer_backend_gate():
     assert get_query_lens_mismatch_unsupported_backend([[group]]) is None
 
 
+def _replay_flattened_logits(compute, q, cache, weights, compress_ratio, table_cpu):
+    """Rebuild step metadata before replay, as the V2 target runner does."""
+    import torch
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+
+    from vllm_sail.utils.deep_gemm import get_num_sms
+
+    capacity = q.shape[0]
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=True)
+    )
+    builder.supports_varlen = builder.indexer_uses_fp4 = False
+    builder.use_flattening = True
+    builder.num_speculative_tokens = 5
+    builder.decode_threshold = 6
+    builder.use_pcp = False
+    builder.pcp_world_size = builder.dcp_world_size = 1
+    builder.cp_kv_cache_interleave_size = 1
+    builder.compress_ratio = compress_ratio
+    builder.indexer_n_head, builder.indexer_q_head_dim = q.shape[-2:]
+    builder.kv_cache_spec = SimpleNamespace(num_states=cache.shape[1])
+    builder.num_sms = get_num_sms()
+    builder.scheduler_metadata_buffer = torch.empty(
+        (builder.num_sms * 8 + 1, 2), dtype=torch.int32, device=q.device
+    )
+    builder.decode_seq_lens_buffer = torch.zeros(
+        capacity, dtype=torch.int32, device=q.device
+    )
+    builder.decode_lens_buffer = torch.zeros_like(builder.decode_seq_lens_buffer)
+    builder.per_req_decode_lens_buffer = torch.zeros_like(
+        builder.decode_seq_lens_buffer
+    )
+    builder.expanded_block_table_buffer = table_cpu.new_zeros(
+        (capacity, table_cpu.shape[1]), device=q.device
+    )
+    builder.arange_buffer = torch.arange(capacity, dtype=torch.int32, device=q.device)
+    builder.compressed_slot_mapping_buffer = torch.empty(
+        capacity, dtype=torch.int64, device=q.device
+    )
+    context = torch.tensor([127, 185], dtype=torch.int32, device=q.device)
+    starts_cpu = torch.zeros(3, dtype=torch.int32)
+    starts = starts_cpu.to(q.device)
+    seq_lens = torch.empty_like(context)
+    common = CommonAttentionMetadata(
+        query_start_loc=starts,
+        query_start_loc_cpu=starts_cpu,
+        seq_lens=seq_lens,
+        num_reqs=2,
+        num_actual_tokens=capacity,
+        max_query_len=6,
+        max_seq_len=256,
+        block_table_tensor=table_cpu.to(q.device),
+        slot_mapping=torch.full((capacity,), -1, dtype=torch.int64, device=q.device),
+    )
+
+    def prepare(host_counts, device_counts):
+        assert sum(host_counts) == sum(device_counts)
+        starts_cpu[1:].copy_(torch.tensor(host_counts).cumsum(0))
+        starts[1:].copy_(torch.tensor(device_counts).cumsum(0))
+        seq_lens.copy_(context + torch.tensor(device_counts, device=q.device))
+        decode = builder.build(0, common).decode
+        assert decode is not None and not decode.requires_padding
+        assert decode.indices is None
+        return decode
+
+    def inputs(decode):
+        return decode.seq_lens, decode.block_table, decode.schedule_metadata
+
+    def forward(decode):
+        return compute(q, cache, weights, *inputs(decode), 256, False)
+
+    steps = [((3, 3), (5, 1)), ((3, 3), (1, 5)), ((2, 1), (1, 2))]
+    captured = prepare(*steps[0])
+    forward(captured)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logits = forward(captured)
+    for host_counts, device_counts in steps:
+        decode = prepare(host_counts, device_counts)
+        assert [tensor.data_ptr() for tensor in inputs(decode)] == [
+            tensor.data_ptr() for tensor in inputs(captured)
+        ]
+        graph.replay()
+        yield (
+            device_counts,
+            decode.seq_lens.cpu(),
+            decode.block_table.cpu(),
+            decode.decode_lens.cpu(),
+            logits.cpu(),
+        )
+
+
 @pytest.mark.parametrize("compress_ratio", [1, 2])
 def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
     import torch
@@ -75,41 +170,15 @@ def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
-    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+    from vllm_sail.utils.deep_gemm import fp8_paged_mqa_logits
 
-    from vllm_sail.utils.deep_gemm import (
-        fp8_paged_mqa_logits,
-        get_num_sms,
-        get_paged_mqa_logits_metadata,
-    )
-
-    # Same total budget; CPU plans [3,3], device reallocates to [5,1] or [1,5].
     # Use the real V4.1 cache spec/backend/allocation path. Hard-coding a
     # 64-row tensor here hid the model's unsupported 128-row C1 pages.
-    capacity, tokens, heads, dim = 8, 6, 64, 128
+    capacity, heads, dim = 8, 64, 128
     cache = _allocate_v41_indexer_cache(compress_ratio, dim)
     block_size = cache.shape[1]
     assert block_size == 64
-    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
-    builder.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(enable_adaptive_verification=True)
-    )
-    builder.supports_varlen = False
-    builder.decode_seq_lens_buffer = torch.zeros(
-        capacity, dtype=torch.int32, device="cuda"
-    )
-    builder.decode_lens_buffer = torch.zeros(capacity, dtype=torch.int32, device="cuda")
-    builder.expanded_block_table_buffer = torch.zeros(
-        capacity, 4, dtype=torch.int32, device="cuda"
-    )
-    builder.arange_buffer = torch.arange(capacity, dtype=torch.int32, device="cuda")
-    cpu_lens = torch.tensor([3, 3], dtype=torch.int32)
-    lens = torch.tensor([5, 1], dtype=torch.int32, device="cuda")
-    starts = torch.tensor([0, 5], dtype=torch.int32, device="cuda")
-    context = torch.tensor([127, 185], dtype=torch.int32, device="cuda")
-    seq_lens = context + lens
     table_cpu = torch.tensor([[4, 0, 6, 2], [5, 1, 7, 3]], dtype=torch.int32)
-    table = table_cpu.cuda()
     generator = torch.Generator().manual_seed(83)
     q_cpu = (torch.randn(capacity, 1, heads, dim, generator=generator) / 8).to(
         torch.float8_e4m3fn
@@ -125,46 +194,11 @@ def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
     )
     cache.copy_(packed.reshape(8, block_size, 1, dim + 4))
     q, weights = q_cpu.cuda(), weight_cpu.cuda()
-    sms = get_num_sms()
 
-    def step():
-        ends, blocks, lengths, batch, padding = builder._prepare_decode_tensors(
-            seq_lens,
-            table,
-            lens,
-            cpu_lens,
-            starts,
-            num_decodes=2,
-            num_decode_tokens=capacity,
-            use_native=False,
-            next_n=6,
-            max_decode_len=3,
-        )
-        assert batch == capacity and not padding
-        ends = (ends // compress_ratio).unsqueeze(-1)
-        schedule = get_paged_mqa_logits_metadata(ends, block_size, sms, None)
-        # Match the model: 2D context lengths require external top-k masking.
-        # The logits kernel only promises values within each visible prefix.
-        logits = fp8_paged_mqa_logits(
-            q, cache, weights, ends, blocks, schedule, 256, False
-        )
-        return ends, blocks, lengths, logits
-
-    # Compile first, then capture and replay with changed device-only boundaries.
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        step()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = step()
-    for device_lens in ([5, 1], [1, 5]):
-        lens.copy_(torch.tensor(device_lens, dtype=torch.int32))
-        starts.copy_(torch.tensor([0, device_lens[0]], dtype=torch.int32))
-        seq_lens.copy_(context + lens)
-        graph.replay()
-        ends, blocks, lengths, logits = (tensor.cpu() for tensor in actual)
+    for device_lens, ends, blocks, lengths, logits in _replay_flattened_logits(
+        fp8_paged_mqa_logits, q, cache, weights, compress_ratio, table_cpu
+    ):
+        tokens = sum(device_lens)
         expected_ends, request_ids = [], []
         for req, count in enumerate(device_lens):
             base = (127, 185)[req]
@@ -195,41 +229,15 @@ def test_int8_device_lengths_flattened_logits_graph_replay(compress_ratio):
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
-    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+    from vllm_sail.utils.deep_gemm import int8_paged_mqa_logits
 
-    from vllm_sail.utils.deep_gemm import (
-        get_num_sms,
-        get_paged_mqa_logits_metadata,
-        int8_paged_mqa_logits,
-    )
-
-    # Same total budget; CPU plans [3,3], device reallocates to [5,1] or [1,5].
     # Use the real V4.1 cache spec/backend/allocation path. Hard-coding a
     # 64-row tensor here hid the model's unsupported 128-row C1 pages.
-    capacity, tokens, heads, dim = 8, 6, 64, 128
+    capacity, heads, dim = 8, 64, 128
     cache = _allocate_v41_indexer_cache(compress_ratio, dim)
     block_size = cache.shape[1]
     assert block_size == 64
-    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
-    builder.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(enable_adaptive_verification=True)
-    )
-    builder.supports_varlen = False
-    builder.decode_seq_lens_buffer = torch.zeros(
-        capacity, dtype=torch.int32, device="cuda"
-    )
-    builder.decode_lens_buffer = torch.zeros(capacity, dtype=torch.int32, device="cuda")
-    builder.expanded_block_table_buffer = torch.zeros(
-        capacity, 4, dtype=torch.int32, device="cuda"
-    )
-    builder.arange_buffer = torch.arange(capacity, dtype=torch.int32, device="cuda")
-    cpu_lens = torch.tensor([3, 3], dtype=torch.int32)
-    lens = torch.tensor([5, 1], dtype=torch.int32, device="cuda")
-    starts = torch.tensor([0, 5], dtype=torch.int32, device="cuda")
-    context = torch.tensor([127, 185], dtype=torch.int32, device="cuda")
-    seq_lens = context + lens
     table_cpu = torch.tensor([[4, 0, 6, 2], [5, 1, 7, 3]], dtype=torch.int32)
-    table = table_cpu.cuda()
     generator = torch.Generator().manual_seed(83)
     q_cpu = torch.randint(
         -16, 17, (capacity, 1, heads, dim), generator=generator, dtype=torch.int8
@@ -248,53 +256,11 @@ def test_int8_device_lengths_flattened_logits_graph_replay(compress_ratio):
     )
     cache.copy_(packed.reshape(8, block_size, 1, dim + 4))
     q, weights = q_cpu.cuda(), weight_cpu.cuda()
-    sms = get_num_sms()
 
-    def step():
-        ends, blocks, lengths, batch, padding = builder._prepare_decode_tensors(
-            seq_lens,
-            table,
-            lens,
-            cpu_lens,
-            starts,
-            num_decodes=2,
-            num_decode_tokens=capacity,
-            use_native=False,
-            next_n=6,
-            max_decode_len=3,
-        )
-        assert batch == capacity and not padding
-        ends = (ends // compress_ratio).unsqueeze(-1)
-        schedule = get_paged_mqa_logits_metadata(ends, block_size, sms, None)
-        # Match the model: 2D context lengths require external top-k masking.
-        # The logits kernel only promises values within each visible prefix.
-        logits = int8_paged_mqa_logits(
-            q,
-            cache,
-            weights,
-            ends,
-            blocks,
-            schedule,
-            256,
-            False,
-        )
-        return ends, blocks, lengths, logits
-
-    # Compile first, then capture and replay with changed device-only boundaries.
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        step()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = step()
-    for device_lens in ([5, 1], [1, 5]):
-        lens.copy_(torch.tensor(device_lens, dtype=torch.int32))
-        starts.copy_(torch.tensor([0, device_lens[0]], dtype=torch.int32))
-        seq_lens.copy_(context + lens)
-        graph.replay()
-        ends, blocks, lengths, logits = (tensor.cpu() for tensor in actual)
+    for device_lens, ends, blocks, lengths, logits in _replay_flattened_logits(
+        int8_paged_mqa_logits, q, cache, weights, compress_ratio, table_cpu
+    ):
+        tokens = sum(device_lens)
         expected_ends, request_ids = [], []
         for req, count in enumerate(device_lens):
             base = (127, 185)[req]

@@ -464,25 +464,16 @@ def ppu_sparse_attn_indexer(
                 decode_weights = pack_seq_triton(
                     decode_weights, decode_lens, pad_value=0
                 ).reshape(num_padded_tokens, -1)
-            contexts, tables, request_ids = _paged_decode_rows(
+            contexts, tables, request_ids, schedule = _paged_decode_inputs(
+                decode_metadata,
                 seq_lens,
-                decode_metadata.block_table,
                 decode_lens,
                 next_n,
-                decode_metadata.indices,
-                decode_metadata.per_req_decode_lens,
-            )
-            schedule = get_paged_mqa_logits_metadata(
-                contexts,
                 kv_cache.shape[1],
-                get_num_sms(),
-                (
-                    1,
-                    padded_q_quant_cast.shape[-2],
-                    head_dim,
-                    torch.int8 if use_fp4_cache else q_dtype,
-                ),
-                indices=request_ids if use_fp4_cache else None,
+                padded_q_quant_cast.shape[-2],
+                head_dim,
+                q_dtype,
+                use_fp4_cache,
             )
             flat_q = padded_q_quant_cast.reshape(
                 num_padded_tokens, 1, *padded_q_quant_cast.shape[2:]
@@ -644,8 +635,72 @@ def _use_deep_select(logits, topk, backend):
     return backend in ("auto", "deep_select") and supported
 
 
+def _paged_decode_inputs(
+    metadata, seq_lens, decode_lens, next_n, page_size, heads, head_dim, q_dtype, fp4
+):
+    """Reuse a schedule only for the matching builder-owned decode layout."""
+    num_sms = get_num_sms()
+    geometry = (1, heads, head_dim, torch.int8 if fp4 else q_dtype)
+    tables = metadata.block_table
+    rows = decode_lens.shape[0]
+    indices = metadata.indices if fp4 else None
+    if (
+        getattr(metadata, "_sail_paged_schedule_key", None)
+        == (page_size, num_sms, geometry, fp4)
+        and next_n == 1
+        and not metadata.requires_padding
+        and seq_lens.shape == (rows, 1)
+        and seq_lens.is_contiguous()
+        and tables.shape[0] == rows
+        and tables.is_contiguous()
+        and current_platform.is_ppu()
+    ):
+        if not fp4 and q_dtype == torch.int8:
+            if current_platform.is_device_capability((8, 0)):
+                return seq_lens, tables, None, metadata.schedule_metadata
+        elif (
+            (fp4 or q_dtype == torch.float8_e4m3fn)
+            and current_platform.is_device_capability(89)
+            and (
+                not fp4
+                or (
+                    indices is not None
+                    and indices.shape == (rows,)
+                    and indices.is_contiguous()
+                )
+            )
+        ):
+            return (
+                seq_lens,
+                tables,
+                indices,
+                metadata.schedule_metadata,
+            )
+
+    contexts, tables, request_ids = _paged_decode_rows(
+        seq_lens,
+        tables,
+        decode_lens,
+        next_n,
+        indices,
+        metadata.per_req_decode_lens,
+        need_request_ids=fp4,
+    )
+    schedule = get_paged_mqa_logits_metadata(
+        contexts, page_size, num_sms, geometry, indices=request_ids if fp4 else None
+    )
+    return contexts, tables, request_ids if fp4 else None, schedule
+
+
 def _paged_decode_rows(
-    seq_lens, block_table, decode_lens, next_n, indices, per_req_decode_lens=None
+    seq_lens,
+    block_table,
+    decode_lens,
+    next_n,
+    indices,
+    per_req_decode_lens=None,
+    *,
+    need_request_ids=True,
 ):
     """Request-major [Q,1] rows, including safe, separately labelled padding."""
     batch = decode_lens.shape[0]
@@ -668,6 +723,13 @@ def _paged_decode_rows(
     valid = positions.unsqueeze(0) < decode_lens.reshape(batch, 1)
     contexts = torch.where(valid, contexts, 0).reshape(-1, 1).contiguous()
     rows = batch * next_n
+    tables = block_table.repeat_interleave(next_n, dim=0)
+    if not need_request_ids:
+        if next_n == 1 and per_req_decode_lens is not None:
+            valid_rows = torch.arange(rows, device=device) < per_req_decode_lens.sum()
+            contexts = torch.where(valid_rows[:, None], contexts, 0)
+        return contexts, tables, None
+
     if indices is None and next_n == 1 and per_req_decode_lens is not None:
         # The non-varlen upstream flattening path replaces decode_lens by
         # ones, but retains original verify counts separately. Recover true
@@ -689,7 +751,6 @@ def _paged_decode_rows(
     # padding without colliding with any real request, even after flattening.
     dummy_ids = -1 - torch.arange(rows, device=device, dtype=torch.int32)
     request_ids = torch.where(valid.reshape(-1), request_ids, dummy_ids).contiguous()
-    tables = block_table.repeat_interleave(next_n, dim=0)
     return contexts, tables, request_ids
 
 

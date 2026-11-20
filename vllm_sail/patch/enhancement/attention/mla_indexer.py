@@ -20,9 +20,9 @@ helpers, new parameters, refactors) cannot break this plugin.
 * Prefill chunking keeps upstream's FP32 budget. This is conservative for
   dense BF16 logits; the candidate-sparse backend already accounts for BF16
   in its split sequence lengths and must not have that saving applied twice.
-* PPU SM89 uses upstream's device-built varlen query rows and request IDs.
-  The SAIL adapter passes those expanded rows to its next_n=1 logits API.
-  Flattened device query lengths remain supported on legacy PPU too.
+* PPU MXFP4 uses upstream's SM100 varlen builder and its request IDs.
+  Legacy FP8/INT8 use upstream's non-varlen rows, including the SM90-style
+  flattening path for adaptive verification.
 * ``DeepseekV32IndexerMetadataBuilder.__init__`` delegates to upstream, then
   adds the fork's PPU-only state: ``indexer_n_head``/``indexer_q_head_dim``
   from the KV-cache spec, the SM count from PPU DeepGEMM, and the enlarged
@@ -48,8 +48,8 @@ import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla import indexer as _indexer_module
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
     DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerMetadataBuilder,
 )
 
 import vllm_sail.utils.deep_gemm as _ppu_deep_gemm
@@ -100,16 +100,13 @@ def _ppu_paged_metadata(
     if metadata_extra is None:
         # PPU declares PlatformEnum.CUDA, so upstream's decode build does reach
         # its is_cuda() block and calls this helper without metadata_extra.
-        # Derive the SAIL tuple from the builder inside build. The execution
-        # path regenerates the schedule after Q packing for graph replay.
+        # Derive the SAIL tuple from the builder inside build.
         # Every PPU-reachable call
         # site (build and update_draft_decode_metadata) runs behind a wrapper
         # that puts its builder on the stack.
         n_head = getattr(builder, "indexer_n_head", 0) if builder else 0
         if n_head > 0:
-            heads_per_token = (
-                context_lens.shape[1] if context_lens.dim() == 2 else 1
-            )
+            heads_per_token = context_lens.shape[1] if context_lens.dim() == 2 else 1
             metadata_extra = (
                 heads_per_token,
                 n_head,
@@ -120,10 +117,10 @@ def _ppu_paged_metadata(
                     else current_platform.fp8_dtype()
                 ),
             )
+    has_varlen_ids = indices is not None
     if metadata_extra is not None:
         # 4869f1e weighted metadata uses next_n=1; MXFP4 also needs request
-        # ownership. Compute regenerates the used schedule after packing Q so a
-        # graph replay also observes current contexts and padding lengths.
+        # ownership.
         batch = context_lens.shape[0]
         next_n = context_lens.shape[1] if context_lens.ndim == 2 else 1
         if weighted_fp4 and indices is None:
@@ -137,15 +134,29 @@ def _ppu_paged_metadata(
                 ).repeat_interleave(next_n)
         context_lens = context_lens.reshape(-1, 1).contiguous()
         metadata_extra = (1, *metadata_extra[1:])
-    # Legacy FP8/INT8 kernels do not accept request grouping. Their context
-    # and block-table rows are still expanded per query by compute.
+    # Legacy FP8/INT8 kernels do not accept request grouping.
     if not weighted_fp4:
         indices = None
     if metadata_extra is None:
         raise ValueError("SAIL paged DSA metadata requires indexer query head geometry")
-    return _ppu_deep_gemm.get_paged_mqa_logits_metadata(
+    schedule = _ppu_deep_gemm.get_paged_mqa_logits_metadata(
         context_lens, block_size, num_sms, metadata_extra, indices=indices
     )
+    if builder is not None and (
+        (weighted_fp4 and getattr(builder, "supports_varlen", False) and has_varlen_ids)
+        or (
+            getattr(builder, "use_flattening", False)
+            and not weighted_fp4
+            and metadata_extra[-1] in (torch.int8, current_platform.fp8_dtype())
+        )
+    ):
+        builder._sail_paged_schedule_key = (
+            block_size,
+            num_sms,
+            metadata_extra,
+            weighted_fp4,
+        )
+    return schedule
 
 
 patch(
@@ -241,7 +252,9 @@ def dsa_indexer_uses_fp4(vllm_config):
     model_config = vllm_config.model_config
     hf_config = model_config.hf_text_config
     supports_fp4 = hf_config.model_type in (
-        "deepseek_v4", "deepseek_v41", "deepseek_v41_text"
+        "deepseek_v4",
+        "deepseek_v41",
+        "deepseek_v41_text",
     )
     # sm_89 (Zhenwu M890) defaults these models to the MXFP4 indexer
     # cache. It halves the per-token K cache (132B -> 68B) and keeps the whole
@@ -288,6 +301,13 @@ for _consumer_name in (
 _upstream_builder_init = DeepseekV32IndexerMetadataBuilder.__init__
 
 
+def _select_paged_decode_layout(builder):
+    """Use the upstream non-varlen flattening path for legacy SAIL logits."""
+    if builder.supports_varlen and not builder.indexer_uses_fp4:
+        builder.supports_varlen = False
+        builder.use_flattening = True
+
+
 def _builder_init_wrapper(self, *args, **kwargs) -> None:
     """Delegate to upstream, then add the fork's PPU-only builder state."""
     _upstream_builder_init(self, *args, **kwargs)
@@ -297,6 +317,7 @@ def _builder_init_wrapper(self, *args, **kwargs) -> None:
 
     if not current_platform.is_ppu():
         return
+    _select_paged_decode_layout(self)
     hf_config = self.vllm_config.model_config.hf_text_config
     self.indexer_n_head = getattr(self.kv_cache_spec, "indexer_n_head", 0) or getattr(
         hf_config, "index_n_heads", 0
@@ -344,7 +365,9 @@ def _decode_request_ids(context_lens, request_lens, flattened):
     rows = context_lens.numel()
     row = torch.arange(rows, device=context_lens.device, dtype=torch.int32)
     if flattened:
-        ids = torch.searchsorted(request_lens.cumsum(0), row, right=True).to(torch.int32)
+        ids = torch.searchsorted(request_lens.cumsum(0), row, right=True).to(
+            torch.int32
+        )
         valid = ids < request_lens.numel()
     else:
         next_n = context_lens.shape[1] if context_lens.ndim == 2 else 1
@@ -418,14 +441,20 @@ def _build_wrapper(
     Upstream owns the whole step build, including the fp4 paged-MQA-logits
     scheduler metadata: PPU declares ``PlatformEnum.CUDA``, so its decode
     block runs here and the rebound ``get_paged_mqa_logits_metadata`` adds the
-    fork's ``metadata_extra`` itself.
+    fork's ``metadata_extra`` itself. Always-flattened and varlen decode
+    publish stable row buffers; draft refresh updates them and the schedule
+    in place.
     """
     self._sail_decode_request_ids = None
+    self._sail_paged_schedule_key = None
     _current_builder.append(self)
     try:
-        return _upstream_build(
+        metadata = _upstream_build(
             self, common_prefix_len, common_attn_metadata, fast_build
         )
+        if self._sail_paged_schedule_key is not None and metadata.decode is not None:
+            metadata.decode._sail_paged_schedule_key = self._sail_paged_schedule_key
+        return metadata
     finally:
         _current_builder.pop()
         self._sail_decode_request_ids = None

@@ -86,10 +86,10 @@ def _register_chain(
     for parent_name, child_name in zip(chain, chain[1:], strict=False):
         parent = modules[parent_name]
         attribute = child_name.rpartition(".")[2]
-        if hasattr(parent, attribute):
-            monkeypatch.setattr(parent, attribute, modules[child_name])
-        else:
-            setattr(parent, attribute, modules[child_name])
+        # Force the binding: with real vLLM already imported, a from-import
+        # resolves through the parent's attribute and would bypass the stub
+        # leaf in sys.modules entirely.
+        monkeypatch.setattr(parent, attribute, modules[child_name], raising=False)
 
 
 class _StubState:
@@ -230,6 +230,9 @@ def _build_stub_vllm(
         def apply_vllm_mapper(self, mapper):
             pass
 
+    class GptOssMxfp4Config(Mxfp4Config):
+        pass
+
     class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         def __init__(self, moe):
             super().__init__(moe)
@@ -252,6 +255,7 @@ def _build_stub_vllm(
 
     quant_mxfp4 = types.ModuleType("vllm.model_executor.layers.quantization.mxfp4")
     quant_mxfp4.Mxfp4Config = Mxfp4Config  # type: ignore[attr-defined]
+    quant_mxfp4.GptOssMxfp4Config = GptOssMxfp4Config  # type: ignore[attr-defined]
     quant_mxfp4.GptOssMxfp4MoEMethod = GptOssMxfp4MoEMethod  # type: ignore[attr-defined]
     quant_mxfp4.Mxfp4MoEMethod = Mxfp4MoEMethod  # type: ignore[attr-defined]
     quant_mxfp4._use_k3_situ_aiter = _use_k3_situ_aiter  # type: ignore[attr-defined]
@@ -387,6 +391,19 @@ def test_config_init_and_from_config(
     assert config.ignored_layers == ["mtp"]
     assert config.fp8_channelwise_layers == []
     _Platform.ppu = True
+
+    # ple_quant_scheme rides along for bugfix/qwen4_exp_ple_quant_scheme;
+    # upstream from_config drops it, and one patch per target means this
+    # replacement is the only place to attach it.
+    config = Mxfp4Config.from_config({"ple_quant_scheme": "fp8_pertensor"})
+    assert config.ple_quant_scheme == "fp8_pertensor"
+    assert not hasattr(Mxfp4Config.from_config({}), "ple_quant_scheme")
+    assert not hasattr(Mxfp4Config.from_config(None), "ple_quant_scheme")
+    # The classmethod delegation must keep the caller's cls.
+    subclass = modules["quant_mxfp4"].GptOssMxfp4Config
+    oss = subclass.from_config({"ple_quant_scheme": "fp8_pertensor"})
+    assert type(oss) is subclass
+    assert oss.ple_quant_scheme == "fp8_pertensor"
 
 
 @pytest.mark.requires_runtime

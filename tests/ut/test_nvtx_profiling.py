@@ -137,6 +137,9 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         def execute_model(
             self, scheduler_output, intermediate_tensors=None, dummy_run=False, **kw
         ):
+            callback = getattr(self, "execute_callback", None)
+            if callback is not None:
+                return callback()
             return ("execute_model", scheduler_output, dummy_run)
 
     class EngineCore:
@@ -182,23 +185,23 @@ def fake_vllm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         EngineCore=EngineCore,
         Scheduler=Scheduler,
         originals={
-            "GPUModelRunner.__init__": GPUModelRunner.__init__,
-            "GPUModelRunner._prepare_inputs": GPUModelRunner._prepare_inputs,
-            "GPUModelRunner._sample": GPUModelRunner._sample,
-            "GPUModelRunner._model_forward": GPUModelRunner._model_forward,
-            "GPUModelRunner.execute_model": GPUModelRunner.execute_model,
-            "gpu.model_runner.GPUModelRunner.prepare_inputs": (
+            "vllm.v1.worker.gpu_model_runner.GPUModelRunner.__init__": GPUModelRunner.__init__,
+            "vllm.v1.worker.gpu_model_runner.GPUModelRunner._prepare_inputs": GPUModelRunner._prepare_inputs,
+            "vllm.v1.worker.gpu_model_runner.GPUModelRunner._sample": GPUModelRunner._sample,
+            "vllm.v1.worker.gpu_model_runner.GPUModelRunner._model_forward": GPUModelRunner._model_forward,
+            "vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model": GPUModelRunner.execute_model,
+            "vllm.v1.worker.gpu.model_runner.GPUModelRunner.prepare_inputs": (
                 GPUModelRunnerV2.prepare_inputs
             ),
-            "gpu.model_runner.GPUModelRunner.sample": GPUModelRunnerV2.sample,
-            "gpu.model_runner.GPUModelRunner.execute_model": (
+            "vllm.v1.worker.gpu.model_runner.GPUModelRunner.sample": GPUModelRunnerV2.sample,
+            "vllm.v1.worker.gpu.model_runner.GPUModelRunner.execute_model": (
                 GPUModelRunnerV2.execute_model
             ),
-            "EngineCore.__init__": EngineCore.__init__,
-            "EngineCore.step": EngineCore.step,
-            "EngineCore.step_with_batch_queue": EngineCore.step_with_batch_queue,
-            "Scheduler.schedule": Scheduler.schedule,
-            "Scheduler._update_after_schedule": Scheduler._update_after_schedule,
+            "vllm.v1.engine.core.EngineCore.__init__": EngineCore.__init__,
+            "vllm.v1.engine.core.EngineCore.step": EngineCore.step,
+            "vllm.v1.engine.core.EngineCore.step_with_batch_queue": EngineCore.step_with_batch_queue,
+            "vllm.v1.core.sched.scheduler.Scheduler.schedule": Scheduler.schedule,
+            "vllm.v1.core.sched.scheduler.Scheduler._update_after_schedule": Scheduler._update_after_schedule,
         },
     )
 
@@ -260,23 +263,36 @@ def profiling_pkg(fake_vllm: SimpleNamespace, monkeypatch: pytest.MonkeyPatch):
     return module
 
 
-@pytest.fixture
+@pytest.fixture(params=[False, True], ids=["plain", "dp-scope-first"])
 def installed(
     profiling_pkg,
     nvtx_stub: dict[str, list],
     monkeypatch: pytest.MonkeyPatch,
     fake_vllm: SimpleNamespace,
+    request: pytest.FixtureRequest,
 ):
     """Run install() with the gate on and return the faked targets."""
     monkeypatch.setenv("VLLM_PPU_NVTX_PROFILE", "1")
-    registry_before = len(PATCH_REGISTRY)
-    profiling_pkg.install()
-    return SimpleNamespace(
-        pkg=profiling_pkg,
-        fakes=fake_vllm,
-        nvtx_calls=nvtx_stub,
-        registry_before=registry_before,
-    )
+    saved_registry = PATCH_REGISTRY[:]
+    PATCH_REGISTRY.clear()
+    try:
+        if request.param:
+            from vllm_sail.patch.bugfix import dp_idle_mtp_dummy_batch
+
+            dp_idle_mtp_dummy_batch._install_execute_model_scope()
+            fake_vllm.originals[
+                "vllm.v1.worker.gpu.model_runner.GPUModelRunner.execute_model"
+            ] = fake_vllm.GPUModelRunnerV2.execute_model
+        registry_before = len(PATCH_REGISTRY)
+        profiling_pkg.install()
+        yield SimpleNamespace(
+            pkg=profiling_pkg,
+            fakes=fake_vllm,
+            nvtx_calls=nvtx_stub,
+            registry_before=registry_before,
+        )
+    finally:
+        PATCH_REGISTRY[:] = saved_registry
 
 
 def _records_for(targets) -> dict[str, Any]:
@@ -311,29 +327,28 @@ def test_gate_on_installs_every_patch(installed) -> None:
 
     fakes = installed.fakes
     replacements = {
-        "GPUModelRunner.__init__": fakes.GPUModelRunner.__init__,
-        "GPUModelRunner._prepare_inputs": fakes.GPUModelRunner._prepare_inputs,
-        "GPUModelRunner._sample": fakes.GPUModelRunner._sample,
-        "GPUModelRunner._model_forward": fakes.GPUModelRunner._model_forward,
-        "GPUModelRunner.execute_model": fakes.GPUModelRunner.execute_model,
-        "gpu.model_runner.GPUModelRunner.prepare_inputs": (
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner.__init__": fakes.GPUModelRunner.__init__,
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner._prepare_inputs": fakes.GPUModelRunner._prepare_inputs,
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner._sample": fakes.GPUModelRunner._sample,
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner._model_forward": fakes.GPUModelRunner._model_forward,
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model": fakes.GPUModelRunner.execute_model,
+        "vllm.v1.worker.gpu.model_runner.GPUModelRunner.prepare_inputs": (
             fakes.GPUModelRunnerV2.prepare_inputs
         ),
-        "gpu.model_runner.GPUModelRunner.sample": fakes.GPUModelRunnerV2.sample,
-        "gpu.model_runner.GPUModelRunner.execute_model": (
+        "vllm.v1.worker.gpu.model_runner.GPUModelRunner.sample": fakes.GPUModelRunnerV2.sample,
+        "vllm.v1.worker.gpu.model_runner.GPUModelRunner.execute_model": (
             fakes.GPUModelRunnerV2.execute_model
         ),
-        "EngineCore.__init__": fakes.EngineCore.__init__,
-        "EngineCore.step": fakes.EngineCore.step,
-        "EngineCore.step_with_batch_queue": fakes.EngineCore.step_with_batch_queue,
-        "Scheduler.schedule": fakes.Scheduler.schedule,
-        "Scheduler._update_after_schedule": fakes.Scheduler._update_after_schedule,
+        "vllm.v1.engine.core.EngineCore.__init__": fakes.EngineCore.__init__,
+        "vllm.v1.engine.core.EngineCore.step": fakes.EngineCore.step,
+        "vllm.v1.engine.core.EngineCore.step_with_batch_queue": fakes.EngineCore.step_with_batch_queue,
+        "vllm.v1.core.sched.scheduler.Scheduler.schedule": fakes.Scheduler.schedule,
+        "vllm.v1.core.sched.scheduler.Scheduler._update_after_schedule": fakes.Scheduler._update_after_schedule,
     }
-    for key, replacement in replacements.items():
-        assert getattr(replacement, PATCH_MARKER, None) is not None, key
-        assert replacement is not fakes.originals[key], key
-        target = records[[t for t in records if t.endswith(key)][0]].target
-        assert original_of(replacement, target) is fakes.originals[key], key
+    for target, replacement in replacements.items():
+        assert target in records
+        assert replacement is not fakes.originals[target], target
+        assert original_of(replacement, target) is fakes.originals[target], target
 
 
 def test_install_is_idempotent(installed) -> None:
@@ -539,6 +554,38 @@ def test_v2_execute_model_forwards_dummy_runs_unprofiled(
     assert recording_nvtx.iters == []
     # Memory profiling and CUDA-graph capture must not consume iteration numbers.
     assert not hasattr(runner, "iteration")
+
+
+@pytest.mark.parametrize("installed", [True], indirect=True, ids=["dp-scope-first"])
+@pytest.mark.parametrize("dummy_run", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_v2_profiling_preserves_dp_scope(
+    installed, recording_nvtx, dummy_run, raises
+) -> None:
+    from vllm_sail.patch.bugfix import dp_idle_mtp_dummy_batch as dp
+
+    runner = installed.fakes.GPUModelRunnerV2()
+
+    def execute():
+        assert dp._get_uniform_token_count() is None
+        dp._set_uniform_token_count(3)
+        if raises:
+            raise ValueError("model failed")
+        return "done"
+
+    runner.execute_callback = execute
+    dp._set_uniform_token_count(32)
+    try:
+        if raises:
+            with pytest.raises(ValueError, match="model failed"):
+                runner.execute_model(_sched_output(), dummy_run=dummy_run)
+        else:
+            assert runner.execute_model(_sched_output(), dummy_run=dummy_run) == "done"
+        assert dp._get_uniform_token_count() is None
+        expected_ranges = 0 if dummy_run else 2
+        assert len(recording_nvtx.pushes) == len(recording_nvtx.pops) == expected_ranges
+    finally:
+        dp._set_uniform_token_count(None)
 
 
 def test_v2_sample_wraps_sampler_range(installed, recording_nvtx) -> None:

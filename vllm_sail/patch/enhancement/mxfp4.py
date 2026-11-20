@@ -10,7 +10,9 @@ priority lists and activation keys are already covered by
 
 * ``Mxfp4Config`` gains ``fp8_channelwise_layers`` (PPU dense layers quantized
   FP8 channelwise via a CompressedTensors scheme), reads ``ignore`` /
-  ``fp8_channelwise_layers`` in ``from_config``, routes ignored ``RoutedExperts``
+  ``fp8_channelwise_layers`` and carries ``ple_quant_scheme`` (consumed by
+  ``bugfix/qwen4_exp_ple_quant_scheme``) in ``from_config``, routes ignored
+  ``RoutedExperts``
   to ``UnquantizedFusedMoEMethod`` (mixed-precision MTP blocks and the BF16
   tail experts of Step5), and remaps the ignore and channelwise lists in
   ``apply_vllm_mapper``.
@@ -61,11 +63,14 @@ _PPU_BACKEND_NAMES = tuple(
 REASON_CONFIG = (
     "The fork adds fp8_channelwise_layers to Mxfp4Config (PPU dense layers "
     "quantized FP8 channelwise), reads 'ignore'/'fp8_channelwise_layers' in "
-    "from_config, routes ignored RoutedExperts to UnquantizedFusedMoEMethod "
-    "for mixed-precision checkpoints (matching both the runtime "
-    "'.routed_experts' prefix and the checkpoint 'experts' prefix), and "
-    "remaps the ignore/channelwise lists in apply_vllm_mapper; upstream has "
-    "none of this, so BF16 expert layers get half-width packed FP4 params."
+    "from_config, carries 'ple_quant_scheme' for the PLE FP8 dispatch "
+    "(bugfix/qwen4_exp_ple_quant_scheme; upstream from_config drops it and "
+    "one patch per target forbids a second from_config replacement), routes "
+    "ignored RoutedExperts to UnquantizedFusedMoEMethod for mixed-precision "
+    "checkpoints (matching both the runtime '.routed_experts' prefix and the "
+    "checkpoint 'experts' prefix), and remaps the ignore/channelwise lists "
+    "in apply_vllm_mapper; upstream has none of this, so BF16 expert layers "
+    "get half-width packed FP4 params."
 )
 REASON_METHOD_SELECT = (
     "PPU runs MXFP4 as W4A4 (mxfp4 activations) on sm90+ and W4A16 on sm80; "
@@ -180,6 +185,7 @@ def install() -> None:
     )
 
     _upstream_config_init = _quant.Mxfp4Config.__init__
+    _upstream_from_config = _quant.Mxfp4Config.from_config
     _upstream_get_quant_method = _quant.Mxfp4Config.get_quant_method
     _upstream_apply_mapper = _quant.Mxfp4Config.apply_vllm_mapper
     _upstream_gptoss_init = _quant.GptOssMxfp4MoEMethod.__init__
@@ -214,14 +220,22 @@ def install() -> None:
     def _from_config(cls, config):
         from vllm.platforms import current_platform
 
-        ignored_layers = config.get("ignore") if isinstance(config, dict) else None
-        fp8_channelwise_layers = None
-        if current_platform.is_ppu() and isinstance(config, dict):
-            fp8_channelwise_layers = config.get("fp8_channelwise_layers")
-        return cls(
-            ignored_layers=ignored_layers,
-            fp8_channelwise_layers=fp8_channelwise_layers,
-        )
+        # Delegate instead of rebuilding cls(...): keep whatever the captured
+        # upstream (or an earlier replacement) attached to the instance.
+        instance = _upstream_from_config.__func__(cls, config)
+        if isinstance(config, dict):
+            instance.ignored_layers = config.get("ignore")
+            # Upstream from_config drops this key; the PLE FP8 dispatch in
+            # bugfix/qwen4_exp_ple_quant_scheme reads it off the instance.
+            # One patch per target, so the attachment lives here.
+            scheme = config.get("ple_quant_scheme")
+            if scheme is not None:
+                instance.ple_quant_scheme = scheme
+            if current_platform.is_ppu():
+                instance.fp8_channelwise_layers = (
+                    config.get("fp8_channelwise_layers") or []
+                )
+        return instance
 
     @patch(
         _QMODULE,

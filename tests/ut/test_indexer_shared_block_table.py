@@ -22,6 +22,9 @@ class Span:
     def contiguous(self):
         return self
 
+    def is_contiguous(self):
+        return True
+
     @staticmethod
     def dim():
         return 2
@@ -92,6 +95,166 @@ def test_wrapper_pops_the_builder_when_upstream_raises(modules):
 
     assert namespace["_current_builder"] == []
     assert builder._sail_decode_request_ids is None
+
+
+@pytest.mark.parametrize("use_flattening", [False, True])
+def test_int8_builder_marks_only_graph_stable_flattened_schedules(
+    modules, use_flattening
+):
+    builder = NS(use_flattening=use_flattening)
+    namespace, calls, _ = _paged_namespace(modules, ppu=True)
+    paged = function(PATCH, "_ppu_paged_metadata", namespace)
+    geometry = (1, 64, 128, "int8")
+    namespace["_upstream_build"] = lambda *args: NS(
+        decode=NS(schedule_metadata=paged(Span(), 64, 7, geometry))
+    )
+    decode = function(PATCH, "_build_wrapper", namespace)(builder, 0, None).decode
+
+    assert len(calls) == 1
+    assert getattr(decode, "_sail_paged_schedule_key", None) == (
+        (64, 7, geometry, False) if use_flattening else None
+    )
+
+
+@pytest.mark.parametrize(
+    "page_size,num_sms,padding",
+    [(64, 7, False), (32, 7, False), (64, 8, False), (64, 7, True)],
+)
+def test_int8_decode_layers_reuse_matching_schedule(page_size, num_sms, padding):
+    contexts, tables, schedule = Span(), Span(), object()
+    metadata = NS(
+        block_table=tables,
+        schedule_metadata=schedule,
+        indices=None,
+        requires_padding=padding,
+        per_req_decode_lens=None,
+        _sail_paged_schedule_key=(64, 7, (1, 64, 128, "int8"), False),
+    )
+    calls = []
+
+    def rebuild(*args, indices):
+        assert indices is None
+        calls.append("rebuild")
+        return "rebuilt"
+
+    inputs = function(
+        "vllm_sail/attention/ops/mla_sparse.py",
+        "_paged_decode_inputs",
+        {
+            "torch": NS(int8="int8"),
+            "current_platform": NS(
+                is_ppu=lambda: True, is_device_capability=lambda cap: cap == (8, 0)
+            ),
+            "get_num_sms": lambda: num_sms,
+            "_paged_decode_rows": lambda *args, **kwargs: (contexts, tables, None),
+            "get_paged_mqa_logits_metadata": rebuild,
+        },
+    )
+    reuse = (page_size, num_sms, padding) == (64, 7, False)
+    for _ in range(2):
+        assert inputs(
+            metadata, contexts, NS(shape=(3,)), 1, page_size, 64, 128, "int8", False
+        ) == (contexts, tables, None, schedule if reuse else "rebuilt")
+    assert calls == ([] if reuse else ["rebuild"] * 2)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_m890_builder_marks_only_native_varlen_or_flattened_schedules(
+    modules, fp4, prepared
+):
+    builder = NS(
+        indexer_uses_fp4=fp4,
+        supports_varlen=fp4 and prepared,
+        use_flattening=not fp4 and prepared,
+    )
+    namespace, calls, _ = _paged_namespace(modules, ppu=True)
+    paged = function(PATCH, "_ppu_paged_metadata", namespace)
+    geometry = (1, 64, 128, "int8" if fp4 else "fp8")
+    indices = object() if fp4 and prepared else None
+    fallback_ids = object()
+    namespace["torch"].arange = lambda *args, **kw: NS(
+        repeat_interleave=lambda next_n: fallback_ids
+    )
+    namespace["_upstream_build"] = lambda *args: NS(
+        decode=NS(
+            indices=indices,
+            schedule_metadata=paged(Span(), 64, 7, geometry, indices=indices),
+        )
+    )
+    decode = function(PATCH, "_build_wrapper", namespace)(builder, 0, None).decode
+
+    assert len(calls) == 1
+    assert calls[0][-1] is (fallback_ids if fp4 and not prepared else indices)
+    assert getattr(decode, "_sail_paged_schedule_key", None) == (
+        (64, 7, geometry, fp4) if prepared else None
+    )
+    assert decode.indices is indices
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("mismatch", [None, "page", "cu", "padding", "indices"])
+def test_m890_decode_layers_reuse_matching_schedule_and_ids(fp4, mismatch):
+    contexts, tables, schedule = Span(), Span(), object()
+    indices = Span()
+    indices.shape = (3,)
+    metadata = NS(
+        block_table=tables,
+        schedule_metadata=schedule,
+        indices=indices if fp4 and mismatch != "indices" else None,
+        requires_padding=mismatch == "padding",
+        per_req_decode_lens=None,
+        _sail_paged_schedule_key=(64, 7, (1, 64, 128, "int8" if fp4 else "fp8"), fp4),
+    )
+    calls = []
+    rebuilt_ids = object()
+
+    def rebuild(*args, indices):
+        assert indices is (rebuilt_ids if fp4 else None)
+        calls.append("rebuild")
+        return "rebuilt"
+
+    def flatten(*args, need_request_ids):
+        assert need_request_ids is fp4
+        assert args[4] is metadata.indices
+        return contexts, tables, rebuilt_ids if fp4 else None
+
+    inputs = function(
+        "vllm_sail/attention/ops/mla_sparse.py",
+        "_paged_decode_inputs",
+        {
+            "torch": NS(int8="int8", float8_e4m3fn="fp8"),
+            "current_platform": NS(
+                is_ppu=lambda: True, is_device_capability=lambda cap: cap == 89
+            ),
+            "get_num_sms": lambda: 8 if mismatch == "cu" else 7,
+            "_paged_decode_rows": flatten,
+            "get_paged_mqa_logits_metadata": rebuild,
+        },
+    )
+    rebuild_schedule = mismatch in ("page", "cu", "padding") or (
+        fp4 and mismatch == "indices"
+    )
+    expected_ids = rebuilt_ids if rebuild_schedule else indices
+    for _ in range(2):
+        used = inputs(
+            metadata,
+            contexts,
+            NS(shape=(3,)),
+            1,
+            32 if mismatch == "page" else 64,
+            64,
+            128,
+            "fp8",
+            fp4,
+        )
+        assert used == (
+            contexts,
+            tables,
+            expected_ids if fp4 else None,
+            "rebuilt" if rebuild_schedule else schedule,
+        )
+    assert calls == (["rebuild"] * 2 if rebuild_schedule else [])
 
 
 def test_prebuilt_metadata_keeps_request_ids_after_upstream_flattens(modules):

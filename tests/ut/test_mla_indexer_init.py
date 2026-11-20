@@ -161,7 +161,8 @@ def test_ppu_fp8_constructor_keeps_geometry_and_reserves_sail_schedule(builder_f
     builder_cls, _ = builder_factory(ppu=True, fp4=False)
     builder = builder_cls("config")
 
-    assert builder.supports_varlen is True
+    assert builder.supports_varlen is False
+    assert builder.use_flattening is True
     assert builder.indexer_n_head == 64
     assert builder.indexer_q_head_dim == 128
     assert builder.num_sms == 7

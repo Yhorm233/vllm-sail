@@ -73,6 +73,13 @@ about. `patch/enhancement/custom_op_dispatch.py` is the worked example: upstream
 `dispatch_forward` is ~35 lines of enable bookkeeping plus a platform ladder, and
 we only need one branch of the ladder.
 
+Wrapping an existing patch requires `allow_wrapping=True` and
+`@functools.wraps(current_target)` immediately below `@patch`. This is used by
+opt-in NVTX instrumentation to delegate through the DP dummy-batch scope wrapper.
+The wrapper must name the current implementation in `__wrapped__`; unrelated
+replacements and repeated installation still fail. `original_of` records the
+immediate inner implementation for each layer.
+
 When you *must* copy a body (Triton kernels, tightly interleaved logic), copy it
 **verbatim** — same name, signature, decorators, comments and unchanged lines —
 and mark only the changed lines:

@@ -88,6 +88,10 @@ def _record_original_attribute(
         original_attributes = {}
     elif not isinstance(original_attributes, dict):
         raise TypeError(f"Invalid patch metadata on {replacement_implementation!r}")
+    else:
+        # functools.wraps copies the wrapped function's __dict__. Keep each
+        # layer's originals independent when an explicit wrapper is installed.
+        original_attributes = original_attributes.copy()
 
     original_attributes[full_target_name] = original_attribute
     try:
@@ -121,8 +125,17 @@ def _raise_if_already_patched(
     original_implementation: Any,
     replacement_implementation: Any,
     full_target_name: str,
+    *,
+    allow_wrapping: bool = False,
 ) -> None:
     """Reject both reapplying one object and installing a second patch."""
+    if (
+        allow_wrapping
+        and original_implementation is not replacement_implementation
+        and getattr(replacement_implementation, "__wrapped__", None)
+        is original_implementation
+    ):
+        return
     if (
         original_implementation is replacement_implementation
         or getattr(original_implementation, PATCH_MARKER, None) is not None
@@ -149,6 +162,7 @@ def _patch_module_attribute(
     target_attribute_name: str | None,
     *,
     allow_missing: bool,
+    allow_wrapping: bool,
     reason: str,
     affected_versions: str,
     remove_when: str,
@@ -181,7 +195,10 @@ def _patch_module_attribute(
 
         if original_attribute is not _MISSING:
             _raise_if_already_patched(
-                original_attribute, replacement_attribute, full_target_name
+                original_attribute,
+                replacement_attribute,
+                full_target_name,
+                allow_wrapping=allow_wrapping,
             )
 
         original_source = _capture_source(original_attribute)
@@ -263,6 +280,7 @@ def _patch_class_method(
     target_attribute_path: str,
     *,
     allow_missing: bool,
+    allow_wrapping: bool,
     reason: str,
     affected_versions: str,
     remove_when: str,
@@ -302,6 +320,7 @@ def _patch_class_method(
                 _unwrap_class_descriptor(original_attribute),
                 replacement_implementation,
                 full_target_name,
+                allow_wrapping=allow_wrapping,
             )
 
         original_source = _capture_source(original_attribute)
@@ -340,6 +359,7 @@ def patch(
     affected_versions: str,
     remove_when: str,
     allow_missing: bool = False,
+    allow_wrapping: bool = False,
 ) -> Callable[[PatchTarget], PatchTarget]:
     """Create a patch decorator for a module attribute or class attribute.
 
@@ -359,6 +379,10 @@ def patch(
             deliberately *adding* a compatibility attribute (``is_ppu``,
             ``forward_ppu``); normal patches require the target to exist so a
             renamed upstream symbol fails loudly.
+        allow_wrapping: Permit wrapping an already patched implementation only
+            when the replacement's ``__wrapped__`` is the current target, as
+            set by ``functools.wraps``. Duplicate installation and unrelated
+            replacements still fail; each wrapper records its immediate original.
 
     Raises:
         RuntimeError: The target is already patched.
@@ -373,6 +397,7 @@ def patch(
             target_module_path,
             target_attribute_name,
             allow_missing=allow_missing,
+            allow_wrapping=allow_wrapping,
             reason=reason,
             affected_versions=affected_versions,
             remove_when=remove_when,
@@ -381,6 +406,7 @@ def patch(
         target_module_path,
         target_attribute_name,
         allow_missing=allow_missing,
+        allow_wrapping=allow_wrapping,
         reason=reason,
         affected_versions=affected_versions,
         remove_when=remove_when,

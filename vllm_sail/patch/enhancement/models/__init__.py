@@ -71,6 +71,7 @@ from vllm_sail.patch.enhancement.models import (
     deepseek_v41_indexer,  # noqa: F401
     deepseek_v41_mega_mhc,  # noqa: F401
     glm5_next,  # noqa: F401
+    glm5_next_indexer,  # noqa: F401
     glm5_next_mtp,  # noqa: F401
     kimi_k3,  # noqa: F401
     llama4,  # noqa: F401
