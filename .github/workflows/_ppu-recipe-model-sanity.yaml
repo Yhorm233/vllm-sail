@@ -21,6 +21,10 @@ on:
         description: Comma-separated recipe policy slugs (blank = all)
         type: string
         default: ""
+      single_case_matrix:
+        description: Validated matrix for the single requested PR Nightly case
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -67,10 +71,28 @@ jobs:
           TIER: model_sanity
           PR_MODE: ${{ inputs.pr_mode }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          SINGLE_CASE_MATRIX: ${{ inputs.single_case_matrix }}
         run: |
           test "$PR_MODE" != true
           test "$BUILD_RUN_ID" = "$GITHUB_RUN_ID"
-          python3 scripts/ci/ppu_e2e_select.py --recipes "${MODELS}" "${TIER}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${SINGLE_CASE_MATRIX:-}" ]]; then
+            python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+
+          try:
+              entries = json.loads(os.environ["SINGLE_CASE_MATRIX"])["include"]
+              if (not isinstance(entries, list) or len(entries) != 1
+                  or not isinstance(entries[0], dict)
+                  or entries[0].get("key") != os.environ["MODELS"]):
+                  raise ValueError
+          except (ValueError, KeyError, TypeError, RecursionError):
+              raise SystemExit("Expected a matrix for the single requested PR Nightly case.") from None
+          print("recipe_matrix=" + json.dumps({"include": entries}, separators=(",", ":")))
+          PY
+          else
+            python3 scripts/ci/ppu_e2e_select.py --recipes "${MODELS}" "${TIER}" >> "$GITHUB_OUTPUT"
+          fi
           printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
   sanity:

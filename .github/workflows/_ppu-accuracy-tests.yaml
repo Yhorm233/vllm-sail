@@ -1,7 +1,7 @@
 name: PPU accuracy tests
 
-# Called by ppu-debug.yaml (manual single target) and ppu-accuracy-nightly.yaml
-# (scheduled). Accuracy is intentionally outside the per-PR gate.
+# Called by ppu-debug.yaml, ppu-accuracy-nightly.yaml and ppu-pr-nightly.yaml.
+# Accuracy is intentionally outside the per-PR gate.
 
 on:
   workflow_call:
@@ -76,6 +76,27 @@ jobs:
               core.setFailed('PPU CI requires cache-mode: none');
             }
 
+      - name: Validate PR Nightly inputs
+        if: inputs.pr_mode
+        env:
+          PR_HEAD_SHA: ${{ inputs.pr_head_sha }}
+          WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          CASE_ID: ${{ inputs.models }}
+        run: |
+          if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ || "$WHEEL_SOURCE_SHA" != "$PR_HEAD_SHA" ]]; then
+            echo 'PR Nightly requires matching immutable source SHAs.' >&2
+            exit 1
+          fi
+          if [[ "$BUILD_RUN_ID" != "$GITHUB_RUN_ID" ]]; then
+            echo 'PR Nightly requires wheels from this run.' >&2
+            exit 1
+          fi
+          if [[ ! "$CASE_ID" =~ ^[a-z0-9][a-z0-9.-]{0,63}$ || "$CASE_ID" == all ]]; then
+            echo 'PR Nightly requires one legacy accuracy case ID.' >&2
+            exit 1
+          fi
+
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
         with:
@@ -91,7 +112,32 @@ jobs:
         id: select
         env:
           MODELS: ${{ inputs.models }}
-        run: python3 scripts/ci/ppu_e2e_select.py "${MODELS}" >> "$GITHUB_OUTPUT"
+          PR_MODE: ${{ inputs.pr_mode }}
+        run: |
+          if [[ "$PR_MODE" != true ]]; then
+            python3 scripts/ci/ppu_e2e_select.py "$MODELS" >> "$GITHUB_OUTPUT"
+            exit
+          fi
+          python3 -I - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          case_id = os.environ["MODELS"]
+          try:
+              catalog = json.loads(subprocess.check_output(
+                  ["git", "show", "HEAD:scripts/ci/ppu_e2e_models.json"],
+                  stderr=subprocess.DEVNULL,
+              ))
+              matches = [entry for entry in catalog if entry["key"] == case_id]
+              if len(matches) != 1 or matches[0].get("category") != "accuracy":
+                  raise ValueError
+          except (ValueError, TypeError, KeyError, subprocess.CalledProcessError):
+              raise SystemExit("Expected one legacy accuracy catalog case.") from None
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print("accuracy_matrix=" + json.dumps({"include": [{"case_id": case_id}]}),
+                    file=output)
+          PY
 
   accuracy:
     name: Accuracy ${{ matrix.model.case_id }}
@@ -113,12 +159,17 @@ jobs:
     steps:
       - name: Prepare private runtime directories and Git configuration
         id: runtime
+        env:
+          PR_MODE: ${{ inputs.pr_mode }}
         run: |
           config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
           wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-wheels.XXXXXX")"
           artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-artifacts.XXXXXX")"
           source_rel=".ppu-accuracy-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source="${GITHUB_WORKSPACE}/${source_rel}"
+          if [[ "$PR_MODE" == true ]]; then
+            printf '::add-mask::%s\n' "$config" "$wheels" "$artifacts" "$source"
+          fi
           {
             printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
             printf 'wheels=%s\n' "$wheels"
@@ -151,15 +202,17 @@ jobs:
         run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Download CI-built wheels
+        id: wheels
         uses: actions/download-artifact@v4
         with:
           name: ppu-wheels-${{ inputs.build_run_id }}
           path: ${{ steps.runtime.outputs.wheels }}
           run-id: ${{ inputs.build_run_id }}
           repository: ${{ github.repository }}
-          github-token: ${{ github.token }}
+          github-token: ${{ !inputs.pr_mode && github.token || '' }}
 
       - name: Run GSM8K accuracy in the preloaded CUDA-compatible runtime
+        if: '!inputs.pr_mode'
         env:
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
@@ -182,8 +235,149 @@ jobs:
           MODEL_ID: ${{ matrix.model.model_id }}
         run: bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" model-accuracy
 
+      - name: Run PR Nightly accuracy with private logging
+        id: pr_accuracy
+        if: inputs.pr_mode
+        env:
+          PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+          PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha }}
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha }}
+          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
+          PPU_CI_HF_HOME: ${{ inputs.hf_home }}
+          PPU_CI_DG_CACHE_DIR: ${{ inputs.dg_cache_dir }}
+          GSM8K_DATASET_PATH: ${{ inputs.gsm8k_dataset_path }}
+          CASE_ID: ${{ matrix.model.case_id }}
+        run: |
+          umask 077
+          python3 -I - >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1 <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          source = Path(os.environ["PPU_CI_SOURCE_DIR"])
+          sha = os.environ["PPU_CI_WHEEL_SOURCE_SHA"]
+          try:
+              def read_source(path):
+                  return subprocess.check_output(["git", "-C", str(source), "show", f"HEAD:{path}"])
+
+              pin = read_source(".github/vllm-main-verified.commit").decode("ascii").strip()
+              manifest = json.loads((Path(os.environ["PPU_CI_WHEELS_DIR"]) /
+                                     "wheel-manifest.json").read_bytes())
+              if (not re.fullmatch(r"[0-9a-f]{40}", pin) or manifest["schema"] != 1
+                  or manifest["commits"]["vllm"] != pin
+                  or manifest["commits"]["vllm-sail"] != sha):
+                  raise ValueError("Wheel manifest does not match the required commits.")
+
+              catalog = json.loads(read_source("scripts/ci/ppu_e2e_models.json"))
+              case = next(entry for entry in catalog if entry["key"] == os.environ["CASE_ID"])
+              child = {key: os.environ[key] for key in (
+                  "PATH", "HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+                  "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "PPU_CI_RUNTIME_IMAGE",
+                  "PPU_CI_SOURCE_DIR", "PPU_CI_SOURCE_SHA", "PPU_CI_WHEEL_SOURCE_SHA",
+                  "PPU_CI_WHEELS_DIR", "PPU_CI_ARTIFACT_DIR", "PPU_CI_HF_HOME",
+                  "PPU_CI_DG_CACHE_DIR", "GSM8K_DATASET_PATH", "CASE_ID",
+              )}
+              child.update(
+                  PPU_CI_REQUIRE_PR_ARTIFACT="true",
+                  PPU_CI_DEVICE_COUNT=str(int(case["ppu_count"])),
+                  HF_HUB_OFFLINE="1",
+                  MODEL_KEY=case["model_key"],
+                  MODEL_ID=case["model_id"],
+                  SERVER_CMD=json.dumps(case.get("server_cmd") or []),
+                  SERVER_ENV=json.dumps(case.get("server_env") or {}),
+              )
+          except (ValueError, TypeError, KeyError, StopIteration, OSError,
+                  subprocess.CalledProcessError):
+              result = Path(os.environ["PPU_CI_ARTIFACT_DIR"]) / "legacy-accuracy-result.json"
+              result.write_text('{"status":"runtime_setup_failed"}\n', encoding="utf-8")
+              raise
+
+          os.execvpe("bash", ["bash", str(source / "scripts/ci/ppu_runtime_container.sh"),
+                              "model-accuracy"], child)
+          PY
+
+      - name: Generate public PR Nightly legacy summary
+        id: pr_summary
+        if: always() && inputs.pr_mode && steps.runtime.outcome == 'success'
+        env:
+          PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
+          WHEELS_OUTCOME: ${{ steps.wheels.outcome }}
+          ACCURACY_OUTCOME: ${{ steps.pr_accuracy.outcome }}
+        run: |
+          PUBLIC_DIR="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-summary.XXXXXX")"
+          printf '::add-mask::%s\n' "$PUBLIC_DIR"
+          export PUBLIC_DIR
+          python3 -I - <<'PY'
+          import json
+          import os
+          import stat
+          from pathlib import Path
+
+          def read_result(path):
+              fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, "rb") as source:
+                  if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                      return {}
+                  data = source.read(4097)
+              result = json.loads(data) if len(data) <= 4096 else None
+              return result if isinstance(result, dict) else {}
+
+          accuracy_outcome = os.environ["ACCURACY_OUTCOME"]
+          reason, gate, score, samples = "unknown", "not_available", None, None
+          failures = {
+              "fail_accuracy": "gsm8k_gate_failed",
+              "fail_threshold": "gsm8k_gate_failed",
+              "fail_completeness": "completeness_failed",
+              "fail_identity": "golden_identity_mismatch",
+              "fail_config": "golden_config_mismatch",
+          }
+          phase_failures = {"runtime_setup_failed", "server_startup_failed", "gsm8k_eval_failed"}
+          if os.environ["WHEELS_OUTCOME"] == "failure":
+              reason = "runtime_setup_failed"
+          elif accuracy_outcome in {"success", "failure"}:
+              path = Path(os.environ["PRIVATE_DIR"]) / "legacy-accuracy-result.json"
+              try:
+                  record = read_result(path)
+              except (OSError, ValueError, RecursionError):
+                  record = {}
+              status = record.get("status")
+              if isinstance(status, str):
+                  if accuracy_outcome == "success" and status in {"pass", "created", "updated"}:
+                      reason, gate = "not_applicable", "pass"
+                  elif accuracy_outcome == "failure" and status in failures:
+                      reason, gate = failures[status], "fail"
+                  elif accuracy_outcome == "failure" and status in phase_failures:
+                      reason = status
+              if gate != "not_available":
+                  raw_score, raw_samples = record.get("score"), record.get("num")
+                  if type(raw_score) in (int, float) and 0 <= raw_score <= 1:
+                      score = raw_score
+                  if type(raw_samples) is int and 0 <= raw_samples <= 100_000:
+                      samples = raw_samples
+
+          summary = {"failure_reason": reason, "gsm8k": {
+              "score": score, "evaluated_samples": samples, "gate": gate,
+          }}
+          output = Path(os.environ["PUBLIC_DIR"]) / "summary.json"
+          with output.open("x", encoding="utf-8") as target:
+              json.dump(summary, target, allow_nan=False)
+          PY
+          printf 'summary=%s/summary.json\n' "$PUBLIC_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload PR Nightly legacy summary
+        if: always() && inputs.pr_mode && steps.pr_summary.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pr-nightly-legacy-${{ matrix.model.case_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.pr_summary.outputs.summary }}
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload accuracy diagnostics
-        if: always()
+        if: always() && !inputs.pr_mode
         uses: actions/upload-artifact@v4
         with:
           name: ppu-accuracy-${{ matrix.model.case_id }}-${{ github.run_id }}-${{ github.run_attempt }}

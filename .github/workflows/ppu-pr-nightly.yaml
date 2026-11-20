@@ -1,0 +1,155 @@
+name: PPU PR Nightly
+run-name: "PPU PR #${{ inputs.pr_number }} Nightly ${{ inputs.case_id }} @ ${{ inputs.head_sha }} (comment ${{ inputs.comment_id }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      requester:
+        required: true
+        type: string
+      comment_id:
+        required: true
+        type: string
+      case_id:
+        required: true
+        type: string
+
+permissions: {}
+cache-mode: none
+
+concurrency:
+  group: ppu-pr-nightly-${{ inputs.pr_number }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  validate:
+    name: Verify PR Nightly request
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify head, requester and original PR comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -m scripts.ci.ppu_pr_nightly validate
+
+  select:
+    name: Resolve the requested Nightly case
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      lane: ${{ steps.select.outputs.lane }}
+      recipe_matrix: ${{ steps.select.outputs.recipe_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --no-cache-dir PyYAML==6.0.3
+      - name: Resolve one case from the verified candidate
+        id: select
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          CASE_ID: ${{ inputs.case_id }}
+          RECIPE_ENABLED: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}
+        run: |
+          test "$(git -C candidate rev-parse HEAD)" = "$HEAD_SHA"
+          python -m scripts.ci.ppu_pr_nightly select candidate "$CASE_ID" "$RECIPE_ENABLED" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build the PR head wheels
+    needs: select
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-build.yaml
+    with:
+      pr_head_sha: ${{ inputs.head_sha }}
+
+  recipe:
+    name: PR Nightly Recipe
+    needs: [select, build]
+    if: needs.select.outputs.lane == 'recipe' && needs.select.outputs.recipe_matrix != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-recipe-model-sanity.yaml
+    with:
+      # Model Sanity's non-PR mode requires exact source and same-run wheels.
+      pr_mode: false
+      pr_head_sha: ${{ inputs.head_sha }}
+      wheel_source_sha: ${{ inputs.head_sha }}
+      build_run_id: ${{ github.run_id }}
+      models: ${{ inputs.case_id }}
+      single_case_matrix: ${{ needs.select.outputs.recipe_matrix }}
+
+  legacy:
+    name: PR Nightly legacy accuracy
+    needs: [select, build]
+    if: needs.select.outputs.lane == 'legacy'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-accuracy-tests.yaml
+    with:
+      pr_mode: true
+      pr_head_sha: ${{ inputs.head_sha }}
+      wheel_source_sha: ${{ inputs.head_sha }}
+      build_run_id: ${{ github.run_id }}
+      models: ${{ inputs.case_id }}
+
+  report:
+    name: Report the Nightly case
+    needs: [validate, select, build, recipe, legacy]
+    if: always() && needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the allowlisted case summary
+        if: needs.select.outputs.lane != '' && needs.build.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ format('{0}-{1}-{2}-{3}', needs.select.outputs.lane == 'recipe' && 'ppu-recipe-model_sanity' || 'ppu-pr-nightly-legacy', inputs.case_id, github.run_id, github.run_attempt) }}
+          path: ${{ runner.temp }}/nightly-case-summary
+      - name: Publish result for the tested PR head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          SUMMARY_PATH: ${{ runner.temp }}/nightly-case-summary/summary.json
+        run: python3 -m scripts.ci.ppu_pr_nightly report

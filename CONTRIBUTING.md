@@ -165,6 +165,22 @@ job checks. The unified status requires every source and PPU stage
 to succeed. Coordinate this ruleset change with the switch to on-demand CI,
 after verifying the commands on the default branch.
 
+### On-demand PR Nightly accuracy
+
+Repository writers can request a single real-weight case by posting
+`/ci run nightly <case>`. Use a Recipe policy slug with a `model_sanity` tier
+(for example, `glm-5.3`) or an exact legacy accuracy case ID (for example,
+`deepseek-v4-mxfp4-dp-ep`). Posting `/ci run nightly` returns help and links
+to the [Nightly case matrix](tests/ppu/README.md). A different configuration of
+the same model may have a different case ID.
+
+The new Nightly workflow runs from the default branch and pins the PR head,
+case selection and the same run's wheels to that commit. It reports the case
+result and Actions link on the PR, with published accuracy and failure details
+when available. It is a separate on-demand run outside the required
+`PPU CI` status. Use GitHub Actions to cancel or rerun it. Full-matrix PR
+Nightly is not part of the single-case rollout.
+
 ## Reporting issues
 
 Use the bug or feature request template in the repository's Issues tab. Bug

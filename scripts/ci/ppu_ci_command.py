@@ -410,9 +410,9 @@ class Controller:
                 raise Rejected(f"CI request failed (HTTP {exc.code}).") from exc
             raise
 
-    def command(self):
+    def command(self, parse=parse_command):
         try:
-            action = parse_command(self.event)
+            action = parse(self.event)
         except Rejected:
             action = "help"
         if action is None:
@@ -432,13 +432,7 @@ class Controller:
                 if action == "help":
                     raise Rejected(HELP)
                 pr = self.api("GET", f"/pulls/{number}")
-                self.authorize(pr, login)
-                if action == "/ci cancel":
-                    text = self.cancel(pr, login)
-                elif action == "/ci retry":
-                    text = self.retry(pr, login)
-                else:
-                    text = self.run(pr, login, cid, action.endswith("--allow-stale"))
+                text = self.execute(action, pr, login, cid)
             except Rejected as exc:
                 text, reaction = str(exc), "-1"
             self.reply(number, cid, text)
@@ -446,6 +440,14 @@ class Controller:
         except Exception:
             self.react(cid, "confused")
             raise
+
+    def execute(self, action, pr, login, cid):
+        self.authorize(pr, login)
+        if action == "/ci cancel":
+            return self.cancel(pr, login)
+        if action == "/ci retry":
+            return self.retry(pr, login)
+        return self.run(pr, login, cid, action.endswith("--allow-stale"))
 
     def run(self, pr, login, cid, allow_stale):
         sha = pr["head"]["sha"]
@@ -558,13 +560,14 @@ class Controller:
         body = f"{tag}\n@{login}: {HELP}. New commits require `/ci run`. `--allow-stale` permits running behind the base branch. Bare CPU UT and the remaining runtime/source UT run with `/ci run`."
         self.api("POST", f"/issues/{pr['number']}/comments", {"body": body})
 
-    def inputs(self):
+    def inputs(self, **extra_patterns):
         inputs = self.event.get("inputs", {})
         patterns = dict(
             pr_number=r"[1-9][0-9]*",
             head_sha=r"[0-9a-f]{40}",
             requester=LOGIN,
             comment_id=r"[1-9][0-9]*",
+            **extra_patterns,
         )
         for key, pattern in patterns.items():
             value = inputs.get(key)
@@ -639,7 +642,7 @@ class Controller:
         best_effort(comment)
 
 
-def main(argv=None, env=None, github=None, sleep=time.sleep):
+def main(argv=None, env=None, github=None, sleep=time.sleep, *, controller=Controller):
     env = os.environ if env is None else env
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("command", "notify", "validate", "report"))
@@ -650,7 +653,7 @@ def main(argv=None, env=None, github=None, sleep=time.sleep):
         github = github or GitHub(
             env["GITHUB_TOKEN"], env.get("GITHUB_API_URL", "https://api.github.com")
         )
-        getattr(Controller(github, event, env, sleep), mode)()
+        getattr(controller(github, event, env, sleep), mode)()
     except Exception as exc:
         if mode != "validate":
             raise

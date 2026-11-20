@@ -33,6 +33,19 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
+ci_result_file="${RESULTS_DIR}/legacy-accuracy-result.json"
+if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+    umask 077
+    mkdir -p "${RESULTS_DIR}"
+    record_setup_failure() {
+        if (( $1 != 0 )); then
+            printf '%s\n' '{"status":"runtime_setup_failed"}' > "${ci_result_file}"
+        fi
+    }
+    trap 'record_setup_failure "$?"' EXIT
+fi
+
 # HuggingFace Hub: resolve model_id to local cache; never contact the hub.
 export HF_HOME="${HF_HOME:?HF_HOME must be set to the Hugging Face cache directory}"
 export HF_HUB_OFFLINE=1
@@ -52,7 +65,6 @@ SERVER_CMD="${SERVER_CMD:-}"
 SERVER_ENV="${SERVER_ENV:-}"
 MODEL_ID="${MODEL_ID:?MODEL_ID is required}"
 WHEELS_DIR="${WHEELS_DIR:?WHEELS_DIR is required}"
-RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
 UPDATE_GOLDEN="${UPDATE_GOLDEN:-0}"
 THRESHOLD="${THRESHOLD:-0.9}"
 VLLM_PORT="${VLLM_PORT:-9985}"
@@ -86,7 +98,14 @@ python -c 'import sys; print("python", sys.version)'
 # serves models with, so there is nothing to replace.
 log "capture SAIL PyTorch stack"
 WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
-python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" verify "${WHEELS_DIR}"
+verify_args=(verify "${WHEELS_DIR}")
+if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+    verify_args+=(
+        --vllm-commit "${EXPECTED_VLLM_COMMIT:?EXPECTED_VLLM_COMMIT is required}"
+        --sail-commit "${EXPECTED_SAIL_COMMIT:?EXPECTED_SAIL_COMMIT is required}"
+    )
+fi
+python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" "${verify_args[@]}"
 
 export PIP_CONSTRAINT="${RESULTS_DIR}/image-constraints.txt"
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
@@ -194,6 +213,10 @@ if [[ -n "${SERVER_ENV}" && "${SERVER_ENV}" != "{}" && "${SERVER_ENV}" != "null"
 fi
 if [[ "${UPDATE_GOLDEN}" == "1" ]]; then
     eval_args+=(--update-golden)
+fi
+if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+    eval_args+=(--ci-result-file "${ci_result_file}")
+    trap - EXIT
 fi
 
 set +e

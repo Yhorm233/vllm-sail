@@ -2343,3 +2343,187 @@ def test_reuse_discovery_has_a_finite_page_budget(github_output):
         )
     assert validate_pair(control, gh, github_output)["existing_build_run_id"] == ""
     assert len([c for c in gh.calls if c[1] == ROOT + RUNS]) <= 10
+
+
+def nightly_setup(body, permission_value="write"):
+    from scripts.ci.ppu_pr_nightly import WORKFLOW, NightlyController
+
+    current, gh, sleeps = command_setup(body=body, value=permission_value)
+    control = NightlyController(gh, current.event, current.env, sleeps.append)
+    gh.page(
+        f"/actions/workflows/{WORKFLOW}/runs",
+        [],
+        "workflow_runs",
+    )
+    path = f"/actions/workflows/{WORKFLOW}/dispatches"
+    gh.add("POST", ROOT + path, None)
+    return control, gh, path
+
+
+def test_nightly_command_dispatches_exact_case_and_head_without_formal_status():
+    control, gh, path = nightly_setup("/ci run nightly deepseek-v4-mxfp4-dp-ep")
+    control.command()
+    assert gh.writes(path)[0][2] == {
+        "ref": "main",
+        "inputs": {**INPUTS, "case_id": "deepseek-v4-mxfp4-dp-ep"},
+    }
+    assert "deepseek-v4-mxfp4-dp-ep" in reply(gh)
+    assert SHA in reply(gh)
+    assert states(gh) == []
+
+
+@pytest.mark.parametrize(
+    "body, access, message",
+    [
+        ("/ci run nightly", "read", "List of available Nightly cases"),
+        ("/ci run nightly all", "write", "not available yet"),
+        (
+            "/ci run nightly glm-5.3,deepseek-v4-flash",
+            "write",
+            "one Recipe policy slug",
+        ),
+        ("/ci run nightly glm-5.3\n/ci run", "write", "one Recipe policy slug"),
+        ("/ci run nightly glm-5.3", "read", "write permission"),
+    ],
+)
+def test_nightly_help_invalid_and_ready_author_do_not_dispatch(body, access, message):
+    control, gh, path = nightly_setup(body, access)
+    control.command()
+    assert message in reply(gh)
+    assert not gh.writes(path)
+    assert states(gh) == []
+
+
+def test_nightly_command_reuses_active_case_for_same_head():
+    control, gh, path = nightly_setup("/ci run nightly glm-5.3")
+    flow = path.removesuffix("/dispatches")
+    gh.page(
+        f"{flow}/runs",
+        [
+            run(
+                status="queued",
+                display_title=f"PPU PR #7 Nightly glm-5.3 @ {SHA} (comment 19)",
+                path=f".github/workflows/{flow.split('/')[-1]}",
+            )
+        ],
+        "workflow_runs",
+    )
+    control.command()
+    assert "already requested" in reply(gh)
+    assert not gh.writes(path)
+
+
+@pytest.mark.parametrize("last_page", [3, 11])
+def test_nightly_command_finds_active_case_on_later_pages(last_page):
+    control, gh, path = nightly_setup("/ci run nightly glm-5.3")
+    flow = path.removesuffix("/dispatches")
+    run_path = f".github/workflows/{flow.split('/')[-1]}"
+    other = run(
+        display_title=f"PPU PR #8 Nightly glm-5.3 @ {SHA} (comment 20)",
+        path=run_path,
+    )
+    for page in range(1, last_page):
+        gh.page(f"{flow}/runs", [other] * 100, "workflow_runs", page=page)
+    active = run(
+        status="queued",
+        display_title=f"PPU PR #7 Nightly glm-5.3 @ {SHA} (comment 19)",
+        path=run_path,
+    )
+    gh.page(f"{flow}/runs", [active], "workflow_runs", page=last_page)
+    control.command()
+    assert not gh.writes(path)
+    assert "already requested" in reply(gh)
+
+
+def test_nightly_dispatcher_still_routes_formal_ci_as_before():
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    base, gh, sleeps = command_setup(value="write")
+    NightlyController(gh, base.event, base.env, sleeps.append).command()
+    assert gh.writes(DISPATCH)[0][2]["inputs"] == INPUTS
+    assert states(gh) == ["pending"]
+
+
+@pytest.mark.parametrize(
+    "problem", ["none", "head", "author", "issue", "command", "write"]
+)
+def test_nightly_executor_binds_writer_comment_to_current_pr_head(problem):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    current, gh, _ = make_controller({"inputs": {**INPUTS, "case_id": "glm-5.3"}})
+    pr = {**PR, "head": {**PR["head"], "sha": OLD if problem == "head" else SHA}}
+    comment = {
+        "issue_url": f"https://api.github.com{ROOT}/issues/{8 if problem == 'issue' else 7}",
+        "user": {**USER, "login": "another" if problem == "author" else "author"},
+        "body": "/ci run" if problem == "command" else "/ci run nightly glm-5.3",
+    }
+    gh.add("GET", ROOT + "/pulls/7", pr)
+    gh.add("GET", ROOT + "/issues/comments/42", comment)
+    permission(gh, value="read" if problem == "write" else "write")
+    control = NightlyController(gh, current.event, current.env)
+    if problem == "none":
+        control.validate()
+    else:
+        with pytest.raises(module().Rejected):
+            control.validate()
+    assert all(method == "GET" for method, *_ in gh.calls)
+
+
+@pytest.mark.parametrize(
+    "case_result,reason",
+    [
+        ("success", "not_applicable"),
+        ("failure", "server_startup_failed"),
+        ("failure", "gsm8k_gate_failed"),
+        ("failure", "CREDENTIALS_AND_PRIVATE_DATA"),
+        ("skipped", "not_applicable"),
+    ],
+)
+def test_nightly_report_keeps_case_verdict_separate_and_redacts_summary(
+    tmp_path, case_result, reason
+):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    report = tmp_path / "summary.json"
+    report.write_text(
+        json.dumps(
+            {
+                "failure_reason": reason,
+                "gsm8k": {"score": 0.92, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+                "extra": "CREDENTIALS_AND_PRIVATE_DATA",
+            }
+        )
+    )
+    current, gh, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "glm-5.3"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {"result": "success", "outputs": {"lane": "recipe"}},
+                    "build": {"result": "success"},
+                    "recipe": {"result": case_result},
+                    "legacy": {"result": "skipped"},
+                }
+            ),
+            "SUMMARY_PATH": str(report),
+        },
+    )
+    gh.page(COMMENTS, [])
+    gh.add("POST", ROOT + COMMENTS, {})
+    control = NightlyController(gh, current.event, current.env)
+    if case_result == "success":
+        control.report()
+    else:
+        with pytest.raises(module().Rejected):
+            control.report()
+    assert ("92.00% (1319 samples)" in reply(gh)) == (case_result != "skipped")
+    assert "CREDENTIALS_AND_PRIVATE_DATA" not in reply(gh)
+    assert (
+        "**Case did not run**" in reply(gh)
+        if case_result == "skipped"
+        else SHA in reply(gh)
+    )
+    if reason in ("server_startup_failed", "gsm8k_gate_failed"):
+        assert reason in reply(gh)
+    assert states(gh) == []
