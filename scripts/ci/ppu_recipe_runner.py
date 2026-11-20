@@ -614,6 +614,7 @@ def _attempt_fast_sanity_once(
     *,
     recipe_path: Path,
     policy_path: Path,
+    variant: str | None = None,
     preset: str | None,
     assets_map: Path | None,
     port: int,
@@ -628,6 +629,7 @@ def _attempt_fast_sanity_once(
         recipe_path,
         policy_path=policy_path,
         tier="fast_sanity",
+        variant=variant,
         preset=preset,
         layer_override=layer_override,
         assets_map_path=assets_map,
@@ -699,6 +701,7 @@ def run_fast_sanity(
     policy_path: Path,
     results_dir: Path,
     assets_map: Path | None = None,
+    variant: str | None = None,
     preset: str | None = None,
     port: int = 9985,
     ready_timeout: int = 1800,
@@ -715,13 +718,18 @@ def run_fast_sanity(
     fs_cfg = policy["tiers"]["fast_sanity"]
     probe = fs_cfg["probe"]
     fallback_full = bool(fs_cfg.get("fallback_full_layers", True))
+    eff_variant = variant if variant is not None else policy.get("variant", "default")
+    configured_layers = fs_cfg.get("layer_override", 2)
 
     attempts: list[dict[str, Any]] = []
-    if layer_mode in {"auto", "2l", "both"}:
-        two_l = int(fs_cfg.get("layer_override", 2))
+    if layer_mode in {"auto", "2l", "both"} and (
+        configured_layers is not None or layer_mode in {"2l", "both"}
+    ):
+        two_l = int(configured_layers if configured_layers is not None else 2)
         res_2l = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
+            variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
             port=port,
@@ -732,15 +740,20 @@ def run_fast_sanity(
             label="fast_2l",
         )
         attempts.append(res_2l)
-    if layer_mode in {"full", "both"} or (
-        layer_mode == "auto"
-        and fallback_full
-        and attempts[-1]["status"] != "pass"
-        and "stream_probe" not in attempts[-1]
+    if (
+        layer_mode in {"full", "both"}
+        or not attempts
+        or (
+            layer_mode == "auto"
+            and fallback_full
+            and attempts[-1]["status"] != "pass"
+            and "stream_probe" not in attempts[-1]
+        )
     ):
         res_full = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
+            variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
             port=port + (1 if attempts else 0),
@@ -768,6 +781,7 @@ def run_fast_sanity(
     summary = {
         "tier": "fast_sanity",
         "model_id": policy["model_id"],
+        "variant": eff_variant,
         "preset": preset,
         "status": final_attempt["status"],
         "parser_checked": val_report["parser_checked"],
@@ -867,6 +881,7 @@ def run_model_sanity(
     policy_path: Path,
     results_dir: Path,
     assets_map: Path | None = None,
+    variant: str | None = None,
     preset: str | None = None,
     port: int = 9985,
     ready_timeout: int = 3600,
@@ -909,6 +924,7 @@ def run_model_sanity(
         recipe_path,
         policy_path=policy_path,
         tier="model_sanity",
+        variant=variant,
         preset=preset,
         assets_map_path=assets_map,
         port=port,
@@ -1087,6 +1103,7 @@ def run_model_sanity(
         summary = {
             "tier": "model_sanity",
             "model_id": policy["model_id"],
+            "variant": resolved["variant"],
             "hf_model_id": resolved["hf_model_id"],
             "golden_model_key": resolved["golden_model_key"],
             "preset": preset,
@@ -1145,6 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--assets-map", type=Path, default=None)
+    parser.add_argument("--variant", default=None)
     parser.add_argument("--preset", default=None)
     parser.add_argument("--port", type=int, default=9985)
     parser.add_argument("--ready-timeout", type=int, default=1800)
@@ -1165,6 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
             policy_path=args.policy,
             results_dir=args.results_dir,
             assets_map=args.assets_map,
+            variant=args.variant,
             preset=args.preset,
             port=args.port,
             ready_timeout=args.ready_timeout,
@@ -1178,6 +1197,7 @@ def main(argv: list[str] | None = None) -> int:
             policy_path=args.policy,
             results_dir=args.results_dir,
             assets_map=args.assets_map,
+            variant=args.variant,
             preset=args.preset,
             port=args.port,
             ready_timeout=args.ready_timeout,

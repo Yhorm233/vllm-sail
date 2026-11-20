@@ -212,6 +212,123 @@ def test_resolve_dsv4_matches_catalog_and_dpep_preset() -> None:
     assert "--enable-prefix-caching" not in resolved_dpep["flags"]
 
 
+def test_resolve_and_validate_variant_overrides_and_policy_variant(
+    tmp_path: Path,
+) -> None:
+    recipe = RECIPES_DIR / "MiniMaxAI" / "MiniMax-M3.yaml"
+    policy = POLICY_DIR / "models" / "minimax-m3-mxfp4.yaml"
+
+    resolved_default = ppu_recipe.resolve_recipe(recipe, cache="enabled")
+    assert resolved_default["variant"] == "default"
+    assert (
+        resolved_default["hf_model_id"]
+        == "T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+    )
+    assert resolved_default["golden_model_key"] == "minimax-m3-fp8"
+    assert (
+        resolved_default["served_name"]
+        == "MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken"
+    )
+
+    resolved_mxfp4 = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="fast_sanity"
+    )
+    assert resolved_mxfp4["variant"] == "mxfp4_fp8"
+    assert resolved_mxfp4["hf_model_id"] == "T-HEAD/MiniMax-M3-MXFP4-FP8"
+    assert resolved_mxfp4["golden_model_key"] == "minimax-m3-mxfp4-fp8"
+    assert resolved_mxfp4["served_name"] == "minimax-m3-mxfp4-fp8"
+    assert resolved_mxfp4["ppu_count"] == 8
+    assert resolved_mxfp4["config_digest"] != resolved_default["config_digest"]
+
+    resolved_dpep = ppu_recipe.resolve_recipe(
+        recipe, variant="mxfp4_fp8", preset="dp_ep_low_latency", cache="disabled"
+    )
+    assert resolved_dpep["hf_model_id"] == "T-HEAD/MiniMax-M3-MXFP4-FP8"
+    assert resolved_dpep["ppu_count"] == 8
+    assert resolved_dpep["server_env"]["HGGC_EMBEDDED_COPY_THRESHOLD"] == "0x10000"
+    assert "--data-parallel-size" in resolved_dpep["flags"]
+    assert "--tensor-parallel-size" not in resolved_dpep["flags"]
+
+    matrix = ppu_e2e_select.build_recipe_matrix("minimax-m3-mxfp4", tier="fast_sanity")
+    assert len(matrix["include"]) == 1
+    entry = matrix["include"][0]
+    assert entry["variant"] == "mxfp4_fp8"
+    assert entry["model_id"] == "T-HEAD/MiniMax-M3-MXFP4-FP8"
+    assert entry["golden_model_key"] == "minimax-m3-mxfp4-fp8"
+
+    # Reject unknown or blank policy variant.
+    bad_pol = yaml.safe_load(policy.read_text())
+    bad_pol["variant"] = "nonexistent"
+    bad_pol_path = tmp_path / "bad_var_pol.yaml"
+    bad_pol_path.write_text(yaml.safe_dump(bad_pol), encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="unknown variant"):
+        ppu_recipe.validate_paths([bad_pol_path], vllm_parser_mode="skip")
+
+    bad_pol["variant"] = "   "
+    bad_pol_path.write_text(yaml.safe_dump(bad_pol), encoding="utf-8")
+    with pytest.raises(ppu_recipe.ValidationError, match="must be non-empty string"):
+        ppu_recipe.validate_paths([bad_pol_path], vllm_parser_mode="skip")
+
+    # Reject invalid variant metadata and sensitive leaks.
+    base_rec = yaml.safe_load(recipe.read_text())
+    for mutator, match in (
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update({"hf_model_id": ""}),
+            "hf_model_id must be non-empty string",
+        ),
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update(
+                {"hf_model_id": "T-HEAD/" + "a" * 97}
+            ),
+            "max 96 chars",
+        ),
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update({"assets": {"model": "only"}}),
+            "missing required key",
+        ),
+        (
+            lambda d: d["variants"]["mxfp4_fp8"].update(
+                {"served_name": "/data/secret"}
+            ),
+            "local_path",
+        ),
+    ):
+        bad_rec = copy.deepcopy(base_rec)
+        mutator(bad_rec)
+        bad_rec_path = tmp_path / "bad_var_rec.yaml"
+        bad_rec_path.write_text(yaml.safe_dump(bad_rec), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=match):
+            ppu_recipe.validate_paths([bad_rec_path], vllm_parser_mode="skip")
+
+
+def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
+    v41 = ppu_recipe.resolve_recipe(
+        RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4.1-Flash.yaml",
+        policy_path=POLICY_DIR / "models" / "deepseek-v4.1-flash.yaml",
+        tier="fast_sanity",
+    )
+    assert v41["ppu_count"] == 8
+    assert v41["layer_override"] is None
+    assert "--hf-overrides" not in v41["flags"]
+    assert v41["hf_model_id"].endswith("Engram-MXFP8")
+    assert "--engram-config" in v41["flags"]
+    assert "--mm-encoder-tp-mode" in v41["flags"]
+    assert v41["server_env"]["VLLM_ENGINE_READY_TIMEOUT_S"] == "3600"
+
+    v4p = ppu_recipe.resolve_recipe(
+        RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Pro.yaml",
+        policy_path=POLICY_DIR / "models" / "deepseek-v4-pro.yaml",
+        tier="fast_sanity",
+    )
+    assert v4p["ppu_count"] == 8
+    assert "--kv-cache-dtype" in v4p["flags"]
+    assert "--compilation-config" in v4p["flags"]
+    assert "--block-size" in v4p["flags"]
+    assert json.loads(v4p["flags"][v4p["flags"].index("--hf-overrides") + 1]) == {
+        "num_hidden_layers": 3
+    }
+
+
 def test_config_digest_ignores_ephemeral_endpoint_and_tracks_changes() -> None:
     recipe = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
     policy = POLICY_DIR / "models" / "glm-5.3.yaml"
@@ -651,6 +768,43 @@ def test_runner_fast_sanity_falls_back_from_2l_to_full_layers(
         "nonstream_s": 1.2,
     }
     assert (tmp_path / "out" / "summary.json").is_file()
+
+
+def test_runner_fast_sanity_uses_policy_variant_and_null_layer_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str | None, int | None]] = []
+
+    def fake_attempt(*, variant, layer_override, label, **kwargs):
+        seen.append((variant, layer_override))
+        return {
+            "mode": label,
+            "layer_override": layer_override,
+            "status": "pass",
+            "cold_start_s": 30.0,
+            "eval_s": 1.0,
+            "config_digest": "c" * 64,
+            "ppu_count": 8,
+            "probe": {"status": "pass", "elapsed_s": 1.0},
+        }
+
+    pol_doc = yaml.safe_load(
+        (POLICY_DIR / "models" / "minimax-m3-mxfp4.yaml").read_text()
+    )
+    pol_doc["tiers"]["fast_sanity"]["layer_override"] = None
+    pol_path = tmp_path / "minimax-full.yaml"
+    pol_path.write_text(yaml.safe_dump(pol_doc), encoding="utf-8")
+
+    monkeypatch.setattr(ppu_recipe_runner, "_attempt_fast_sanity_once", fake_attempt)
+    res = ppu_recipe_runner.run_fast_sanity(
+        recipe_path=RECIPES_DIR / "MiniMaxAI" / "MiniMax-M3.yaml",
+        policy_path=pol_path,
+        results_dir=tmp_path / "out",
+        parser_mode="skip",
+    )
+    assert seen == [("mxfp4_fp8", None)]
+    assert res["status"] == "pass"
+    assert res["variant"] == "mxfp4_fp8"
 
 
 @pytest.mark.parametrize(

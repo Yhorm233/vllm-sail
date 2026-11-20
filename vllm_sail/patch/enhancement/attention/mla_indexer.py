@@ -142,6 +142,13 @@ def _ppu_paged_metadata(
     schedule = _ppu_deep_gemm.get_paged_mqa_logits_metadata(
         context_lens, block_size, num_sms, metadata_extra, indices=indices
     )
+    # PPU MODIFICATION: begin -- size upstream's copy buffer for the active ABI.
+    buffer = getattr(builder, "scheduler_metadata_buffer", None)
+    if buffer is not None and (
+        buffer.shape[0] < schedule.shape[0] or buffer.shape[1] != schedule.shape[1]
+    ):
+        builder.scheduler_metadata_buffer = schedule.new_empty(schedule.shape)
+    # PPU MODIFICATION: end
     if builder is not None and (
         (weighted_fp4 and getattr(builder, "supports_varlen", False) and has_varlen_ids)
         or (

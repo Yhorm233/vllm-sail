@@ -286,7 +286,10 @@ first run cannot silently become the baseline. Promote it by either:
 |-----------|------|----|-----------|----------|
 | `deepseek_v4_int8` | 890p | 8 | `DeepSeek-V4-Flash-0731-W8A8-INT8` | 0.9689 seeded |
 | `deepseek_v4_mxfp4` | 890p | 8 | `DeepSeek-V4-Flash-0731-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9689 seeded |
+| `deepseek_v4_pro_mxfp4` | 890p | 8 | `DeepSeek-V4-Pro-0813-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9742 measured |
+| `deepseek_v4_1_flash_mxfp4` | 890p | 8 | `DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8` | 0.9712 measured |
 | `minimax-m3-fp8` | 890p | 8 | `MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9735 seeded |
+| `minimax-m3-mxfp4-fp8` | 890p | 8 | `MiniMax-M3-MXFP4-FP8` | 0.9735 measured |
 | `glm_5_3_mxfp4` | 890p | 4 | `GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9689 seeded |
 | `glm_5_3_flash_mxfp4` | 890p | 2 | `GLM-5.3-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9697 measured |
 | `kimi_k2_6_mxfp4` | 890p | 8 | `Kimi-K2.6-MXFP4-FP8` | 0.9788 seeded |
@@ -320,7 +323,10 @@ Sampling parameters per weight (`max_tokens` 10240 for every one of them):
 |-----------|-------------|-------|-------|---------------|
 | `deepseek_v4_int8` | 1.0 | 1.0 | — | `deepseek_v4_flash` |
 | `deepseek_v4_mxfp4` | 1.0 | 1.0 | — | `deepseek_v4_flash` |
+| `deepseek_v4_pro_mxfp4` | 1.0 | 1.0 | — | `deepseek_v4_pro` |
+| `deepseek_v4_1_flash_mxfp4` | 1.0 | 1.0 | — | `deepseek_v4_1_flash` |
 | `minimax-m3-fp8` | 1.0 | 0.95 | — | `minimax_m3` |
+| `minimax-m3-mxfp4-fp8` | 1.0 | 0.95 | — | `minimax_m3` |
 | `glm_5_3_mxfp4` | 1.0 | 1.0 | — | `glm_5_3` |
 | `glm_5_3_flash_mxfp4` | 1.0 | 1.0 | — | `glm_5_3` |
 | `kimi_k2_6_mxfp4` | 1.0 | 0.95 | — | `kimi_k2_6` |

@@ -365,6 +365,43 @@ def test_paged_metadata_derives_legacy_fp8_geometry_from_the_builder(modules):
     assert not fallback
 
 
+@pytest.mark.parametrize("shape", [(630, 4), (313, 2)])
+def test_upstream_copies_exact_schedule_shape_and_reuses_buffer(modules, shape):
+    class Schedule:
+        def __init__(self, shape):
+            self.shape = shape
+            self.copied = None
+
+        def __getitem__(self, selection):
+            return Schedule((min(selection.stop, self.shape[0]), self.shape[1]))
+
+        def __setitem__(self, selection, source):
+            assert self.shape == source.shape
+            self.copied = source
+
+    initial = Schedule((313, 2))
+    builder = NS(
+        indexer_n_head=64,
+        indexer_q_head_dim=128,
+        scheduler_metadata_buffer=initial,
+    )
+    namespace, _, _ = _paged_namespace(modules, ppu=True, builder=builder)
+    metadata = Schedule(shape)
+    namespace["_ppu_deep_gemm"].get_paged_mqa_logits_metadata = lambda *args, **kwargs: (
+        metadata
+    )
+    metadata.new_empty = Schedule
+    paged = function(PATCH, "_ppu_paged_metadata", namespace)
+    for _ in range(2):
+        produced = paged(Span(), 64, 39)
+        view = builder.scheduler_metadata_buffer[: produced.shape[0]]
+        view[:] = produced
+        assert view.copied is metadata
+        if shape == initial.shape:
+            assert builder.scheduler_metadata_buffer is initial
+        initial = builder.scheduler_metadata_buffer
+
+
 def test_paged_metadata_rejects_missing_query_geometry(modules):
     namespace, calls, fallback = _paged_namespace(modules, ppu=True)
     namespace["_current_builder"] = [NS(indexer_n_head=0, indexer_q_head_dim=128)]

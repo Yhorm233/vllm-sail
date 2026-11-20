@@ -1,0 +1,101 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: minimax-m3-fp8
+    tokenizer: minimax-m3-fp8
+  hf_model_id: T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: minimax-m3-fp8
+  served_name: MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  default_features:
+    - tool_calling
+    - reasoning
+  external_env:
+    - HGGC_EMBEDDED_COPY_THRESHOLD
+model:
+  model_id: MiniMaxAI/MiniMax-M3
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "8"
+    - --block-size
+    - "128"
+    - --kv-cache-dtype
+    - fp8
+    - --gpu-memory-utilization
+    - "0.9"
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "3600"
+  base_env: {}
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - minimax_m3
+  reasoning:
+    args:
+      - --reasoning-parser
+      - minimax_m3
+variants:
+  default:
+    precision: fp8
+    assets:
+      model: minimax-m3-fp8
+      tokenizer: minimax-m3-fp8
+    hf_model_id: T-HEAD/MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    golden_model_key: minimax-m3-fp8
+    served_name: MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    extra_args: []
+    extra_env: {}
+  mxfp4_fp8:
+    precision: mxfp4
+    assets:
+      model: minimax-m3-mxfp4-fp8
+      tokenizer: minimax-m3-mxfp4-fp8
+    hf_model_id: T-HEAD/MiniMax-M3-MXFP4-FP8
+    golden_model_key: minimax-m3-mxfp4-fp8
+    served_name: minimax-m3-mxfp4-fp8
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  dp_ep_low_latency:
+    hardware: zhenwu_m890
+    remove_args:
+      - --tensor-parallel-size
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --max-model-len
+      - auto
+    env:
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      VLLM_ENGINE_READY_TIMEOUT_S: "60000"
+      VLLM_PROCESS_GROUP_TIMEOUT_M: "60"
+  prefill_long:
+    hardware: zhenwu_m890
+    args: []
+  eval_longctx:
+    hardware: zhenwu_m890
+    args: []
+notes: >-
+  Default serving configuration aligns with the P0 single-node 8-card Zhenwu M890
+  performance baseline (TP8, FP8 KV cache, block size 128, and MiniMax M3
+  tool-call/reasoning parsers). Variants select the FP8 (default) or MXFP4-FP8
+  checkpoint; preset dp_ep_low_latency matches the P0 8-card DP+EP decode
+  layout. Prefix caching is controlled by the test policy.

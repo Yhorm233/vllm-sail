@@ -301,7 +301,7 @@ def resolve_recipe(
     *,
     policy_path: Path | None = None,
     tier: str | None = None,
-    variant: str = "default",
+    variant: str | None = None,
     hardware: str = "zhenwu_m890",
     preset: str | None = None,
     cache: str | None = None,
@@ -331,6 +331,11 @@ def resolve_recipe(
     eff_dummy = dummy_weights
     eff_layers: int | None = None if layer_override is _UNSET else layer_override
     eff_preset = preset
+    eff_variant = (
+        variant
+        if variant is not None
+        else (policy.get("variant") if policy is not None else None) or "default"
+    )
     needs_dev_mode = False
 
     if policy is not None:
@@ -372,9 +377,9 @@ def resolve_recipe(
 
     # 2. variants.<variant>
     variants_blk = recipe.get("variants", {})
-    if variant not in variants_blk:
-        raise ValidationError(f"{recipe_path}: unknown variant {variant!r}")
-    var_blk = variants_blk[variant]
+    if eff_variant not in variants_blk:
+        raise ValidationError(f"{recipe_path}: unknown variant {eff_variant!r}")
+    var_blk = variants_blk[eff_variant]
     ordered = _apply_flag_entries(ordered, list(var_blk.get("extra_args", [])))
     server_env.update(var_blk.get("extra_env", {}))
 
@@ -444,11 +449,22 @@ def resolve_recipe(
 
     # 7. assets-map + runtime endpoint injection
     assets_map = _load_assets_map(assets_map_path)
-    asset_name = ppu_blk["assets"]["model"]
-    hf_model_id = ppu_blk.get("hf_model_id") or model_blk["model_id"]
+    eff_assets = {**ppu_blk["assets"], **var_blk.get("assets", {})}
+    asset_name = eff_assets["model"]
+    hf_model_id = (
+        var_blk.get("hf_model_id")
+        or ppu_blk.get("hf_model_id")
+        or model_blk["model_id"]
+    )
     resolved_model = assets_map.get(asset_name, hf_model_id)
     effective_served_name = (
-        served_model_name or ppu_blk.get("served_name") or asset_name
+        served_model_name
+        or var_blk.get("served_name")
+        or ppu_blk.get("served_name")
+        or asset_name
+    )
+    golden_model_key = (
+        var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
     )
 
     flags_only = _render_entries(ordered)
@@ -482,7 +498,7 @@ def resolve_recipe(
         "framework": ppu_blk["framework"],
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
-        "variant": variant,
+        "variant": eff_variant,
         "hardware": hardware,
         "preset": eff_preset,
         "tier": tier,
@@ -507,12 +523,12 @@ def resolve_recipe(
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
         "resolved_model": resolved_model,
-        "golden_model_key": ppu_blk.get("golden_model_key", asset_name),
+        "golden_model_key": golden_model_key,
         "served_name": effective_served_name,
         "config_digest": config_digest,
         "tier": tier,
         "preset": eff_preset,
-        "variant": variant,
+        "variant": eff_variant,
         "hardware": hardware,
         "enabled_features": active_features,
         "layer_override": eff_layers,
@@ -581,6 +597,23 @@ def _validate_env_block(
             raise ValidationError(
                 f"{context}: external env {name!r} must be listed in ppu.external_env"
             )
+
+
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_hf_model_id(value: Any, *, context: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{context} must be non-empty string")
+    if not _HF_REPO_ID_RE.fullmatch(value):
+        raise ValidationError(
+            f"{context} must be a valid owner/name Hugging Face repo ID: {value!r}"
+        )
+    owner, repo = value.split("/", 1)
+    if owner.endswith(("-", ".")) or repo.endswith(("-", ".")) or len(repo) > 96:
+        raise ValidationError(
+            f"{context} violates Hugging Face repo ID rules (max 96 chars for name): {value!r}"
+        )
 
 
 def _validate_flag_list(tokens: Any, *, context: str) -> None:
@@ -680,6 +713,8 @@ def validate_serving_recipe_structure(
             f"{context}.ppu.topology.devices_per_node must be positive int"
         )
 
+    if "hf_model_id" in ppu:
+        _validate_hf_model_id(ppu["hf_model_id"], context=f"{context}.ppu.hf_model_id")
     external_env = set(
         _check_str_list(
             ppu.get("external_env", []), context=f"{context}.ppu.external_env"
@@ -754,10 +789,37 @@ def validate_serving_recipe_structure(
     for vname, vcfg in recipe.get("variants", {}).items():
         _check_keys(
             vcfg,
-            allowed={"precision", "extra_args", "extra_env"},
+            allowed={
+                "precision",
+                "extra_args",
+                "extra_env",
+                "assets",
+                "hf_model_id",
+                "golden_model_key",
+                "served_name",
+            },
             required={"precision"},
             context=f"{context}.variants.{vname}",
         )
+        if "assets" in vcfg:
+            v_assets = _check_keys(
+                vcfg["assets"],
+                allowed={"model", "tokenizer"},
+                required={"model", "tokenizer"},
+                context=f"{context}.variants.{vname}.assets",
+            )
+            _check_str_dict(v_assets, context=f"{context}.variants.{vname}.assets")
+        if "hf_model_id" in vcfg:
+            _validate_hf_model_id(
+                vcfg["hf_model_id"], context=f"{context}.variants.{vname}.hf_model_id"
+            )
+        for key in ("golden_model_key", "served_name"):
+            if key in vcfg and (
+                not isinstance(vcfg[key], str) or not vcfg[key].strip()
+            ):
+                raise ValidationError(
+                    f"{context}.variants.{vname}.{key} must be non-empty string"
+                )
         _validate_flag_list(
             vcfg.get("extra_args", []), context=f"{context}.variants.{vname}.extra_args"
         )
@@ -925,6 +987,7 @@ def validate_policy_structure(
             "schema_version",
             "model_id",
             "recipe",
+            "variant",
             "hardware",
             "frameworks",
             "measurement",
@@ -942,6 +1005,12 @@ def validate_policy_structure(
     if "tiers" not in policy and "stages" not in policy:
         raise ValidationError(f"{context}: policy must define 'tiers' or 'stages'")
 
+    if "variant" in policy and (
+        not isinstance(policy["variant"], str) or not policy["variant"].strip()
+    ):
+        raise ValidationError(f"{context}.variant must be non-empty string")
+    policy_variant = policy.get("variant", "default")
+
     recipe_path: Path | None = None
     if "recipe" in policy:
         rel = Path(policy["recipe"])
@@ -949,6 +1018,12 @@ def validate_policy_structure(
         if not recipe_path.is_file():
             raise ValidationError(
                 f"{context}: referenced recipe not found: {policy['recipe']}"
+            )
+        rec_doc = _load_yaml(recipe_path)
+        variants_blk = rec_doc.get("variants", {})
+        if policy_variant not in variants_blk:
+            raise ValidationError(
+                f"{context}: unknown variant {policy_variant!r} in {policy['recipe']}"
             )
 
     tiers = policy.get("tiers", {})
@@ -1065,6 +1140,7 @@ def validate_policy_structure(
                 if recipe_path is not None:
                     resolved = resolve_recipe(
                         recipe_path,
+                        variant=policy_variant,
                         hardware=policy["hardware"],
                         preset=stage.get("preset"),
                         cache=stage.get("cache"),
@@ -1573,7 +1649,7 @@ def main(argv: list[str] | None = None) -> int:
     res.add_argument("--recipe", type=Path, required=True)
     res.add_argument("--policy", type=Path, default=None)
     res.add_argument("--tier", choices=["fast_sanity", "model_sanity"], default=None)
-    res.add_argument("--variant", default="default")
+    res.add_argument("--variant", default=None)
     res.add_argument("--hardware", default="zhenwu_m890")
     res.add_argument("--preset", default=None)
     res.add_argument("--cache", choices=["enabled", "disabled"], default=None)

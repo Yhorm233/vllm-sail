@@ -1,0 +1,84 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: deepseek-v4-pro-mxfp4
+    tokenizer: deepseek-v4-pro-mxfp4
+  hf_model_id: T-HEAD/DeepSeek-V4-Pro-0813-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: deepseek_v4_pro_mxfp4
+  served_name: deepseek-v4-pro-mxfp4
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  default_features:
+    - tool_calling
+    - reasoning
+  external_env: []
+model:
+  model_id: deepseek-ai/DeepSeek-V4-Pro
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "8"
+    - --block-size
+    - "256"
+    - --kv-cache-dtype
+    - fp8
+    - --gpu-memory-utilization
+    - "0.95"
+    - --max-model-len
+    - auto
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":0}'
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "3600"
+  base_env:
+    VLLM_ENGINE_READY_TIMEOUT_S: "6000"
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - deepseek_v4
+  reasoning:
+    args:
+      - --tokenizer-mode
+      - deepseek_v4
+      - --reasoning-parser
+      - deepseek_v4
+  spec_decoding:
+    default_mode: mtp
+    modes:
+      mtp:
+        args:
+          - --speculative-config
+          - '{"method":"mtp","num_speculative_tokens":2}'
+variants:
+  default:
+    precision: mxfp4
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  prefill_long:
+    hardware: zhenwu_m890
+    select:
+      features:
+        spec_decoding: false
+    args: []
+  eval_longctx:
+    hardware: zhenwu_m890
+    args: []
+notes: >-
+  Default serving configuration aligns with the P0 single-node 8-card Zhenwu M890
+  performance baseline (TP8, FP8 KV cache, block size 256, FULL_DECODE_ONLY
+  compilation config, and DeepSeek V4 parsers). Prefix caching is controlled by
+  the test policy.

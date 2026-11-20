@@ -140,6 +140,7 @@ def _recipe_entries(models: str, tier: str) -> Iterator[tuple[dict, list[str], d
                 "key": slug,
                 "policy_path": pol_path.relative_to(REPO_ROOT).as_posix(),
                 "recipe_path": rec_path.relative_to(REPO_ROOT).as_posix(),
+                "variant": resolved["variant"],
                 "model_id": resolved["hf_model_id"],
                 "golden_model_key": resolved["golden_model_key"],
                 "ppu_count": int(resolved["ppu_count"]),
