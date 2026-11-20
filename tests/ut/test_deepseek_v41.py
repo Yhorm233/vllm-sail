@@ -774,7 +774,7 @@ def test_v41_model_resolves_int8_at_construction_like_v4(
     calls = []
     published = []
     selected = ppu and int8
-    original_mapper, mapped = object(), object()
+    original_mapper, mapped, class_mapper = object(), object(), object()
     config = SimpleNamespace(quant_config=None)
 
     class Base:
@@ -783,6 +783,7 @@ def test_v41_model_resolves_int8_at_construction_like_v4(
         def __init__(self, **kwargs):
             # Upstream layers are built here and must already see the decision.
             calls.append(("construct", kwargs, list(published)))
+            self.hf_to_vllm_mapper = original_mapper
 
         def forward(self, *args, **kwargs):
             return 17
@@ -805,7 +806,16 @@ def test_v41_model_resolves_int8_at_construction_like_v4(
         set_current_vllm_config=unavailable,
         get_current_vllm_config=unavailable,
     )
-    modules("vllm.models.deepseek_v41.nvidia.vl_model", DeepseekV41ForCausalLM=Base)
+
+    def make_mapper(*, orig_to_new_prefix):
+        assert orig_to_new_prefix["layers."] == "language_model.model.layers."
+        return class_mapper
+
+    modules("vllm.model_executor.models.utils", WeightsMapper=make_mapper)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.vl_model",
+        DeepseekV41ForCausalLM=Base,
+    )
     modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
     modules(
         "vllm_sail.models.deepseek_v41.config",
@@ -813,6 +823,7 @@ def test_v41_model_resolves_int8_at_construction_like_v4(
         set_int8_w8a8=published.append,
     )
     module = load_patch("vllm_sail/models/deepseek_v41/model.py")
+    assert module.DeepseekV41ForCausalLM.hf_to_vllm_mapper is class_mapper
     monkeypatch.setattr(module, "int8_weights_mapper", map_weights)
     model = module.DeepseekV41ForCausalLM(vllm_config=config, prefix="model")
     assert [call[0] for call in calls] == (
@@ -823,6 +834,7 @@ def test_v41_model_resolves_int8_at_construction_like_v4(
     assert published == [selected]
     assert model.hf_to_vllm_mapper is (mapped if selected else original_mapper)
     assert Base.hf_to_vllm_mapper is original_mapper
+    assert module.DeepseekV41ForCausalLM.hf_to_vllm_mapper is class_mapper
     # Like the PPU V4 model, forward is inherited unchanged.
     assert "forward" not in vars(module.DeepseekV41ForCausalLM)
     assert model.forward(1, 2, 3, 4, lookback_token_ids=5) == 17

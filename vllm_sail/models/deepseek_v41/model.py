@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Preserve the V4.1 VL wrapper and adjust weight-scale mapping only for PPU W8A8 instances."""
+"""Preserve the V4.1 VL wrapper and its checkpoint quantization contract."""
 
 from copy import deepcopy
 
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.models.deepseek_v41.nvidia.vl_model import (
     DeepseekV41ForCausalLM as UpstreamDeepseekV41ForCausalLM,
 )
@@ -30,6 +31,23 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
     constructor's ``vllm_config`` only; forward stays upstream and never reads
     the global config.
     """
+
+    # configure_quant_config reads this before __init__ constructs any layers.
+    # The upstream VL wrapper only installs an instance mapper after constructing
+    # its language model, which is too late to remap compressed-tensors ignores
+    # such as layers.1.engram.wkv into language_model.model.layers.1.engram.wkv.
+    # Only map module prefixes here, independently of expert dtype or scale
+    # naming. The upstream initializer still installs the checkpoint-specific
+    # instance mapper for loading weights.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "layers.": "language_model.model.layers.",
+            "embed.": "language_model.model.embed.",
+            "norm.": "language_model.model.norm.",
+            "hc_head": "language_model.model.hc_head",
+            "mtp.": "language_model.model.mtp.",
+        }
+    )
 
     def __init__(self, *, vllm_config, prefix=""):
         use_int8 = current_platform.is_ppu() and uses_int8_w8a8(vllm_config)
