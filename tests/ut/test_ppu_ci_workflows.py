@@ -402,6 +402,8 @@ def test_pr_pipeline_structure():
     assert runtime["outputs"] == {
         "upstream_reuse": "${{ steps.reuse.outputs.supported }}",
         "recipe_sanity": "${{ steps.recipe.outputs.supported }}",
+        "recipe_matrix": "${{ steps.recipe_matrix.outputs.recipe_matrix }}",
+        "ready_epoch": "${{ steps.ready.outputs.ready_epoch }}",
     }
     resolve = next(
         step
@@ -431,6 +433,10 @@ def test_pr_pipeline_structure():
     ]
     assert "always()" in jobs["gate"]["if"]
     assert "ci-preview" in jobs["gate"]["if"]
+    assert (
+        jobs["gate"]["runs-on"]
+        == "${{ inputs.skip_ppu && 'ubuntu-latest' || '8-ppu-m890p' }}"
+    )
     gate = jobs["gate"]["steps"][0]
     assert gate["env"] == {
         "JOB_RESULTS": "${{ toJSON(needs) }}",
@@ -454,12 +460,20 @@ def test_pr_pipeline_structure():
         assert "!cancelled()" in job["if"]
         assert "ci-preview" in job["if"]
         assert "needs.build.result == 'success'" in job["if"]
-        assert job["with"] == {
+        expected_with = {
             "pr_mode": True,
             "pr_head_sha": "${{ inputs.pr_head_sha || github.sha }}",
             "wheel_source_sha": "${{ inputs.wheel_source_sha || '' }}",
             "build_run_id": "${{ inputs.existing_build_run_id || github.run_id }}",
         }
+        if job_id == "recipe-sanity":
+            expected_with.update(
+                {
+                    "recipe_matrix": "${{ needs.runtime-image.outputs.recipe_matrix || '' }}",
+                    "ready_epoch": "${{ needs.build.outputs.ready_epoch || needs.runtime-image.outputs.ready_epoch || '' }}",
+                }
+            )
+        assert job["with"] == expected_with
     # kernel-perf is no longer in the gate; it lives in kernel-perf-label.yaml
     assert "kernel-perf" not in jobs
 
@@ -706,13 +720,20 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
         assert value["type"] == "string"
         assert value["default"] == ""
         assert not value.get("required", False)
-    assert set(call["outputs"]) == {"image"}
+    assert set(call["outputs"]) == {"image", "ready_epoch"}
     assert call["outputs"]["image"]["value"] == "${{ jobs.build.outputs.image }}"
+    assert (
+        call["outputs"]["ready_epoch"]["value"]
+        == "${{ jobs.build.outputs.ready_epoch }}"
+    )
     assert set(config["jobs"]) == {"build"}
     build = config["jobs"]["build"]
     # The controller identifies successful wheel builds by the leaf job name on retry.
     assert build["name"] == "PPU wheel build"
-    assert build["outputs"] == {"image": "${{ steps.image.outputs.image }}"}
+    assert build["outputs"] == {
+        "image": "${{ steps.image.outputs.image }}",
+        "ready_epoch": "${{ steps.ready.outputs.ready_epoch }}",
+    }
     assert "if" not in build
     assert "needs" not in build
     caller = workflow("ppu-build-and-test.yaml")["jobs"]["build"]
@@ -2865,3 +2886,189 @@ def test_debug_workflow_retains_kernel_perf_target():
         "kernel-perf"
         in config[True]["workflow_dispatch"]["inputs"]["target"]["options"]
     )
+
+
+def test_runtime_preflight_resolves_fast_sanity_matrix_in_isolated_container(
+    build_jobs, tmp_path
+):
+    step = next(
+        s
+        for s in build_jobs["runtime-image"]["steps"]
+        if s.get("id") == "recipe_matrix"
+    )
+    base_ctx = {
+        "inputs.skip_device_tests": False,
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "",
+        "steps.recipe.outputs.supported": "true",
+    }
+    assert bool(expression(step["if"], base_ctx)) is True
+    assert (
+        bool(expression(step["if"], {**base_ctx, "inputs.skip_device_tests": True}))
+        is False
+    )
+    assert (
+        bool(
+            expression(
+                step["if"], {**base_ctx, "vars.PPU_RECIPE_PUBLIC_ENABLED": "false"}
+            )
+        )
+        is False
+    )
+    assert (
+        bool(
+            expression(
+                step["if"], {**base_ctx, "steps.recipe.outputs.supported": "false"}
+            )
+        )
+        is False
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    args_file = tmp_path / "docker-args.json"
+    docker = bin_dir / "docker"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"open({str(args_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+        "sys.stdout.write(os.environ['FAKE_DOCKER_OUT'])\n"
+    )
+    docker.chmod(0o755)
+
+    image_id = "sha256:" + "a" * 64
+    output = tmp_path / "github-output"
+    valid = 'recipe_matrix={"include":[{"key":"glm-5.3"}]}\n'
+    res = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "SOURCE_DIR": str(src_dir),
+            "IMAGE_ID": image_id,
+            "GITHUB_OUTPUT": str(output),
+            "FAKE_DOCKER_OUT": valid,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    assert output.read_text() == valid
+    argv = json.loads(args_file.read_text())
+    for required in (
+        "run",
+        "--rm",
+        "--runtime=runc",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--entrypoint",
+        "python3",
+        image_id,
+        "-I",
+        "-B",
+        "/source/scripts/ci/ppu_e2e_select.py",
+        "--recipes",
+        "",
+        "fast_sanity",
+    ):
+        assert required in argv
+
+    for bad in (
+        'recipe_matrix={"include":[]}\ninjected=true\n',
+        "supported=false\n",
+        "",
+    ):
+        bad_out = tmp_path / "bad-output"
+        res_bad = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", step["run"]],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "SOURCE_DIR": str(src_dir),
+                "IMAGE_ID": image_id,
+                "GITHUB_OUTPUT": str(bad_out),
+                "FAKE_DOCKER_OUT": bad,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert res_bad.returncode != 0
+        assert not bad_out.exists()
+
+
+def test_fast_sanity_skips_hosted_prepare_with_preflight_matrix_and_runs_two_way_parallel(
+    tmp_path,
+):
+    fast = workflow("_ppu-recipe-fast-sanity.yaml")["jobs"]
+    prepare = fast["prepare"]
+    sanity = fast["sanity"]
+    assert sanity["strategy"]["max-parallel"] == 2
+    assert (
+        sanity["strategy"]["matrix"]["model"]
+        == "${{ fromJson(inputs.recipe_matrix || needs.prepare.outputs.matrix || '{\"include\":[]}').include }}"
+    )
+
+    pr_preflight_ctx = {
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
+        "inputs.pr_mode": True,
+        "inputs.recipe_matrix": '{"include":[{"key":"glm-5.3"}]}',
+        "needs.prepare.result": "skipped",
+    }
+    assert bool(expression(prepare["if"], pr_preflight_ctx)) is False
+    assert bool(expression(sanity["if"], pr_preflight_ctx)) is True
+
+    # Manual dispatch (pr_mode=False) still runs prepare and refuses foreign wheel runs.
+    manual_ctx = {
+        "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
+        "inputs.pr_mode": False,
+        "inputs.recipe_matrix": '{"include":[{"key":"glm-5.3"}]}',
+        "needs.prepare.result": "skipped",
+    }
+    assert bool(expression(prepare["if"], manual_ctx)) is True
+    assert bool(expression(sanity["if"], manual_ctx)) is False
+
+    runtime_step = next(s for s in sanity["steps"] if s.get("id") == "runtime")
+    for pr_mode, build_run, ready_epoch, ok in (
+        ("true", "100", "", True),
+        ("true", "100", "not-a-number", True),
+        ("false", "101", "1700000000", True),
+        ("false", "100", "1700000000", False),
+    ):
+        out_file = tmp_path / f"out-{pr_mode}-{build_run}-{ready_epoch or 'empty'}"
+        env_file = tmp_path / f"env-{pr_mode}-{build_run}-{ready_epoch or 'empty'}"
+        runner_tmp = tmp_path / f"rt-{pr_mode}-{build_run}-{ready_epoch or 'empty'}"
+        runner_tmp.mkdir()
+        res = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", runtime_step["run"]],
+            env={
+                **os.environ,
+                "PR_MODE": pr_mode,
+                "BUILD_RUN_ID": build_run,
+                "GITHUB_RUN_ID": "101",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_WORKSPACE": str(tmp_path),
+                "RUNNER_TEMP": str(runner_tmp),
+                "READY_EPOCH": ready_epoch,
+                "GITHUB_OUTPUT": str(out_file),
+                "GITHUB_ENV": str(env_file),
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert (res.returncode == 0) is ok, res.stderr
+        if ok:
+            kv = dict(line.split("=", 1) for line in out_file.read_text().splitlines())
+            if not ready_epoch.isdigit():
+                assert kv["queue_s"] == "0"
+            else:
+                assert int(kv["queue_s"]) > 0
+
+
+def test_ppu_gate_avoids_hosted_runner_queue_except_when_skip_ppu_is_set(build_jobs):
+    gate_runs_on = build_jobs["gate"]["runs-on"]
+    assert expression(gate_runs_on, {"inputs.skip_ppu": False}) == "8-ppu-m890p"
+    assert expression(gate_runs_on, {}) == "8-ppu-m890p"
+    assert expression(gate_runs_on, {"inputs.skip_ppu": True}) == "ubuntu-latest"

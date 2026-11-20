@@ -82,6 +82,8 @@ jobs:
     outputs:
       upstream_reuse: ${{ steps.reuse.outputs.supported }}
       recipe_sanity: ${{ steps.recipe.outputs.supported }}
+      recipe_matrix: ${{ steps.recipe_matrix.outputs.recipe_matrix }}
+      ready_epoch: ${{ steps.ready.outputs.ready_epoch }}
     steps:
       - name: Prepare isolated runtime preflight checkout
         id: workspace
@@ -104,9 +106,13 @@ jobs:
           persist-credentials: false
 
       - name: Resolve the runner-configured CUDA-compatible runtime
+        id: image
         env:
           SOURCE_DIR: ${{ steps.workspace.outputs.source }}
-        run: bash "${SOURCE_DIR}/scripts/ci/ppu_runtime_image.sh" >/dev/null
+        run: |
+          image_id="$(bash "${SOURCE_DIR}/scripts/ci/ppu_runtime_image.sh")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'image_id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
 
       # Release branches cut before the M890 reuse lane do not ship its entry
       # script, so their PRs skip the lane instead of failing on an unknown mode.
@@ -143,6 +149,35 @@ jobs:
           else
             echo supported=false >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve fast sanity matrix
+        id: recipe_matrix
+        if: >-
+          ${{ !inputs.skip_device_tests &&
+          (vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true') &&
+          steps.recipe.outputs.supported == 'true' }}
+        env:
+          SOURCE_DIR: ${{ steps.workspace.outputs.source }}
+          IMAGE_ID: ${{ steps.image.outputs.image_id }}
+        run: |
+          source_dir="$(realpath "${SOURCE_DIR}")"
+          matrix_line="$(docker run --rm --runtime=runc --network=none --read-only \
+            --cap-drop=ALL --security-opt=no-new-privileges \
+            --env NVIDIA_VISIBLE_DEVICES=void \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --mount "type=bind,source=${source_dir},target=/source,readonly" \
+            --workdir /source \
+            --entrypoint python3 "${IMAGE_ID}" \
+            -I -B /source/scripts/ci/ppu_e2e_select.py --recipes "" fast_sanity)"
+          if [[ "$matrix_line" == *$'\n'* || ! "$matrix_line" =~ ^recipe_matrix=\{\"include\":\[.*\]\}$ ]]; then
+            echo "Invalid recipe_matrix output from selector" >&2
+            exit 1
+          fi
+          printf '%s\n' "$matrix_line" >> "$GITHUB_OUTPUT"
+
+      - name: Record runtime preflight completion
+        id: ready
+        run: printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
   preview-donor:
     name: Find a Nightly wheel donor for Preview
@@ -267,6 +302,8 @@ jobs:
       pr_head_sha: ${{ inputs.pr_head_sha || github.sha }}
       build_run_id: ${{ inputs.existing_build_run_id || github.run_id }}
       wheel_source_sha: ${{ inputs.wheel_source_sha || '' }}
+      recipe_matrix: ${{ needs.runtime-image.outputs.recipe_matrix || '' }}
+      ready_epoch: ${{ needs.build.outputs.ready_epoch || needs.runtime-image.outputs.ready_epoch || '' }}
 
   upstream-reuse:
     name: PPU upstream reuse
@@ -305,7 +342,7 @@ jobs:
       github.event.label.name == 'ci-preview')) &&
       !github.event.pull_request.draft &&
       contains(github.event.pull_request.labels.*.name, 'ci-preview'))) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.skip_ppu && 'ubuntu-latest' || '8-ppu-m890p' }}
     timeout-minutes: 5
     steps:
       - name: Require every PPU stage to succeed

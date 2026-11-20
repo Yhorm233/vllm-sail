@@ -21,6 +21,14 @@ on:
         description: Comma-separated recipe policy slugs (blank = all)
         type: string
         default: ""
+      recipe_matrix:
+        description: Pre-resolved recipe matrix JSON from runtime preflight (blank resolves in prepare)
+        type: string
+        default: ""
+      ready_epoch:
+        description: Unix epoch when wheels became ready for Fast Sanity queueing
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -34,7 +42,9 @@ concurrency:
 jobs:
   prepare:
     name: Resolve fast sanity matrix
-    if: vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+    if: >-
+      ${{ (vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true') &&
+      (!inputs.pr_mode || (inputs.recipe_matrix || '') == '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -79,13 +89,18 @@ jobs:
   sanity:
     name: Fast sanity ${{ matrix.model.key }}
     needs: prepare
+    if: >-
+      ${{ !cancelled() &&
+      (vars.PPU_RECIPE_PUBLIC_ENABLED == '' || vars.PPU_RECIPE_PUBLIC_ENABLED == 'true') &&
+      (needs.prepare.result == 'success' ||
+      (inputs.pr_mode && needs.prepare.result == 'skipped' && (inputs.recipe_matrix || '') != '')) }}
     runs-on: 8-ppu-m890p
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
-        model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
+        model: ${{ fromJson(inputs.recipe_matrix || needs.prepare.outputs.matrix || '{"include":[]}').include }}
     env:
       GIT_CONFIG_NOSYSTEM: "1"
     defaults:
@@ -95,10 +110,19 @@ jobs:
       - name: Prepare private runtime directories and Git configuration
         id: runtime
         env:
-          READY_EPOCH: ${{ needs.prepare.outputs.ready_epoch }}
+          READY_EPOCH: ${{ inputs.ready_epoch || needs.prepare.outputs.ready_epoch }}
+          PR_MODE: ${{ inputs.pr_mode }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
+          if [[ "$PR_MODE" != true ]]; then
+            test "$BUILD_RUN_ID" = "$GITHUB_RUN_ID"
+          fi
           now_epoch="$(date +%s)"
-          queue_s=$(( now_epoch > READY_EPOCH ? now_epoch - READY_EPOCH : 0 ))
+          ready_epoch="${READY_EPOCH:-0}"
+          if [[ ! "$ready_epoch" =~ ^[0-9]+$ ]]; then
+            ready_epoch=0
+          fi
+          queue_s=$(( ready_epoch > 0 && now_epoch > ready_epoch ? now_epoch - ready_epoch : 0 ))
           config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
           wheels="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-wheels.XXXXXX")"
           artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-artifacts.XXXXXX")"

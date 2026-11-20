@@ -27,6 +27,9 @@ on:
       image:
         description: Build image recorded for downstream tests
         value: ${{ jobs.build.outputs.image }}
+      ready_epoch:
+        description: Unix epoch recorded when wheel artifacts are ready
+        value: ${{ jobs.build.outputs.ready_epoch }}
 
 permissions:
   contents: read
@@ -40,6 +43,7 @@ jobs:
     timeout-minutes: 180
     outputs:
       image: ${{ steps.image.outputs.image }}
+      ready_epoch: ${{ steps.ready.outputs.ready_epoch }}
     container:
       image: ${{ inputs.build_image || 'download.t-head.cn/docker_release/pytorch@sha256:a33a67832f7ec442c481421e94255518dd67e464406f8e610c15d2b594b21f80' }}
     env:
@@ -114,6 +118,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           overwrite: true
+
+      - name: Record wheel readiness epoch
+        id: ready
+        if: success()
+        run: printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Upload build diagnostics
         if: always()
