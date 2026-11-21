@@ -5,7 +5,8 @@ hardware: zhenwu_m890
 tiers:
   fast_sanity:
     dummy_weights: true
-    layer_override: 2
+    # Deterministic 4-layer dummy weights emit empty_stream_content under enable_thinking=false; full 64-layer dummy startup is ~303s vs ~294s.
+    layer_override: null
     fallback_full_layers: true
     cache: enabled
     probe:

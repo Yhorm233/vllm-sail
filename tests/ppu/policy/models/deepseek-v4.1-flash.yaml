@@ -10,9 +10,9 @@ accuracy_gate:
 tiers:
   fast_sanity:
     dummy_weights: true
-    # Full 40 layers (20 encoder + 20 decoder): layer_override: 2 would skip the decoder stack.
-    layer_override: null
-    fallback_full_layers: false
+    # Segmented 40-layer stack (20 encoder + 20 decoder): `auto` infers full layers via `deepseek_v41`.
+    layer_override: auto
+    fallback_full_layers: true
     cache: enabled
     probe:
       prompt: "Compute 6 * 7 and reply with the integer only."

@@ -14,6 +14,8 @@ import os
 import re
 import shlex
 import sys
+from collections.abc import Mapping, Sequence
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +92,108 @@ ALLOWED_PRESET_SLOTS = frozenset(
     }
 )
 ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"})
+DEFAULT_MAX_AUTO_LAYER_OVERRIDE = 8
+SEGMENTED_MODEL_TYPES = frozenset({"deepseek_v41"})
+_SAFE_SIGNAL_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_NON_BACKBONE_PREFIX_RE = re.compile(
+    r"(?:^|\.)(?:vision|visual|audio|mtp|draft|mm_projector|multi_modal_projector)[^.]*\."
+)
+_BACKBONE_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.(.+))?$")
+_EXPERT_INDEX_RE = re.compile(r"\bexperts\.\d+\.")
+_TENSOR_PARAM_SUFFIX_RE = re.compile(
+    r"\.(?:weight|bias|qweight|qzeros|scales|g_idx|"
+    r"(?:weight|input|output|k|v|kv)_scale(?:_inv|_2)?)$"
+)
+_LAYER_SPECIFIC_RULE_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])layers(?:[^A-Za-z0-9]|$)", re.I
+)
+_CANONICAL_LAYER_MODULE_PROBES: tuple[str, ...] = (
+    "",
+    "mlp",
+    "mlp.down_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.gate_up_proj",
+    "mlp.fc1",
+    "mlp.fc2",
+    "mlp.c_fc",
+    "mlp.c_proj",
+    "mlp.gate",
+    "mlp.shared_expert_gate",
+    "mlp.experts.0.down_proj",
+    "mlp.experts.0.gate_proj",
+    "mlp.experts.0.up_proj",
+    "mlp.experts.0.gate_up_proj",
+    "mlp.experts.0.w1",
+    "mlp.experts.0.w2",
+    "mlp.experts.0.w3",
+    "mlp.experts.0.w13_proj",
+    "mlp.shared_experts",
+    "mlp.shared_experts.down_proj",
+    "mlp.shared_experts.gate_proj",
+    "mlp.shared_experts.up_proj",
+    "mlp.shared_experts.gate_up_proj",
+    "mlp.shared_experts.w1",
+    "mlp.shared_experts.w2",
+    "mlp.shared_experts.w3",
+    "block_sparse_moe.gate",
+    "block_sparse_moe.experts.0.w1",
+    "block_sparse_moe.experts.0.w2",
+    "block_sparse_moe.experts.0.w3",
+    "ffn",
+    "ffn.w1",
+    "ffn.w2",
+    "ffn.w3",
+    "ffn.shared_experts",
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w2",
+    "ffn.shared_experts.w3",
+    "self_attn",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "self_attn.qkv_proj",
+    "self_attn.c_attn",
+    "self_attn.c_proj",
+    "self_attn.q_a_proj",
+    "self_attn.q_b_proj",
+    "self_attn.kv_a_proj_with_mqa",
+    "self_attn.kv_b_proj",
+    "self_attn.compressor",
+    "self_attn.indexer",
+    "attn.qkv_proj",
+    "attn.o_proj",
+    "attn.compressor",
+    "linear_attn",
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_qkvz",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_a",
+    "linear_attn.in_proj_b",
+    "linear_attn.in_proj_ba",
+    "linear_attn.conv1d",
+    "linear_attn.out_proj",
+)
+_NON_LAYER_LIST_KEYS = frozenset(
+    {
+        "architectures",
+        "bad_words_ids",
+        "begin_suppress_tokens",
+        "bos_token_id",
+        "eos_token_id",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "head_dim",
+        "image_grid_pinpoints",
+        "medusa_choices",
+        "mrope_section",
+        "pad_token_id",
+        "rope_scaling",
+        "suppress_tokens",
+        "torch_dtype",
+    }
+)
 
 _PROHIBITED_TOKEN_A = "".join(chr(c) for c in (98, 116, 118))
 _PROHIBITED_TOKEN_B = "".join(chr(c) for c in (102, 108, 121, 116, 105, 103, 101, 114))
@@ -296,6 +400,629 @@ def _canonical_flags(ordered: list[tuple[str, str | None, bool]]) -> list[str]:
     return canonical
 
 
+def _expand_env_path(raw: str, active_env: Mapping[str, str]) -> Path:
+    expanded = os.path.expandvars(raw)
+    if expanded == "~" or expanded.startswith("~/"):
+        home_base = Path(active_env["HOME"]) if active_env.get("HOME") else Path.home()
+        return home_base if expanded == "~" else home_base / expanded[2:]
+    return Path(os.path.expanduser(expanded))
+
+
+def resolve_local_checkpoint_dir(
+    resolved_model: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Locate a local Hugging Face checkpoint directory without network I/O."""
+    if not resolved_model or not resolved_model.strip():
+        return None
+    active_env = os.environ if env is None else env
+    direct = Path(resolved_model)
+    try:
+        if direct.is_dir() and (direct / "config.json").is_file():
+            return direct
+    except OSError:
+        pass
+
+    explicit_hub = active_env.get("HF_HUB_CACHE") or active_env.get(
+        "HUGGINGFACE_HUB_CACHE"
+    )
+    cache_roots: list[Path] = []
+    primary_hub_cache: Path
+    if explicit_hub:
+        primary_hub_cache = _expand_env_path(explicit_hub, active_env)
+        cache_roots.append(primary_hub_cache)
+    elif hf_home := active_env.get("HF_HOME"):
+        hf_home_dir = _expand_env_path(hf_home, active_env)
+        primary_hub_cache = hf_home_dir / "hub"
+        cache_roots.extend([primary_hub_cache, hf_home_dir])
+    elif xdg_cache := active_env.get("XDG_CACHE_HOME"):
+        primary_hub_cache = (
+            _expand_env_path(xdg_cache, active_env) / "huggingface" / "hub"
+        )
+        cache_roots.append(primary_hub_cache)
+    else:
+        home_base = (
+            _expand_env_path(active_env["HOME"], active_env)
+            if active_env.get("HOME")
+            else Path.home()
+        )
+        primary_hub_cache = home_base / ".cache" / "huggingface" / "hub"
+        cache_roots.append(primary_hub_cache)
+
+    try:
+        hf_hub = importlib.import_module("huggingface_hub")
+        local_dir = Path(
+            hf_hub.snapshot_download(
+                resolved_model,
+                cache_dir=str(primary_hub_cache),
+                local_files_only=True,
+            )
+        )
+        if (local_dir / "config.json").is_file():
+            return local_dir
+    except Exception:
+        pass
+
+    repo_folder = f"models--{resolved_model.strip('/').replace('/', '--')}"
+    seen: set[Path] = set()
+    for root in cache_roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        repo_dir = root / repo_folder
+        try:
+            if (repo_dir / "config.json").is_file():
+                return repo_dir
+            snaps_dir = repo_dir / "snapshots"
+            ref_main = repo_dir / "refs" / "main"
+            if ref_main.is_file():
+                rev = ref_main.read_text(encoding="utf-8").strip()
+                if rev and (snaps_dir / rev / "config.json").is_file():
+                    return snaps_dir / rev
+            if snaps_dir.is_dir():
+                candidates = sorted(
+                    p
+                    for p in snaps_dir.iterdir()
+                    if p.is_dir() and (p / "config.json").is_file()
+                )
+                if candidates:
+                    return candidates[-1]
+        except OSError:
+            continue
+
+    return None
+
+
+def _extract_text_config_and_path(
+    cfg: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    for key in ("text_config", "llm_config", "language_config"):
+        sub = cfg.get(key)
+        if isinstance(sub, dict):
+            return sub, (key,)
+    thinker = cfg.get("thinker_config")
+    if isinstance(thinker, dict) and isinstance(thinker.get("text_config"), dict):
+        return thinker["text_config"], ("thinker_config", "text_config")
+    return dict(cfg), ()
+
+
+def _hf_overrides_has_num_hidden_layers(hf_ov: Mapping[str, Any]) -> bool:
+    if "num_hidden_layers" in hf_ov:
+        return True
+    sub, path = _extract_text_config_and_path(hf_ov)
+    return bool(path) and "num_hidden_layers" in sub
+
+
+def build_layer_hf_overrides(
+    num_layers: int,
+    model_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Build ``--hf-overrides`` payload targeting the checkpoint's text config."""
+    if type(num_layers) is not int or num_layers < 1:
+        raise ValidationError(f"num_layers must be a positive int, got {num_layers!r}")
+    if model_dir is not None and (model_dir / "config.json").is_file():
+        try:
+            cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cfg = None
+        if isinstance(cfg, dict):
+            _, path = _extract_text_config_and_path(cfg)
+            if path:
+                nested: dict[str, Any] = {"num_hidden_layers": num_layers}
+                for key in reversed(path):
+                    nested = {key: nested}
+                if type(cfg.get("num_hidden_layers")) is int:
+                    nested["num_hidden_layers"] = num_layers
+                return nested
+    return {"num_hidden_layers": num_layers}
+
+
+def _expand_module_suffix_aliases(mod_suffix: str) -> list[str]:
+    aliases = [mod_suffix]
+    for src_leaf, fused_leaf in (
+        (".q_proj", ".qkv_proj"),
+        (".k_proj", ".qkv_proj"),
+        (".v_proj", ".qkv_proj"),
+        (".gate_proj", ".gate_up_proj"),
+        (".up_proj", ".gate_up_proj"),
+        (".w1", ".w13_proj"),
+        (".w3", ".w13_proj"),
+    ):
+        if mod_suffix.endswith(src_leaf):
+            aliases.append(mod_suffix[: -len(src_leaf)] + fused_leaf)
+    return aliases
+
+
+def _read_safetensors_weight_keys(model_dir: Path) -> tuple[list[str], str | None]:
+    """Read tensor parameter names from ``index.json`` or ``.safetensors`` headers."""
+    index_file = model_dir / "model.safetensors.index.json"
+    if index_file.is_file():
+        try:
+            doc = json.loads(index_file.read_text(encoding="utf-8"))
+            weight_map = doc.get("weight_map")
+            if isinstance(weight_map, dict) and weight_map:
+                return [str(k) for k in weight_map], "safetensors_index"
+        except (OSError, ValueError):
+            pass
+
+    shard_files = sorted(model_dir.glob("*.safetensors"))
+    keys: list[str] = []
+    for shard in shard_files:
+        try:
+            with shard.open("rb") as fh:
+                raw_len = fh.read(8)
+                if len(raw_len) != 8:
+                    continue
+                header_len = int.from_bytes(raw_len, "little")
+                if not (0 < header_len <= 64 * 1024 * 1024):
+                    continue
+                header = json.loads(fh.read(header_len).decode("utf-8"))
+            if isinstance(header, dict):
+                keys.extend(str(k) for k in header if k != "__metadata__")
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+    return (keys, "safetensors_header") if keys else ([], None)
+
+
+def _parse_layer_index_enum(raw: str, depth: int) -> set[int]:
+    """Parse ``'3,4,5'`` or ``'3..44'`` / ``'3-44'`` layer index expressions."""
+    indices: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        sep = ".." if ".." in token else ("-" if "-" in token else None)
+        if sep is not None:
+            lhs, rhs = token.split(sep, 1)
+            if lhs.strip().isdigit() and rhs.strip().isdigit():
+                start, end = int(lhs), int(rhs)
+                if start <= end:
+                    indices.update(i for i in range(start, end + 1) if 0 <= i < depth)
+        elif token.isdigit():
+            val = int(token)
+            if 0 <= val < depth:
+                indices.add(val)
+    return indices
+
+
+def _record_signal(signals: list[str], name: str) -> None:
+    if name not in signals and _SAFE_SIGNAL_KEY_RE.fullmatch(name):
+        signals.append(name)
+
+
+def infer_fast_sanity_layer_override(
+    model_dir: Path | None,
+    *,
+    flags: Sequence[str] = (),
+    max_override_layers: int = DEFAULT_MAX_AUTO_LAYER_OVERRIDE,
+) -> dict[str, Any]:
+    """Infer minimal ``num_hidden_layers`` prefix covering every layer archetype.
+
+    Returns a public-safe metadata mapping (never containing filesystem paths)
+    with ``layer_override`` set to an integer in ``[2, cap]`` when a prefix
+    covers all distinct ``(T(i), Q(i), C(i))`` layer signatures, or ``None``
+    when ``fast_sanity`` should run the full layer stack.
+    """
+
+    def _result(
+        override: int | None,
+        reason: str,
+        *,
+        depth: int | None = None,
+        distinct: int | None = None,
+        min_prefix: int | None = None,
+        cap: int | None = None,
+        signals: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "layer_override": override,
+            "reason": reason,
+            "num_hidden_layers": depth,
+            "distinct_archetypes": distinct,
+            "min_prefix_layers": min_prefix,
+            "cap_layers": cap,
+            "signals": list(signals or []),
+        }
+
+    try:
+        parsed_flags = _parse_flag_entries(list(flags))
+    except ValidationError:
+        parsed_flags = []
+    quant_flag = _flag_value(parsed_flags, "--quantization")
+    if quant_flag and quant_flag.startswith("w8a8_dynamic"):
+        return _result(None, "online_quantization", signals=["flag:quantization"])
+    hf_ov_raw = _flag_value(parsed_flags, "--hf-overrides")
+    if hf_ov_raw:
+        try:
+            hf_ov = json.loads(hf_ov_raw)
+        except ValueError:
+            hf_ov = None
+        if isinstance(hf_ov, dict):
+            if hf_ov.get("sail_quantization_recipe") or hf_ov.get(
+                "ppu_quantization_recipe"
+            ):
+                return _result(
+                    None, "online_quantization", signals=["flag:hf_overrides"]
+                )
+            if _hf_overrides_has_num_hidden_layers(hf_ov):
+                return _result(
+                    None, "explicit_hf_override", signals=["flag:hf_overrides"]
+                )
+
+    if model_dir is None or not (model_dir / "config.json").is_file():
+        return _result(None, "missing_checkpoint")
+    try:
+        cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _result(None, "invalid_config")
+    if not isinstance(cfg, dict):
+        return _result(None, "invalid_config")
+
+    text_cfg, _ = _extract_text_config_and_path(cfg)
+    merged_cfg: dict[str, Any] = {**cfg, **text_cfg}
+    if merged_cfg.get("sail_quantization_recipe") or merged_cfg.get(
+        "ppu_quantization_recipe"
+    ):
+        return _result(None, "online_quantization", signals=["config:quant_recipe"])
+
+    if merged_cfg.get("is_encoder_decoder") is True:
+        return _result(None, "encoder_decoder", signals=["config:is_encoder_decoder"])
+    for enc_k, dec_k in (
+        ("num_encoder_layers", "num_decoder_layers"),
+        ("encoder_layers", "decoder_layers"),
+    ):
+        enc_v, dec_v = merged_cfg.get(enc_k), merged_cfg.get(dec_k)
+        if type(enc_v) is int and enc_v > 0 and type(dec_v) is int and dec_v > 0:
+            return _result(None, "encoder_decoder", signals=[f"config:{enc_k}"])
+
+    model_types = {
+        str(v)
+        for v in (cfg.get("model_type"), text_cfg.get("model_type"))
+        if isinstance(v, str) and v
+    }
+    if model_types & SEGMENTED_MODEL_TYPES:
+        return _result(
+            None,
+            "segmented_architecture",
+            depth=(
+                merged_cfg["num_hidden_layers"]
+                if type(merged_cfg.get("num_hidden_layers")) is int
+                else None
+            ),
+            signals=["config:model_type"],
+        )
+
+    depth = merged_cfg.get("num_hidden_layers")
+    if type(depth) is not int or depth <= 0:
+        return _result(None, "missing_num_hidden_layers")
+    if depth <= 2:
+        return _result(None, "shallow_model", depth=depth)
+
+    signals: list[str] = []
+    t_sets: list[set[str]] = [set() for _ in range(depth)]
+    layer_mod_suffixes: list[set[str]] = [set() for _ in range(depth)]
+    weight_keys, weight_source = _read_safetensors_weight_keys(model_dir)
+    has_backbone_weights = False
+    for key in weight_keys:
+        if _NON_BACKBONE_PREFIX_RE.search(key):
+            continue
+        match = _BACKBONE_LAYER_RE.search(key)
+        if match is None:
+            continue
+        layer_idx = int(match.group(1))
+        rel_key = match.group(2) or "*"
+        if 0 <= layer_idx < depth:
+            has_backbone_weights = True
+            t_sets[layer_idx].add(_EXPERT_INDEX_RE.sub("experts.*.", rel_key))
+            mod_suffix = _TENSOR_PARAM_SUFFIX_RE.sub("", rel_key)
+            for alias in _expand_module_suffix_aliases(mod_suffix):
+                layer_mod_suffixes[layer_idx].add(alias)
+    if has_backbone_weights and weight_source:
+        _record_signal(signals, weight_source)
+
+    q_sets: list[set[str]] = [set() for _ in range(depth)]
+    quant_sources: list[dict[str, Any]] = []
+    if isinstance(merged_cfg.get("quantization_config"), dict):
+        quant_sources.append(merged_cfg["quantization_config"])
+    for qfile in ("quantization_config.json", "hf_quant_config.json"):
+        qpath = model_dir / qfile
+        if qpath.is_file():
+            try:
+                qdoc = json.loads(qpath.read_text(encoding="utf-8"))
+                if isinstance(qdoc, dict):
+                    quant_sources.append(qdoc)
+            except (OSError, ValueError):
+                pass
+    if quant_sources:
+        candidates_by_layer: list[list[tuple[str, str]]] = []
+        for idx in range(depth):
+            suffixes = sorted(
+                set(_CANONICAL_LAYER_MODULE_PROBES) | layer_mod_suffixes[idx]
+            )
+            layer_cands: list[tuple[str, str]] = []
+            for suffix in suffixes:
+                norm_suffix = (
+                    _EXPERT_INDEX_RE.sub("experts.*.", suffix) if suffix else "*"
+                )
+                for prefix in ("model.layers", "language_model.model.layers", "layers"):
+                    if suffix:
+                        layer_cands.append((f"{prefix}.{idx}.{suffix}", norm_suffix))
+                    else:
+                        layer_cands.append((f"{prefix}.{idx}", "*"))
+                        layer_cands.append((f"{prefix}.{idx}.", "*"))
+            candidates_by_layer.append(layer_cands)
+
+        def _apply_quant_rule(rule_str: str, tag_prefix: str, signal_name: str) -> bool:
+            """Apply one quantization rule string; return True if unresolved."""
+            if rule_str.startswith("re:"):
+                raw_pat = rule_str[3:]
+                try:
+                    pat = re.compile(raw_pat)
+                except re.error:
+                    return bool(_LAYER_SPECIFIC_RULE_RE.search(raw_pat))
+                matched_any = False
+                for idx in range(depth):
+                    for cand_name, norm_suffix in candidates_by_layer[idx]:
+                        if pat.search(cand_name):
+                            q_sets[idx].add(f"{tag_prefix}:{raw_pat}:{norm_suffix}")
+                            matched_any = True
+                if matched_any:
+                    _record_signal(signals, signal_name)
+                    return False
+                if _LAYER_SPECIFIC_RULE_RE.search(
+                    raw_pat
+                ) and not _NON_BACKBONE_PREFIX_RE.search(raw_pat):
+                    _record_signal(signals, signal_name)
+                    return True
+                return False
+
+            if _NON_BACKBONE_PREFIX_RE.search(rule_str):
+                return False
+
+            if any(ch in rule_str for ch in "*?["):
+                matched_any = False
+                for idx in range(depth):
+                    for cand_name, norm_suffix in candidates_by_layer[idx]:
+                        if fnmatchcase(cand_name, rule_str):
+                            q_sets[idx].add(f"{tag_prefix}:{rule_str}:{norm_suffix}")
+                            matched_any = True
+                if matched_any:
+                    _record_signal(signals, signal_name)
+                    return False
+                if _LAYER_SPECIFIC_RULE_RE.search(rule_str):
+                    _record_signal(signals, signal_name)
+                    return True
+                return False
+
+            match = _BACKBONE_LAYER_RE.search(rule_str)
+            if match is not None:
+                idx = int(match.group(1))
+                if 0 <= idx < depth:
+                    suffix = match.group(2) or "*"
+                    q_sets[idx].add(
+                        f"{tag_prefix}:{_EXPERT_INDEX_RE.sub('experts.*.', suffix)}"
+                    )
+                    _record_signal(signals, signal_name)
+            return False
+
+        for qcfg in quant_sources:
+            for field in (
+                "ignore",
+                "ignored_layers",
+                "modules_to_not_convert",
+                "exclude",
+            ):
+                entries = qcfg.get(field)
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if isinstance(item, str) and _apply_quant_rule(
+                        item, field, f"quant:{field}"
+                    ):
+                        return _result(
+                            None,
+                            "unresolved_quantization_rule",
+                            depth=depth,
+                            signals=signals,
+                        )
+            for field in ("layer_quant_config", "quantized_layers"):
+                mapping = qcfg.get(field)
+                if not isinstance(mapping, dict):
+                    continue
+                for pattern, scheme in sorted(mapping.items()):
+                    if not isinstance(pattern, str):
+                        continue
+                    scheme_tok = hashlib.sha256(
+                        json.dumps(scheme, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest()[:12]
+                    if _apply_quant_rule(
+                        pattern, f"{field}:{scheme_tok}", f"quant:{field}"
+                    ):
+                        return _result(
+                            None,
+                            "unresolved_quantization_rule",
+                            depth=depth,
+                            signals=signals,
+                        )
+            config_groups = qcfg.get("config_groups")
+            if isinstance(config_groups, dict):
+                for group_name, group_cfg in sorted(config_groups.items()):
+                    if not isinstance(group_cfg, dict):
+                        continue
+                    targets = group_cfg.get("targets")
+                    if not isinstance(targets, list):
+                        continue
+                    scheme_body = {k: v for k, v in group_cfg.items() if k != "targets"}
+                    scheme_tok = hashlib.sha256(
+                        json.dumps(scheme_body, sort_keys=True, default=str).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()[:12]
+                    for item in targets:
+                        if isinstance(item, str) and _apply_quant_rule(
+                            item,
+                            f"group:{group_name}:{scheme_tok}",
+                            "quant:config_groups",
+                        ):
+                            return _result(
+                                None,
+                                "unresolved_quantization_rule",
+                                depth=depth,
+                                signals=signals,
+                            )
+            mix_layers = qcfg.get("mix_layers")
+            if isinstance(mix_layers, list):
+                for idx in mix_layers:
+                    if type(idx) is int and 0 <= idx < depth:
+                        q_sets[idx].add("mix_layer")
+                        _record_signal(signals, "quant:mix_layers")
+
+    c_lists: list[list[tuple[str, str]]] = [[] for _ in range(depth)]
+    mtp_extra = max(
+        [
+            val
+            for key in (
+                "num_nextn_predict_layers",
+                "num_mtp_layers",
+                "mtp_num_layers",
+            )
+            if type(val := merged_cfg.get(key)) is int and val > 0
+        ],
+        default=0,
+    )
+    max_list_len = depth + max(mtp_extra, 4)
+
+    for key, val in sorted(merged_cfg.items()):
+        if key in _NON_LAYER_LIST_KEYS:
+            continue
+        if isinstance(val, list) and depth <= len(val) <= max_list_len:
+            sliced = val[:depth]
+            encoded = [
+                json.dumps(item, sort_keys=True, separators=(",", ":"))
+                for item in sliced
+            ]
+            if len(set(encoded)) > 1:
+                for idx, tok in enumerate(encoded):
+                    c_lists[idx].append((key, tok))
+                _record_signal(signals, f"config:{key}")
+            continue
+        if (
+            isinstance(val, list)
+            and 0 < len(val) < depth
+            and key.endswith(("_layer_ids", "_layers", "_layer_indices", "_layer_idxs"))
+            and all(type(x) is int and 0 <= x < depth for x in val)
+        ):
+            idx_set = set(val)
+            if 0 < len(idx_set) < depth:
+                for idx in range(depth):
+                    c_lists[idx].append((key, "1" if idx in idx_set else "0"))
+                _record_signal(signals, f"config:{key}")
+            continue
+        if isinstance(val, str) and key.endswith(("_layers_enum", "_layer_ids")):
+            idx_set = _parse_layer_index_enum(val, depth)
+            if 0 < len(idx_set) < depth:
+                for idx in range(depth):
+                    c_lists[idx].append((key, "1" if idx in idx_set else "0"))
+                _record_signal(signals, f"config:{key}")
+
+    first_dense = merged_cfg.get("first_k_dense_replace")
+    if type(first_dense) is int and 0 < first_dense < depth:
+        for idx in range(depth):
+            c_lists[idx].append(
+                ("first_k_dense_replace", "dense" if idx < first_dense else "moe")
+            )
+        _record_signal(signals, "config:first_k_dense_replace")
+
+    full_attn_iv = merged_cfg.get("full_attention_interval")
+    if type(full_attn_iv) is int and 1 < full_attn_iv <= depth:
+        for idx in range(depth):
+            c_lists[idx].append(
+                (
+                    "full_attention_interval",
+                    "full" if (idx + 1) % full_attn_iv == 0 else "sub",
+                )
+            )
+        _record_signal(signals, "config:full_attention_interval")
+
+    for step_key, one_based in (
+        ("moe_layer_freq", False),
+        ("interleave_moe_layer_step", True),
+        ("decoder_sparse_step", True),
+    ):
+        step_val = merged_cfg.get(step_key)
+        if type(step_val) is int and 1 < step_val <= depth:
+            for idx in range(depth):
+                pos = idx + 1 if one_based else idx
+                c_lists[idx].append((step_key, "1" if pos % step_val == 0 else "0"))
+            _record_signal(signals, f"config:{step_key}")
+
+    has_config_heterogeneity = any(c_lists) or any(q_sets)
+    if not has_backbone_weights and not has_config_heterogeneity and "auto_map" in cfg:
+        return _result(
+            None,
+            "missing_weight_metadata",
+            depth=depth,
+            signals=["config:auto_map"],
+        )
+
+    signatures = [
+        (tuple(sorted(t_sets[idx])), tuple(sorted(q_sets[idx])), tuple(c_lists[idx]))
+        for idx in range(depth)
+    ]
+    all_archetypes = set(signatures)
+    distinct_count = len(all_archetypes)
+    seen_archetypes: set[Any] = set()
+    min_cover = depth
+    for idx, sig in enumerate(signatures):
+        seen_archetypes.add(sig)
+        if len(seen_archetypes) == distinct_count:
+            min_cover = idx + 1
+            break
+
+    k_min = max(2, min_cover)
+    cap = min(max_override_layers, max(2, depth // 3))
+    if k_min > cap:
+        return _result(
+            None,
+            "exceeds_override_cap",
+            depth=depth,
+            distinct=distinct_count,
+            min_prefix=k_min,
+            cap=cap,
+            signals=signals,
+        )
+    return _result(
+        k_min,
+        "inferred_prefix_cover",
+        depth=depth,
+        distinct=distinct_count,
+        min_prefix=k_min,
+        cap=cap,
+        signals=signals,
+    )
+
+
 def resolve_recipe(
     recipe_path: Path,
     *,
@@ -308,6 +1035,7 @@ def resolve_recipe(
     dummy_weights: bool = False,
     layer_override: Any = _UNSET,
     assets_map_path: Path | None = None,
+    model_dir: Path | None = None,
     host: str = "127.0.0.1",
     port: int = 9985,
     served_model_name: str | None = None,
@@ -329,7 +1057,7 @@ def resolve_recipe(
 
     eff_cache = cache
     eff_dummy = dummy_weights
-    eff_layers: int | None = None if layer_override is _UNSET else layer_override
+    eff_layers: int | str | None = None if layer_override is _UNSET else layer_override
     eff_preset = preset
     eff_variant = (
         variant
@@ -350,8 +1078,8 @@ def resolve_recipe(
                 eff_cache = tier_cfg.get("cache", "enabled")
             if not dummy_weights:
                 eff_dummy = bool(tier_cfg.get("dummy_weights", True))
-            if layer_override is _UNSET and "layer_override" in tier_cfg:
-                eff_layers = tier_cfg["layer_override"]
+            if layer_override is _UNSET:
+                eff_layers = tier_cfg.get("layer_override", "auto")
             if eff_preset is None:
                 eff_preset = tier_cfg.get("preset")
         elif tier == "model_sanity":
@@ -432,22 +1160,7 @@ def resolve_recipe(
         ordered = _apply_flag_entries(ordered, list(preset_blk.get("args", [])))
         server_env.update(preset_blk.get("env", {}))
 
-    # 6. policy switches (prefix cache, dummy load format, layer override)
-    if eff_cache == "enabled":
-        ordered = _apply_flag_entries(ordered, ["--enable-prefix-caching"])
-    elif eff_cache == "disabled":
-        ordered = _apply_flag_entries(ordered, ["--no-enable-prefix-caching"])
-    elif eff_cache is not None:
-        raise ValidationError(f"unsupported cache value: {eff_cache!r}")
-
-    if eff_dummy:
-        ordered = _apply_flag_entries(ordered, ["--load-format", "dummy"])
-    if eff_layers is not None:
-        ordered = _merge_json_flag(
-            ordered, "--hf-overrides", {"num_hidden_layers": int(eff_layers)}
-        )
-
-    # 7. assets-map + runtime endpoint injection
+    # 6. assets-map + runtime endpoint resolution
     assets_map = _load_assets_map(assets_map_path)
     eff_assets = {**ppu_blk["assets"], **var_blk.get("assets", {})}
     asset_name = eff_assets["model"]
@@ -466,6 +1179,31 @@ def resolve_recipe(
     golden_model_key = (
         var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
     )
+
+    # 7. policy switches (prefix cache, dummy load format, layer override)
+    if eff_cache == "enabled":
+        ordered = _apply_flag_entries(ordered, ["--enable-prefix-caching"])
+    elif eff_cache == "disabled":
+        ordered = _apply_flag_entries(ordered, ["--no-enable-prefix-caching"])
+    elif eff_cache is not None:
+        raise ValidationError(f"unsupported cache value: {eff_cache!r}")
+
+    if eff_dummy:
+        ordered = _apply_flag_entries(ordered, ["--load-format", "dummy"])
+    if eff_layers is not None and eff_layers != "auto":
+        if type(eff_layers) is not int or eff_layers < 1:
+            raise ValidationError(
+                f"layer_override must be a positive int, 'auto', or None, got {eff_layers!r}"
+            )
+        eff_model_dir = model_dir
+        if eff_model_dir is None:
+            lookup_env = {**os.environ, **{k: str(v) for k, v in server_env.items()}}
+            eff_model_dir = resolve_local_checkpoint_dir(resolved_model, env=lookup_env)
+        ordered = _merge_json_flag(
+            ordered,
+            "--hf-overrides",
+            build_layer_hf_overrides(eff_layers, eff_model_dir),
+        )
 
     flags_only = _render_entries(ordered)
     argv = [
@@ -1067,6 +1805,23 @@ def validate_policy_structure(
                 raise ValidationError(
                     f"{context}.tiers.fast_sanity.cache must be 'enabled'"
                 )
+            if type(fs["dummy_weights"]) is not bool:
+                raise ValidationError(
+                    f"{context}.tiers.fast_sanity.dummy_weights must be boolean"
+                )
+            if "layer_override" in fs:
+                lo = fs["layer_override"]
+                if lo is not None and lo != "auto" and (type(lo) is not int or lo < 1):
+                    raise ValidationError(
+                        f"{context}.tiers.fast_sanity.layer_override must be a positive integer, 'auto', or null"
+                    )
+            if (
+                "fallback_full_layers" in fs
+                and type(fs["fallback_full_layers"]) is not bool
+            ):
+                raise ValidationError(
+                    f"{context}.tiers.fast_sanity.fallback_full_layers must be boolean"
+                )
             probe_context = f"{context}.tiers.fast_sanity.probe"
             if not isinstance(fs["probe"], dict):
                 raise ValidationError(f"{probe_context} must be mapping")
@@ -1427,6 +2182,8 @@ def _format_fast_sanity_weights(
         return f"{weight}, full layers"
     fs_cfg = policy_doc.get("tiers", {}).get("fast_sanity", {})
     suffix = " (fallback: full)" if fs_cfg.get("fallback_full_layers") else ""
+    if layer_override == "auto":
+        return f"{weight}, {_md_code('auto')} layers{suffix}"
     return f"{weight}, {layer_override} layers{suffix}"
 
 
@@ -1567,6 +2324,7 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
         "## Configuration Resolution Rules",
         "",
         "- **Resolution order**: `model.base_args` -> `variants.<variant>` (default: `default`) -> `hardware_overrides.<hardware>` -> `ppu.default_features` -> optional `presets.<preset>` -> policy runtime switches (`--enable-prefix-caching`, `--load-format dummy`, `--hf-overrides`).",
+        "- **Auto layer override in `fast_sanity`**: When `layer_override: auto` (default), the runner inspects local checkpoint metadata (`config.json` and safetensors headers) to select the minimal prefix covering every distinct layer archetype (`2..8` layers), or runs full layers when prefix coverage exceeds the cap or the architecture is segmented.",
         "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `dp_ep_low_latency`) are not applied unless explicitly selected by a policy or `--preset`.",
         "- **Shared server in `model_sanity`**: All stages in `model_sanity` run against one server process; when a `bench` stage is present, the runner injects `VLLM_SERVER_DEV_MODE=1` into the server process environment for cache resets between concurrency points.",
         "- **Regenerate / verify**:",
@@ -1641,6 +2399,23 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _parse_layer_override_cli(raw: str) -> int | str | None:
+    lowered = raw.strip().lower()
+    if lowered == "auto":
+        return "auto"
+    if lowered in {"none", "null", "full"}:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "layer-override must be a positive int, 'auto', or 'full'"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("layer-override must be >= 1")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve and validate ppu-serving/v1")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1654,8 +2429,11 @@ def main(argv: list[str] | None = None) -> int:
     res.add_argument("--preset", default=None)
     res.add_argument("--cache", choices=["enabled", "disabled"], default=None)
     res.add_argument("--dummy-weights", action="store_true")
-    res.add_argument("--layer-override", type=int, default=argparse.SUPPRESS)
+    res.add_argument(
+        "--layer-override", type=_parse_layer_override_cli, default=argparse.SUPPRESS
+    )
     res.add_argument("--assets-map", type=Path, default=None)
+    res.add_argument("--model-dir", type=Path, default=None)
     res.add_argument("--host", default="127.0.0.1")
     res.add_argument("--port", type=int, default=9985)
     res.add_argument("--served-model-name", default=None)
@@ -1701,6 +2479,7 @@ def main(argv: list[str] | None = None) -> int:
             dummy_weights=args.dummy_weights,
             layer_override=getattr(args, "layer_override", _UNSET),
             assets_map_path=args.assets_map,
+            model_dir=args.model_dir,
             host=args.host,
             port=args.port,
             served_model_name=args.served_model_name,

@@ -10,7 +10,7 @@ accuracy_gate:
 tiers:
   fast_sanity:
     dummy_weights: true
-    layer_override: 3
+    layer_override: auto
     fallback_full_layers: true
     cache: enabled
     probe:

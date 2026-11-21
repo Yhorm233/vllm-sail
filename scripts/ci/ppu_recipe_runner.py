@@ -36,7 +36,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ppu_recipe import (  # noqa: E402
+    infer_fast_sanity_layer_override,
     redact_and_verify_public_payload,
+    resolve_local_checkpoint_dir,
     resolve_recipe,
     validate_paths,
 )
@@ -592,10 +594,19 @@ def _launch_resolved_server(
     resolved: dict[str, Any],
     *,
     log_path: Path,
+    model_dir: Path | None = None,
 ) -> subprocess.Popen[bytes]:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in resolved.get("server_env", {}).items()})
     env.update({k: str(v) for k, v in resolved.get("runtime_env", {}).items()})
+    if (
+        model_dir is not None
+        and model_dir.parent.name == "snapshots"
+        and model_dir.parent.parent.name.startswith("models--")
+    ):
+        hub_root = str(model_dir.parent.parent.parent)
+        env["HF_HUB_CACHE"] = hub_root
+        env["HUGGINGFACE_HUB_CACHE"] = hub_root
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = log_path.open("w", encoding="utf-8")
     try:
@@ -617,6 +628,7 @@ def _attempt_fast_sanity_once(
     variant: str | None = None,
     preset: str | None,
     assets_map: Path | None,
+    model_dir: Path | None = None,
     port: int,
     ready_timeout: int,
     layer_override: int | None,
@@ -633,6 +645,7 @@ def _attempt_fast_sanity_once(
         preset=preset,
         layer_override=layer_override,
         assets_map_path=assets_map,
+        model_dir=model_dir,
         port=port,
         served_model_name=base_name,
     )
@@ -641,7 +654,7 @@ def _attempt_fast_sanity_once(
     t_start = time.monotonic()
     try:
         _record_phase("server_startup")
-        proc = _launch_resolved_server(resolved, log_path=log_path)
+        proc = _launch_resolved_server(resolved, log_path=log_path, model_dir=model_dir)
         cold_start_s = _wait_server_ready(
             proc,
             log_path,
@@ -718,20 +731,52 @@ def run_fast_sanity(
     fs_cfg = policy["tiers"]["fast_sanity"]
     probe = fs_cfg["probe"]
     fallback_full = bool(fs_cfg.get("fallback_full_layers", True))
+    dummy_weights = bool(fs_cfg.get("dummy_weights", True))
     eff_variant = variant if variant is not None else policy.get("variant", "default")
-    configured_layers = fs_cfg.get("layer_override", 2)
+    configured_layers = fs_cfg.get("layer_override", "auto")
+    base_resolved = resolve_recipe(
+        recipe_path,
+        policy_path=policy_path,
+        tier="fast_sanity",
+        variant=eff_variant,
+        preset=preset,
+        layer_override=None,
+        assets_map_path=assets_map,
+    )
+    effective_env = {
+        **os.environ,
+        **{k: str(v) for k, v in base_resolved.get("server_env", {}).items()},
+    }
+    model_dir = resolve_local_checkpoint_dir(
+        base_resolved["resolved_model"], env=effective_env
+    )
+    layer_inference: dict[str, Any] | None = None
+    effective_layers: int | None
+    if configured_layers == "auto":
+        if layer_mode == "full":
+            effective_layers = None
+        else:
+            layer_inference = infer_fast_sanity_layer_override(
+                model_dir, flags=base_resolved["flags"]
+            )
+            effective_layers = layer_inference["layer_override"]
+    else:
+        effective_layers = (
+            int(configured_layers) if configured_layers is not None else None
+        )
 
     attempts: list[dict[str, Any]] = []
     if layer_mode in {"auto", "2l", "both"} and (
-        configured_layers is not None or layer_mode in {"2l", "both"}
+        effective_layers is not None or layer_mode in {"2l", "both"}
     ):
-        two_l = int(configured_layers if configured_layers is not None else 2)
+        two_l = int(effective_layers if effective_layers is not None else 2)
         res_2l = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
             variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
+            model_dir=model_dir,
             port=port,
             ready_timeout=ready_timeout,
             layer_override=two_l,
@@ -740,6 +785,7 @@ def run_fast_sanity(
             label="fast_2l",
         )
         attempts.append(res_2l)
+    did_fallback = False
     if (
         layer_mode in {"full", "both"}
         or not attempts
@@ -747,15 +793,25 @@ def run_fast_sanity(
             layer_mode == "auto"
             and fallback_full
             and attempts[-1]["status"] != "pass"
-            and "stream_probe" not in attempts[-1]
+            and (
+                "stream_probe" not in attempts[-1]
+                or (
+                    dummy_weights
+                    and attempts[-1].get("layer_override") is not None
+                    and attempts[-1].get("stream_probe", {}).get("error")
+                    == "empty_stream_content"
+                )
+            )
         )
     ):
+        did_fallback = bool(attempts) and layer_mode == "auto"
         res_full = _attempt_fast_sanity_once(
             recipe_path=recipe_path,
             policy_path=policy_path,
             variant=eff_variant,
             preset=preset,
             assets_map=assets_map,
+            model_dir=model_dir,
             port=port + (1 if attempts else 0),
             ready_timeout=ready_timeout,
             layer_override=None,
@@ -765,16 +821,18 @@ def run_fast_sanity(
         )
         attempts.append(res_full)
 
+    terminal_attempts = [attempts[-1]] if did_fallback else attempts
     stream_failure = next(
         (
             item
-            for item in attempts
+            for item in terminal_attempts
             if item.get("stream_probe", {}).get("status") == "fail"
         ),
         None,
     )
     final_attempt = stream_failure or next(
-        (item for item in attempts if item["status"] == "pass"), attempts[-1]
+        (item for item in terminal_attempts if item["status"] == "pass"),
+        terminal_attempts[-1],
     )
     if stream_failure is not None:
         _record_phase(stream_failure["error"])
@@ -794,6 +852,8 @@ def run_fast_sanity(
         },
         "attempts": attempts,
     }
+    if layer_inference is not None:
+        summary["layer_inference"] = layer_inference
     if "probe" in final_attempt:
         summary["timings"]["nonstream_s"] = final_attempt["probe"]["elapsed_s"]
     if "stream_probe" in final_attempt:
