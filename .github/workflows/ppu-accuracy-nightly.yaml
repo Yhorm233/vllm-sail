@@ -15,14 +15,16 @@ name: PPU accuracy nightly
 #               the only rows it lists are pull_request previews. Picking the
 #               newest of those pinned this lane to a preview from days ago,
 #               whose checkout predates every fix merged since.
-#   select   -- on schedule, route migrated cases to Recipe when enabled.
-#               Manual runs keep their legacy or explicit recipe: selection.
-#   accuracy -- one reusable call per model. A single model already needs all
-#               eight devices and ppu_runtime_container.sh takes an exclusive
-#               flock on the runner, so max-parallel stays at 1; the catalog
-#               can occupy a runner for much of a day.
-#   recipe   -- scheduled after the legacy lane, or run on its own with the
-#               recipe: prefix. The public Recipe gate applies to both paths.
+#   select   -- on schedule, run Recipe model_sanity only when enabled (skipping
+#               scheduled legacy accuracy cases). Manual runs keep their legacy
+#               or explicit recipe: selection.
+#   accuracy -- one reusable call per legacy model (manual workflow_dispatch,
+#               or scheduled fallback when PPU_RECIPE_PUBLIC_ENABLED != 'true').
+#               A single model already needs all eight devices and
+#               ppu_runtime_container.sh takes an exclusive flock on the runner,
+#               so max-parallel stays at 1.
+#   recipe   -- runs on schedule when PPU_RECIPE_PUBLIC_ENABLED == 'true', or on
+#               its own via workflow_dispatch with the recipe: prefix.
 #
 # What the lane gates on
 #   * the reviewed golden under tests/e2e/models/_golden when one exists
@@ -145,7 +147,12 @@ jobs:
           try:
               selected = select.build_accuracy_matrix(catalog, requested)["include"]
               if scheduled_recipes:
-                  legacy_cases = select.scheduled_legacy_accuracy_cases(selected)
+                  # Keep validating replaces_legacy_cases policy declarations,
+                  # but disable scheduled legacy accuracy so Nightly runs
+                  # Recipe model_sanity only. Manual workflow_dispatch retains
+                  # legacy access.
+                  select.scheduled_legacy_accuracy_cases(selected)
+                  legacy_cases = []
               else:
                   # Use catalog case IDs as keys to distinguish serving variants.
                   legacy_cases = [entry["case_id"] for entry in selected]
@@ -160,6 +167,10 @@ jobs:
               print(f"accuracy matrix: {matrix}")
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"matrix={matrix}\n")
+          else:
+              print("accuracy matrix: skipped (scheduled legacy nightly disabled)")
+              with output.open("a", encoding="utf-8") as handle:
+                  handle.write("matrix=\n")
           PY
 
   accuracy:

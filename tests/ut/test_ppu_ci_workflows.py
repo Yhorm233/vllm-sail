@@ -1685,8 +1685,8 @@ def test_recipe_model_sanity_has_one_scheduled_entry():
 @pytest.mark.parametrize(
     "event,models,enabled,legacy_cases,recipe_slugs,error",
     [
-        ("schedule", "", "true", None, "", ""),
-        ("schedule", "", "TRUE", None, "", ""),
+        ("schedule", "", "true", [], "", ""),
+        ("schedule", "", "TRUE", [], "", ""),
         ("schedule", "", "false", None, None, ""),
         ("schedule", "", "", None, None, ""),
         ("workflow_dispatch", "", "true", None, None, ""),
@@ -1794,15 +1794,6 @@ def test_accuracy_nightly_routes_selected_models(
         expected = [
             entry["key"] for entry in catalog if entry["category"] == "accuracy"
         ]
-        if event == "schedule" and recipe_enabled:
-            claimed = {
-                case_id
-                for path in (ROOT / "tests/ppu/policy/models").glob("*.yaml")
-                for case_id in yaml.safe_load(path.read_text()).get(
-                    "replaces_legacy_cases", []
-                )
-            }
-            expected = [case_id for case_id in expected if case_id not in claimed]
         assert [
             entry["model"] for entry in json.loads(legacy_matrix)["include"]
         ] == expected
@@ -1810,6 +1801,8 @@ def test_accuracy_nightly_routes_selected_models(
         assert [
             entry["model"] for entry in json.loads(legacy_matrix)["include"]
         ] == legacy_cases
+    else:
+        assert legacy_matrix == ""
     recipe = jobs["recipe-model-sanity"]
     assert "accuracy" in recipe["needs"]
     assert bool(expression(recipe["if"], context)) == (recipe_slugs is not None)

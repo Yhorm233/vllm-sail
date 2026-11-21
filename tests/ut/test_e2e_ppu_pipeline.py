@@ -157,6 +157,24 @@ def test_scheduled_recipe_rejects_invalid_policy_claims(
         select.scheduled_legacy_accuracy_cases(selected)
 
 
+def test_scheduled_selector_retires_minimax_once_the_recipe_is_enabled() -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    case_ids = [entry["case_id"] for entry in selected]
+    # The flag-off schedule still lists every catalog case, so the fallback is
+    # the untouched matrix this assertion starts from.
+    assert "minimax-m3-fp8" in case_ids
+    claimed = {
+        case_id
+        for path in (ROOT / "tests/ppu/policy/models").glob("*.yaml")
+        for case_id in yaml.safe_load(path.read_text()).get("replaces_legacy_cases", [])
+    }
+    assert "minimax-m3-fp8" in claimed
+    assert select.scheduled_legacy_accuracy_cases(selected) == [
+        case_id for case_id in case_ids if case_id not in claimed
+    ]
+
+
 def test_scheduled_recipe_dp_ep_removes_only_its_legacy_case(
     tmp_path, monkeypatch
 ) -> None:
