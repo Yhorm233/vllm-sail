@@ -2360,49 +2360,87 @@ def nightly_setup(body, permission_value="write"):
     return control, gh, path
 
 
-def test_nightly_command_dispatches_exact_case_and_head_without_formal_status():
-    control, gh, path = nightly_setup("/ci run nightly deepseek-v4-mxfp4-dp-ep")
+@pytest.mark.parametrize(
+    "body, expected_case_id",
+    [
+        ("/ci run nightly deepseek-v4-mxfp4-dp-ep", "deepseek-v4-mxfp4-dp-ep"),
+        ("/ci run nightly all", "all"),
+        (
+            "/ci run nightly glm-5.3,deepseek-v4-flash",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+        (
+            "/ci run nightly glm-5.3, deepseek-v4-flash",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+        (
+            "/ci run nightly glm-5.3 deepseek-v4-flash",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+    ],
+)
+def test_nightly_command_dispatches_exact_cases_and_head_without_formal_status(
+    body, expected_case_id
+):
+    control, gh, path = nightly_setup(body)
     control.command()
     assert gh.writes(path)[0][2] == {
         "ref": "main",
-        "inputs": {**INPUTS, "case_id": "deepseek-v4-mxfp4-dp-ep"},
+        "inputs": {**INPUTS, "case_id": expected_case_id},
     }
-    assert "deepseek-v4-mxfp4-dp-ep" in reply(gh)
+    assert expected_case_id in reply(gh)
     assert SHA in reply(gh)
+    assert reactions(gh) == ["eyes", "rocket"]
     assert states(gh) == []
 
 
 @pytest.mark.parametrize(
     "body, access, message",
     [
+        ("/ci nightly", "read", "/ci run nightly <case[,case...]|all>"),
         ("/ci run nightly", "read", "List of available Nightly cases"),
-        ("/ci run nightly all", "write", "not available yet"),
+        ("/ci run nightly all,glm-5.3", "write", "Cannot combine"),
+        ("/ci run nightly glm-5.3,glm-5.3", "write", "Duplicate"),
+        ("/ci run nightly glm-5.3,", "write", "Use `/ci run nightly"),
+        ("/ci run nightly glm-5.3\n/ci run", "write", "Use `/ci run nightly"),
         (
-            "/ci run nightly glm-5.3,deepseek-v4-flash",
+            "/ci run nightly " + ",".join(f"model-case-{i:02d}" for i in range(17)),
             "write",
-            "one Recipe policy slug",
+            "Too many Nightly cases",
         ),
-        ("/ci run nightly glm-5.3\n/ci run", "write", "one Recipe policy slug"),
         ("/ci run nightly glm-5.3", "read", "write permission"),
+        ("/ci run nightly all", "read", "write permission"),
     ],
 )
 def test_nightly_help_invalid_and_ready_author_do_not_dispatch(body, access, message):
     control, gh, path = nightly_setup(body, access)
     control.command()
     assert message in reply(gh)
+    assert reactions(gh) == ["eyes", "-1"]
     assert not gh.writes(path)
     assert states(gh) == []
 
 
-def test_nightly_command_reuses_active_case_for_same_head():
-    control, gh, path = nightly_setup("/ci run nightly glm-5.3")
+@pytest.mark.parametrize(
+    "body, existing_case_spec",
+    [
+        ("/ci run nightly glm-5.3", "glm-5.3"),
+        ("/ci run nightly all", "all"),
+        (
+            "/ci run nightly deepseek-v4-flash,glm-5.3",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+    ],
+)
+def test_nightly_command_reuses_active_case_for_same_head(body, existing_case_spec):
+    control, gh, path = nightly_setup(body)
     flow = path.removesuffix("/dispatches")
     gh.page(
         f"{flow}/runs",
         [
             run(
                 status="queued",
-                display_title=f"PPU PR #7 Nightly glm-5.3 @ {SHA} (comment 19)",
+                display_title=f"PPU PR #7 Nightly {existing_case_spec} @ {SHA} (comment 19)",
                 path=f".github/workflows/{flow.split('/')[-1]}",
             )
         ],
@@ -2445,17 +2483,34 @@ def test_nightly_dispatcher_still_routes_formal_ci_as_before():
 
 
 @pytest.mark.parametrize(
-    "problem", ["none", "head", "author", "issue", "command", "write"]
+    "problem, case_id, comment_body",
+    [
+        ("none", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("none", "all", "/ci run nightly all"),
+        (
+            "none",
+            "glm-5.3,deepseek-v4-flash",
+            "/ci run nightly glm-5.3, deepseek-v4-flash",
+        ),
+        ("head", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("author", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("issue", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("command", "glm-5.3", "/ci run"),
+        ("command", "glm-5.3,deepseek-v4-flash", "/ci run nightly glm-5.3"),
+        ("write", "glm-5.3", "/ci run nightly glm-5.3"),
+    ],
 )
-def test_nightly_executor_binds_writer_comment_to_current_pr_head(problem):
+def test_nightly_executor_binds_writer_comment_to_current_pr_head(
+    problem, case_id, comment_body
+):
     from scripts.ci.ppu_pr_nightly import NightlyController
 
-    current, gh, _ = make_controller({"inputs": {**INPUTS, "case_id": "glm-5.3"}})
+    current, gh, _ = make_controller({"inputs": {**INPUTS, "case_id": case_id}})
     pr = {**PR, "head": {**PR["head"], "sha": OLD if problem == "head" else SHA}}
     comment = {
         "issue_url": f"https://api.github.com{ROOT}/issues/{8 if problem == 'issue' else 7}",
         "user": {**USER, "login": "another" if problem == "author" else "author"},
-        "body": "/ci run" if problem == "command" else "/ci run nightly glm-5.3",
+        "body": comment_body,
     }
     gh.add("GET", ROOT + "/pulls/7", pr)
     gh.add("GET", ROOT + "/issues/comments/42", comment)
@@ -2484,10 +2539,12 @@ def test_nightly_report_keeps_case_verdict_separate_and_redacts_summary(
 ):
     from scripts.ci.ppu_pr_nightly import NightlyController
 
-    report = tmp_path / "summary.json"
-    report.write_text(
+    artifact = tmp_path / "ppu-recipe-model_sanity-glm-5.3-900-2"
+    artifact.mkdir()
+    (artifact / "summary.json").write_text(
         json.dumps(
             {
+                "status": "pass" if case_result == "success" else "fail",
                 "failure_reason": reason,
                 "gsm8k": {"score": 0.92, "evaluated_samples": 1319},
                 "micro_e2e": "pass",
@@ -2500,13 +2557,16 @@ def test_nightly_report_keeps_case_verdict_separate_and_redacts_summary(
         {
             "NEEDS": json.dumps(
                 {
-                    "select": {"result": "success", "outputs": {"lane": "recipe"}},
+                    "select": {
+                        "result": "success",
+                        "outputs": {"recipe_models": "glm-5.3", "legacy_models": ""},
+                    },
                     "build": {"result": "success"},
                     "recipe": {"result": case_result},
                     "legacy": {"result": "skipped"},
                 }
             ),
-            "SUMMARY_PATH": str(report),
+            "SUMMARY_DIR": str(tmp_path),
         },
     )
     gh.page(COMMENTS, [])
@@ -2527,3 +2587,277 @@ def test_nightly_report_keeps_case_verdict_separate_and_redacts_summary(
     if reason in ("server_startup_failed", "gsm8k_gate_failed"):
         assert reason in reply(gh)
     assert states(gh) == []
+
+
+def test_nightly_report_summarizes_multi_case_mixed_lanes_in_table(tmp_path):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    legacy_dir = tmp_path / "ppu-pr-nightly-legacy-deepseek-v4-int8-900-2"
+    legacy_dir.mkdir()
+    (legacy_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.91, "evaluated_samples": 1319},
+                "extra": "PRIVATE_SECRET",
+            }
+        )
+    )
+    recipe_dir = tmp_path / "ppu-recipe-model_sanity-glm-5.3-900-2"
+    recipe_dir.mkdir()
+    (recipe_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "fail",
+                "failure_reason": "gsm8k_gate_failed",
+                "gsm8k": {"score": 0.85, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+                "extra": "PRIVATE_SECRET",
+            }
+        )
+    )
+    current, gh, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "all"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "deepseek-v4-int8",
+                            "recipe_models": "glm-5.3,deepseek-v4-flash",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "success"},
+                    "recipe": {"result": "failure"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh.page(COMMENTS, [])
+    gh.add("POST", ROOT + COMMENTS, {})
+    control = NightlyController(gh, current.event, current.env)
+    with pytest.raises(module().Rejected, match="Failed"):
+        control.report()
+    body = reply(gh)
+    assert f"PR Nightly `all` at `{SHA}` — **Failed** (1/3 passed)" in body
+    assert "| `deepseek-v4-int8` | legacy | pass | 91.00% (1319) | — | — |" in body
+    assert (
+        "| `glm-5.3` | recipe | fail | 85.00% (1319) | pass | `gsm8k_gate_failed` |"
+        in body
+    )
+    assert "| `deepseek-v4-flash` | recipe | unavailable | — | — | — |" in body
+    assert "PRIVATE_SECRET" not in body
+    assert states(gh) == []
+
+
+def test_nightly_report_partial_rerun_uses_exact_job_attempts_and_avoids_stale_fallback(
+    tmp_path,
+):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    # Attempt 1: legacy deepseek-v4-int8 passed, recipe glm-5.3 failed,
+    # recipe deepseek-v4-flash failed.
+    for dirname, payload in (
+        (
+            "ppu-pr-nightly-legacy-deepseek-v4-int8-900-1",
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.91, "evaluated_samples": 1319},
+            },
+        ),
+        (
+            "ppu-recipe-model_sanity-glm-5.3-900-1",
+            {
+                "status": "fail",
+                "failure_reason": "server_startup_failed",
+                "gsm8k": {"score": None, "evaluated_samples": None},
+            },
+        ),
+        (
+            "ppu-recipe-model_sanity-glm-5.3-900-2",
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.93, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+            },
+        ),
+        (
+            "ppu-recipe-model_sanity-deepseek-v4-flash-900-1",
+            {
+                "status": "fail",
+                "failure_reason": "gsm8k_gate_failed",
+                "gsm8k": {"score": 0.50, "evaluated_samples": 1319},
+            },
+        ),
+    ):
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "summary.json").write_text(json.dumps(payload))
+
+    # Case A: Re-run failed jobs succeeded for both lanes (2/2 passed).
+    current, gh, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "deepseek-v4-int8,glm-5.3"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "deepseek-v4-int8",
+                            "recipe_models": "glm-5.3",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "success"},
+                    "recipe": {"result": "success"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh.page(
+        "/actions/runs/900/jobs",
+        [
+            {
+                "name": "PR Nightly legacy accuracy / Accuracy deepseek-v4-int8",
+                "run_attempt": 1,
+                "conclusion": "success",
+            },
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E glm-5.3",
+                "run_attempt": 2,
+                "conclusion": "success",
+            },
+        ],
+        "jobs",
+        filter="latest",
+    )
+    gh.page(COMMENTS, [])
+    gh.add("POST", ROOT + COMMENTS, {})
+    NightlyController(gh, current.event, current.env).report()
+    body = reply(gh)
+    assert (
+        f"PR Nightly `deepseek-v4-int8,glm-5.3` at `{SHA}` — **Passed** (2/2 passed)"
+        in body
+    )
+    assert "| `deepseek-v4-int8` | legacy | pass | 91.00% (1319) | — | — |" in body
+    assert "| `glm-5.3` | recipe | pass | 93.00% (1319) | pass | — |" in body
+
+    # Case B: deepseek-v4-flash was rerun in attempt 2 and cancelled before
+    # uploading attempt-2 summary; must NOT fall back to attempt-1 failure summary.
+    current2, gh2, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "deepseek-v4-int8,deepseek-v4-flash"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "deepseek-v4-int8",
+                            "recipe_models": "deepseek-v4-flash",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "success"},
+                    "recipe": {"result": "cancelled"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh2.page(
+        "/actions/runs/900/jobs",
+        [
+            {
+                "name": "PR Nightly legacy accuracy / Accuracy deepseek-v4-int8",
+                "run_attempt": 1,
+                "conclusion": "success",
+            },
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E deepseek-v4-flash",
+                "run_attempt": 2,
+                "conclusion": "cancelled",
+            },
+        ],
+        "jobs",
+        filter="latest",
+    )
+    gh2.page(COMMENTS, [])
+    gh2.add("POST", ROOT + COMMENTS, {})
+    with pytest.raises(module().Rejected, match="Cancelled"):
+        NightlyController(gh2, current2.event, current2.env).report()
+    body2 = reply(gh2)
+    assert "(1/2 passed)" in body2
+    assert "| `deepseek-v4-int8` | legacy | pass | 91.00% (1319) | — | — |" in body2
+    assert "| `deepseek-v4-flash` | recipe | cancelled | — | — | — |" in body2
+    assert "gsm8k_gate_failed" not in body2
+    assert "50.00%" not in body2
+
+    # Case C: Same lane partial rerun where one case passed on attempt 1 and a
+    # sibling case failed on attempt 2 without an attempt-2 summary.
+    for dirname, payload in (
+        (
+            "ppu-recipe-model_sanity-glm-5.3-flash-900-1",
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.94, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+            },
+        ),
+    ):
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "summary.json").write_text(json.dumps(payload))
+    current3, gh3, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "glm-5.3-flash,deepseek-v4-flash"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "",
+                            "recipe_models": "glm-5.3-flash,deepseek-v4-flash",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "skipped"},
+                    "recipe": {"result": "failure"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh3.page(
+        "/actions/runs/900/jobs",
+        [
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E glm-5.3-flash",
+                "run_attempt": 1,
+                "conclusion": "success",
+            },
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E deepseek-v4-flash",
+                "run_attempt": 2,
+                "conclusion": "failure",
+            },
+        ],
+        "jobs",
+        filter="latest",
+    )
+    gh3.page(COMMENTS, [])
+    gh3.add("POST", ROOT + COMMENTS, {})
+    with pytest.raises(module().Rejected, match="Failed"):
+        NightlyController(gh3, current3.event, current3.env).report()
+    body3 = reply(gh3)
+    assert "(1/2 passed)" in body3
+    assert "| `glm-5.3-flash` | recipe | pass | 94.00% (1319) | pass | — |" in body3
+    assert "| `deepseek-v4-flash` | recipe | unavailable | — | — | — |" in body3
+    assert "50.00%" not in body3

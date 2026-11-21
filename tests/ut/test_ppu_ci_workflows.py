@@ -1840,7 +1840,7 @@ def test_recipe_workflow_refuses_arbitrary_wheel_run(
             "GITHUB_RUN_ID": "101",
             "GITHUB_OUTPUT": str(output),
             "MODELS": "",
-            "SINGLE_CASE_MATRIX": "",
+            "SELECTED_MATRIX": "",
         },
     )
     assert (result.returncode == 0) is allowed

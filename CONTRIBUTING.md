@@ -167,19 +167,26 @@ after verifying the commands on the default branch.
 
 ### On-demand PR Nightly accuracy
 
-Repository writers can request a single real-weight case by posting
-`/ci run nightly <case>`. Use a Recipe policy slug with a `model_sanity` tier
-(for example, `glm-5.3`) or an exact legacy accuracy case ID (for example,
-`deepseek-v4-mxfp4-dp-ep`). Posting `/ci run nightly` returns help and links
-to the [Nightly case matrix](tests/ppu/README.md). A different configuration of
-the same model may have a different case ID.
+Repository writers can request real-weight Nightly accuracy coverage on a PR:
 
-The new Nightly workflow runs from the default branch and pins the PR head,
-case selection and the same run's wheels to that commit. It reports the case
-result and Actions link on the PR, with published accuracy and failure details
-when available. It is a separate on-demand run outside the required
-`PPU CI` status. Use GitHub Actions to cancel or rerun it. Full-matrix PR
-Nightly is not part of the single-case rollout.
+- Single case: `/ci run nightly <case>`
+- Multiple cases: `/ci run nightly <case1>,<case2>` (comma- or space-separated)
+- Full deduplicated Nightly matrix: `/ci run nightly all` (runs all Recipe
+  `model_sanity` policies plus remaining legacy accuracy cases not replaced by
+  Recipe, matching scheduled Nightly)
+
+Use a Recipe policy slug with a `model_sanity` tier (for example, `glm-5.3`) or
+an exact legacy accuracy case ID (for example, `deepseek-v4-int8-dp-ep`).
+Posting `/ci run nightly` returns usage help and links to the
+[Nightly case matrix](tests/ppu/README.md) without dispatching a run. A
+different configuration of the same model may have a different case ID.
+
+The Nightly workflow runs from the default branch and pins the PR head, case
+selection and the same run's wheels to that commit. Multiple cases execute
+serially across legacy and Recipe lanes. It reports the case results and
+Actions link on the PR, with published accuracy and failure details when
+available. It is a separate on-demand run outside the required `PPU CI` status.
+Use GitHub Actions to cancel or rerun it.
 
 ## Reporting issues
 

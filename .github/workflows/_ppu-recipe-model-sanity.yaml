@@ -21,8 +21,8 @@ on:
         description: Comma-separated recipe policy slugs (blank = all)
         type: string
         default: ""
-      single_case_matrix:
-        description: Validated matrix for the single requested PR Nightly case
+      selected_matrix:
+        description: Validated matrix for the requested PR Nightly cases
         type: string
         default: ""
 
@@ -71,23 +71,29 @@ jobs:
           TIER: model_sanity
           PR_MODE: ${{ inputs.pr_mode }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
-          SINGLE_CASE_MATRIX: ${{ inputs.single_case_matrix }}
+          SELECTED_MATRIX: ${{ inputs.selected_matrix }}
         run: |
           test "$PR_MODE" != true
           test "$BUILD_RUN_ID" = "$GITHUB_RUN_ID"
-          if [[ -n "${SINGLE_CASE_MATRIX:-}" ]]; then
+          if [[ -n "${SELECTED_MATRIX:-}" ]]; then
             python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
           import json
           import os
 
           try:
-              entries = json.loads(os.environ["SINGLE_CASE_MATRIX"])["include"]
-              if (not isinstance(entries, list) or len(entries) != 1
-                  or not isinstance(entries[0], dict)
-                  or entries[0].get("key") != os.environ["MODELS"]):
+              expected = [m for m in os.environ["MODELS"].split(",") if m]
+              entries = json.loads(os.environ["SELECTED_MATRIX"])["include"]
+              if (
+                  not expected
+                  or len(expected) != len(set(expected))
+                  or not isinstance(entries, list)
+                  or len(entries) != len(expected)
+                  or not all(isinstance(entry, dict) for entry in entries)
+                  or [entry.get("key") for entry in entries] != expected
+              ):
                   raise ValueError
           except (ValueError, KeyError, TypeError, RecursionError):
-              raise SystemExit("Expected a matrix for the single requested PR Nightly case.") from None
+              raise SystemExit("Expected a matrix matching the requested PR Nightly cases.") from None
           print("recipe_matrix=" + json.dumps({"include": entries}, separators=(",", ":")))
           PY
           else
@@ -124,6 +130,9 @@ jobs:
           public="$(mktemp -d "${RUNNER_TEMP}/ppu-recipe-public.XXXXXX")"
           source_rel=".ppu-recipe-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source="${GITHUB_WORKSPACE}/${source_rel}"
+          trusted_rel=".ppu-recipe-trusted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trusted="${GITHUB_WORKSPACE}/${trusted_rel}"
+          printf '::add-mask::%s\n' "$config" "$wheels" "$artifacts" "$public" "$source" "$trusted"
           {
             printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
             printf 'wheels=%s\n' "$wheels"
@@ -131,6 +140,8 @@ jobs:
             printf 'public=%s\n' "$public"
             printf 'source_rel=%s\n' "$source_rel"
             printf 'source=%s\n' "$source"
+            printf 'trusted_rel=%s\n' "$trusted_rel"
+            printf 'trusted=%s\n' "$trusted"
             printf 'queue_s=%s\n' "$queue_s"
           } >> "$GITHUB_OUTPUT"
           printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
@@ -157,6 +168,21 @@ jobs:
           SOURCE_DIR: ${{ steps.runtime.outputs.source }}
         run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
 
+      - name: Check out trusted CI scripts
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          path: ${{ steps.runtime.outputs.trusted_rel }}
+          persist-credentials: false
+
+      - name: Verify trusted CI revision
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          TRUSTED_DIR: ${{ steps.runtime.outputs.trusted }}
+        run: test "$(git -c safe.directory="$TRUSTED_DIR" -C "$TRUSTED_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
       - name: Download CI-built wheels
         uses: actions/download-artifact@v4
         with:
@@ -169,6 +195,7 @@ jobs:
       - name: Run recipe model sanity and micro-E2E in the PPU runtime container
         id: recipe
         env:
+          TRUSTED_CI_DIR: ${{ steps.runtime.outputs.trusted }}
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
           PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
@@ -184,13 +211,28 @@ jobs:
           PPU_CI_QUEUE_S: ${{ steps.runtime.outputs.queue_s }}
         run: |
           umask 077
-          bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" recipe-sanity \
-            >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1
+          python3 -I - >"${PPU_CI_ARTIFACT_DIR}/launcher.log" 2>&1 <<'PY'
+          import os
+
+          trusted = os.environ.get("TRUSTED_CI_DIR") or os.environ["PPU_CI_SOURCE_DIR"]
+          wrapper = os.path.join(trusted, "scripts", "ci", "ppu_runtime_container.sh")
+          keep_github = {"GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"}
+          blocked_prefixes = ("ACTIONS_", "INPUT_", "STATE_", "RUNNER_")
+          child = {
+              key: value
+              for key, value in os.environ.items()
+              if not key.startswith(blocked_prefixes)
+              and (not key.startswith("GITHUB_") or key in keep_github)
+              and key != "TRUSTED_CI_DIR"
+          }
+          os.execvpe("bash", ["bash", wrapper, "recipe-sanity"], child)
+          PY
 
       - name: Retain private recipe results on the runner
         id: retain
         if: always() && steps.runtime.outcome == 'success'
         env:
+          TRUSTED_CI_DIR: ${{ steps.runtime.outputs.trusted }}
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
           PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
@@ -199,7 +241,7 @@ jobs:
           RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
         run: |
           umask 077
-          python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
+          python3 -I "${TRUSTED_CI_DIR:-$PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_retention.py"
 
       - name: Publish public recipe sanity summary
         id: publish
@@ -208,6 +250,7 @@ jobs:
           RECIPE_OUTCOME: ${{ steps.recipe.outcome }}
           RETENTION_OUTCOME: ${{ steps.retain.outcome }}
           RETENTION: ${{ steps.retain.outputs.retention }}
+          TRUSTED_CI_DIR: ${{ steps.runtime.outputs.trusted }}
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           MODEL_KEY: ${{ matrix.model.key }}
           PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
@@ -226,7 +269,15 @@ jobs:
           esac
           reason=not_applicable
           if [[ "$RECIPE_OUTCOME" == failure ]]; then
-            reason=$(python3 -I "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py")
+            raw_reason=$(python3 -I "${TRUSTED_CI_DIR:-$PPU_CI_SOURCE_DIR}/scripts/ci/ppu_recipe_diagnostics.py" 2>/dev/null || true)
+            case "$raw_reason" in
+              wheel_verification_failed|runtime_dependencies_failed|platform_check_failed|model_cache_check_failed|recipe_validation_failed|server_startup_failed|server_readiness_timeout|chat_probe_failed|stream_probe_failed|stream_http_error|stream_transport_error|stream_response_too_large|stream_timeout|invalid_stream_chunk|truncated_stream|missing_done|empty_stream_content|gsm8k_eval_failed|micro_e2e_failed|gsm8k_gate_failed|mla_metadata_shape_mismatch|runtime_setup_failed|unknown)
+                reason="$raw_reason"
+                ;;
+              *)
+                reason=unknown
+                ;;
+            esac
           fi
           printf 'Recipe sanity: %s\nretention: %s\nfailure_reason: %s\n' "$status" "$retention" "$reason"
           python3 -I - "$status" "$retention" "$reason" <<'PY'
@@ -236,6 +287,33 @@ jobs:
           import stat
           import sys
           from pathlib import Path
+
+          ALLOWED_REASONS = {
+              "not_applicable",
+              "wheel_verification_failed",
+              "runtime_dependencies_failed",
+              "platform_check_failed",
+              "model_cache_check_failed",
+              "recipe_validation_failed",
+              "server_startup_failed",
+              "server_readiness_timeout",
+              "chat_probe_failed",
+              "stream_probe_failed",
+              "stream_http_error",
+              "stream_transport_error",
+              "stream_response_too_large",
+              "stream_timeout",
+              "invalid_stream_chunk",
+              "truncated_stream",
+              "missing_done",
+              "empty_stream_content",
+              "gsm8k_eval_failed",
+              "micro_e2e_failed",
+              "gsm8k_gate_failed",
+              "mla_metadata_shape_mismatch",
+              "runtime_setup_failed",
+              "unknown",
+          }
 
           def mapping(value):
               return value if isinstance(value, dict) else {}
@@ -269,11 +347,12 @@ jobs:
           model = os.environ["MODEL_KEY"]
           if baseline not in ("baseline_established", "baseline_incomplete"):
               baseline = "not_available"
+          safe_reason = sys.argv[3] if sys.argv[3] in ALLOWED_REASONS else "unknown"
           public = {
               "model_key": model if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", model) else None,
               "status": sys.argv[1],
               "retention": sys.argv[2],
-              "failure_reason": sys.argv[3],
+              "failure_reason": safe_reason,
               "gsm8k": {
                   "score": number(accuracy.get("score"), 0, 1),
                   "evaluated_samples": count(accuracy.get("num")),

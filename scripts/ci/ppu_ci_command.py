@@ -127,6 +127,8 @@ class GitHub:
 class Controller:
     """Inject request/GraphQL client, event, environment and sleep for CPU tests."""
 
+    command_help = HELP
+
     def __init__(self, github, event, env=None, sleep=time.sleep):
         self.gh, self.event = github, event
         self.env = os.environ if env is None else env
@@ -430,7 +432,7 @@ class Controller:
             reaction = "rocket"
             try:
                 if action == "help":
-                    raise Rejected(HELP)
+                    raise Rejected(self.command_help)
                 pr = self.api("GET", f"/pulls/{number}")
                 text = self.execute(action, pr, login, cid)
             except Rejected as exc:

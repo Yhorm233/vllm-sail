@@ -87,7 +87,11 @@ def test_summary_projects_only_allowlisted_result(
         )
     )
     has_gate = gate != "not_available"
+    expected_status = {"success": "pass", "failure": "fail", "cancelled": "cancelled"}[
+        outcome
+    ]
     assert summarize(tmp_path, outcome) == {
+        "status": expected_status,
         "failure_reason": reason,
         "gsm8k": {
             "score": 0.91 if has_gate else None,
@@ -111,6 +115,7 @@ def test_unusable_evidence_is_unknown_without_inventing_a_gate(tmp_path, source_
     elif source_type == "fifo":
         os.mkfifo(sidecar)
     assert summarize(tmp_path, "success") == {
+        "status": "pass",
         "failure_reason": "unknown",
         "gsm8k": {"score": None, "evaluated_samples": None, "gate": "not_available"},
     }
@@ -132,20 +137,25 @@ def test_out_of_range_or_non_numeric_fields_are_omitted(tmp_path, score, samples
 
 
 def test_failed_wheel_download_has_setup_evidence(tmp_path):
-    assert summarize(tmp_path, "skipped", wheels="failure")["failure_reason"] == (
-        "runtime_setup_failed"
-    )
+    summary = summarize(tmp_path, "skipped", wheels="failure")
+    assert summary["status"] == "fail"
+    assert summary["failure_reason"] == "runtime_setup_failed"
 
 
 @pytest.mark.parametrize(
     ("head", "wheel", "run", "case", "passed"),
     [
         (HEAD, HEAD, "10", "deepseek-v4-mxfp4", True),
+        (HEAD, HEAD, "10", "one,two", True),
         ("main", "main", "10", "deepseek-v4-mxfp4", False),
         (HEAD, PIN, "10", "deepseek-v4-mxfp4", False),
         (HEAD, HEAD, "11", "deepseek-v4-mxfp4", False),
         (HEAD, HEAD, "10", "all", False),
-        (HEAD, HEAD, "10", "one,two", False),
+        (HEAD, HEAD, "10", "one,all", False),
+        (HEAD, HEAD, "10", "one,one", False),
+        (HEAD, HEAD, "10", "one,", False),
+        (HEAD, HEAD, "10", ",one", False),
+        (HEAD, HEAD, "10", "", False),
     ],
 )
 def test_pr_input_guard(head, wheel, run, case, passed):
@@ -161,6 +171,49 @@ def test_pr_input_guard(head, wheel, run, case, passed):
         },
     )
     assert (step.returncode == 0) == passed
+
+
+@pytest.mark.parametrize(
+    ("models", "expected"),
+    [
+        ("case-a", [{"case_id": "case-a"}]),
+        ("case-a,case-b", [{"case_id": "case-a"}, {"case_id": "case-b"}]),
+        ("case-a,case-a", None),
+        ("case-a,smoke-only", None),
+        ("case-a,unknown", None),
+    ],
+)
+def test_pr_select_expands_multiple_legacy_cases_and_rejects_invalid(
+    tmp_path, models, expected
+):
+    git = tmp_path / "git"
+    git.write_text(
+        "#!/bin/bash\n"
+        'echo \'[{"key":"case-a","category":"accuracy"},'
+        '{"key":"case-b","category":"accuracy"},'
+        '{"key":"smoke-only","category":"smoke"}]\'\n'
+    )
+    git.chmod(0o700)
+    output = tmp_path / "github-output"
+    step = run_step(
+        "prepare",
+        "Select accuracy models",
+        {
+            "PATH": os.pathsep.join(
+                (str(tmp_path), str(Path(sys.executable).parent), os.environ["PATH"])
+            ),
+            "PR_MODE": "true",
+            "MODELS": models,
+            "GITHUB_OUTPUT": str(output),
+        },
+    )
+    if expected is None:
+        assert step.returncode != 0
+        assert not output.exists() or output.read_text() == ""
+        return
+    assert step.returncode == 0, step.stderr
+    line = output.read_text().strip()
+    assert json.loads(line.removeprefix("accuracy_matrix=")) == {"include": expected}
 
 
 @pytest.mark.parametrize("commits", [(PIN, HEAD), (HEAD, HEAD), (PIN, PIN)])

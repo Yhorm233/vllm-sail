@@ -9,7 +9,8 @@ SCRIPT = ROOT / "scripts/ci/ppu_runtime_container.sh"
 
 def test_runtime_wrapper_uses_preloaded_image_and_explicit_ppu_devices():
     text = SCRIPT.read_text()
-    assert 'ppu_runtime_image.sh" 9>&-' in text
+    assert 'bash "${script_dir}/ppu_runtime_image.sh" 9>&-' in text
+    assert "${source_dir}/scripts/ci/ppu_runtime_image.sh" not in text
     resolver = (ROOT / "scripts/ci/ppu_runtime_image.sh").read_text()
     assert "Runner must configure PPU_CI_RUNTIME_IMAGE" in resolver
     assert 'docker image inspect "${PPU_CI_RUNTIME_IMAGE}"' in resolver

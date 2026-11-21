@@ -49,14 +49,15 @@ jobs:
         run: python3 -m scripts.ci.ppu_pr_nightly validate
 
   select:
-    name: Resolve the requested Nightly case
+    name: Resolve requested Nightly cases
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
-      lane: ${{ steps.select.outputs.lane }}
+      recipe_models: ${{ steps.select.outputs.recipe_models }}
+      legacy_models: ${{ steps.select.outputs.legacy_models }}
       recipe_matrix: ${{ steps.select.outputs.recipe_matrix }}
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +73,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --no-cache-dir PyYAML==6.0.3
-      - name: Resolve one case from the verified candidate
+      - name: Resolve requested cases from the verified candidate
         id: select
         env:
           HEAD_SHA: ${{ inputs.head_sha }}
@@ -92,10 +93,30 @@ jobs:
     with:
       pr_head_sha: ${{ inputs.head_sha }}
 
+  legacy:
+    name: PR Nightly legacy accuracy
+    needs: [select, build]
+    if: needs.select.outputs.legacy_models != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ppu-accuracy-tests.yaml
+    with:
+      pr_mode: true
+      pr_head_sha: ${{ inputs.head_sha }}
+      wheel_source_sha: ${{ inputs.head_sha }}
+      build_run_id: ${{ github.run_id }}
+      models: ${{ needs.select.outputs.legacy_models }}
+
   recipe:
     name: PR Nightly Recipe
-    needs: [select, build]
-    if: needs.select.outputs.lane == 'recipe' && needs.select.outputs.recipe_matrix != ''
+    needs: [select, build, legacy]
+    if: >-
+      !cancelled() &&
+      needs.select.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.select.outputs.recipe_models != '' &&
+      needs.select.outputs.recipe_matrix != ''
     permissions:
       contents: read
       actions: read
@@ -106,27 +127,12 @@ jobs:
       pr_head_sha: ${{ inputs.head_sha }}
       wheel_source_sha: ${{ inputs.head_sha }}
       build_run_id: ${{ github.run_id }}
-      models: ${{ inputs.case_id }}
-      single_case_matrix: ${{ needs.select.outputs.recipe_matrix }}
-
-  legacy:
-    name: PR Nightly legacy accuracy
-    needs: [select, build]
-    if: needs.select.outputs.lane == 'legacy'
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/_ppu-accuracy-tests.yaml
-    with:
-      pr_mode: true
-      pr_head_sha: ${{ inputs.head_sha }}
-      wheel_source_sha: ${{ inputs.head_sha }}
-      build_run_id: ${{ github.run_id }}
-      models: ${{ inputs.case_id }}
+      models: ${{ needs.select.outputs.recipe_models }}
+      selected_matrix: ${{ needs.select.outputs.recipe_matrix }}
 
   report:
-    name: Report the Nightly case
-    needs: [validate, select, build, recipe, legacy]
+    name: Report the Nightly results
+    needs: [validate, select, build, legacy, recipe]
     if: always() && needs.validate.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -140,16 +146,23 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Read the allowlisted case summary
-        if: needs.select.outputs.lane != '' && needs.build.result == 'success'
+      - name: Read allowlisted Recipe summaries
+        if: needs.select.outputs.recipe_models != '' && needs.build.result == 'success'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ${{ format('{0}-{1}-{2}-{3}', needs.select.outputs.lane == 'recipe' && 'ppu-recipe-model_sanity' || 'ppu-pr-nightly-legacy', inputs.case_id, github.run_id, github.run_attempt) }}
-          path: ${{ runner.temp }}/nightly-case-summary
+          pattern: ppu-recipe-model_sanity-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/nightly-case-summaries
+      - name: Read allowlisted legacy summaries
+        if: needs.select.outputs.legacy_models != '' && needs.build.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-pr-nightly-legacy-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/nightly-case-summaries
       - name: Publish result for the tested PR head
         env:
           GITHUB_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
-          SUMMARY_PATH: ${{ runner.temp }}/nightly-case-summary/summary.json
+          SUMMARY_DIR: ${{ runner.temp }}/nightly-case-summaries
         run: python3 -m scripts.ci.ppu_pr_nightly report

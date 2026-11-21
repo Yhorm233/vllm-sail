@@ -92,10 +92,19 @@ jobs:
             echo 'PR Nightly requires wheels from this run.' >&2
             exit 1
           fi
-          if [[ ! "$CASE_ID" =~ ^[a-z0-9][a-z0-9.-]{0,63}$ || "$CASE_ID" == all ]]; then
-            echo 'PR Nightly requires one legacy accuracy case ID.' >&2
+          IFS=',' read -r -a cases <<< "$CASE_ID"
+          if [[ -z "$CASE_ID" || "$CASE_ID" == *, || ${#cases[@]} -eq 0 ]]; then
+            echo 'PR Nightly requires one or more distinct legacy accuracy case IDs.' >&2
             exit 1
           fi
+          seen=","
+          for case in "${cases[@]}"; do
+            if [[ ! "$case" =~ ^[a-z0-9][a-z0-9.-]{0,63}$ || "$case" == all || "$seen" == *",$case,"* ]]; then
+              echo 'PR Nightly requires one or more distinct legacy accuracy case IDs.' >&2
+              exit 1
+            fi
+            seen+="$case,"
+          done
 
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
@@ -123,19 +132,24 @@ jobs:
           import os
           import subprocess
 
-          case_id = os.environ["MODELS"]
+          cases = os.environ["MODELS"].split(",")
           try:
+              if not cases or any(not case for case in cases) or len(cases) != len(set(cases)):
+                  raise ValueError
               catalog = json.loads(subprocess.check_output(
                   ["git", "show", "HEAD:scripts/ci/ppu_e2e_models.json"],
                   stderr=subprocess.DEVNULL,
               ))
-              matches = [entry for entry in catalog if entry["key"] == case_id]
-              if len(matches) != 1 or matches[0].get("category") != "accuracy":
-                  raise ValueError
+              include = []
+              for case_id in cases:
+                  matches = [entry for entry in catalog if entry["key"] == case_id]
+                  if len(matches) != 1 or matches[0].get("category") != "accuracy":
+                      raise ValueError
+                  include.append({"case_id": case_id})
           except (ValueError, TypeError, KeyError, subprocess.CalledProcessError):
-              raise SystemExit("Expected one legacy accuracy catalog case.") from None
+              raise SystemExit("Expected exact legacy accuracy catalog cases.") from None
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print("accuracy_matrix=" + json.dumps({"include": [{"case_id": case_id}]}),
+              print("accuracy_matrix=" + json.dumps({"include": include}, separators=(",", ":")),
                     file=output)
           PY
 
@@ -149,6 +163,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      # Every accuracy model takes all eight devices and holds an exclusive
+      # flock on the runner, so multiple cases must execute serially.
+      max-parallel: 1
       matrix:
         model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
     env:
@@ -336,29 +353,36 @@ jobs:
           }
           phase_failures = {"runtime_setup_failed", "server_startup_failed", "gsm8k_eval_failed"}
           if os.environ["WHEELS_OUTCOME"] == "failure":
+              case_status = "fail"
               reason = "runtime_setup_failed"
-          elif accuracy_outcome in {"success", "failure"}:
-              path = Path(os.environ["PRIVATE_DIR"]) / "legacy-accuracy-result.json"
-              try:
-                  record = read_result(path)
-              except (OSError, ValueError, RecursionError):
-                  record = {}
-              status = record.get("status")
-              if isinstance(status, str):
-                  if accuracy_outcome == "success" and status in {"pass", "created", "updated"}:
-                      reason, gate = "not_applicable", "pass"
-                  elif accuracy_outcome == "failure" and status in failures:
-                      reason, gate = failures[status], "fail"
-                  elif accuracy_outcome == "failure" and status in phase_failures:
-                      reason = status
-              if gate != "not_available":
-                  raw_score, raw_samples = record.get("score"), record.get("num")
-                  if type(raw_score) in (int, float) and 0 <= raw_score <= 1:
-                      score = raw_score
-                  if type(raw_samples) is int and 0 <= raw_samples <= 100_000:
-                      samples = raw_samples
+          else:
+              case_status = {
+                  "success": "pass",
+                  "failure": "fail",
+                  "cancelled": "cancelled",
+              }.get(accuracy_outcome, "not_run")
+              if accuracy_outcome in {"success", "failure"}:
+                  path = Path(os.environ["PRIVATE_DIR"]) / "legacy-accuracy-result.json"
+                  try:
+                      record = read_result(path)
+                  except (OSError, ValueError, RecursionError):
+                      record = {}
+                  status = record.get("status")
+                  if isinstance(status, str):
+                      if accuracy_outcome == "success" and status in {"pass", "created", "updated"}:
+                          reason, gate = "not_applicable", "pass"
+                      elif accuracy_outcome == "failure" and status in failures:
+                          reason, gate = failures[status], "fail"
+                      elif accuracy_outcome == "failure" and status in phase_failures:
+                          reason = status
+                  if gate != "not_available":
+                      raw_score, raw_samples = record.get("score"), record.get("num")
+                      if type(raw_score) in (int, float) and 0 <= raw_score <= 1:
+                          score = raw_score
+                      if type(raw_samples) is int and 0 <= raw_samples <= 100_000:
+                          samples = raw_samples
 
-          summary = {"failure_reason": reason, "gsm8k": {
+          summary = {"status": case_status, "failure_reason": reason, "gsm8k": {
               "score": score, "evaluated_samples": samples, "gate": gate,
           }}
           output = Path(os.environ["PUBLIC_DIR"]) / "summary.json"
