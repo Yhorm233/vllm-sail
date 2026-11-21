@@ -90,6 +90,7 @@ def test_checked_in_recipes_and_policies_validate_cleanly() -> None:
         [
             RECIPES_DIR / "zai-org" / "GLM-5.3.yaml",
             RECIPES_DIR / "deepseek-ai" / "DeepSeek-V4-Flash.yaml",
+            RECIPES_DIR / "moonshotai" / "Kimi-K2.6.yaml",
         ],
         vllm_parser_mode="required",
         parser=_sample_vllm_parser(),
@@ -429,6 +430,63 @@ def test_resolve_deepseek_v41_and_v4_pro_recipes() -> None:
     assert json.loads(v4p["flags"][v4p["flags"].index("--hf-overrides") + 1]) == {
         "num_hidden_layers": 3
     }
+
+
+def test_resolve_kimi_k26_matches_catalog_and_sampling_contract() -> None:
+    recipe = RECIPES_DIR / "moonshotai" / "Kimi-K2.6.yaml"
+    policy = POLICY_DIR / "models" / "kimi-k2.6.yaml"
+    catalog = {
+        entry["key"]: entry
+        for entry in json.loads((CI_DIR / "ppu_e2e_models.json").read_text())
+    }
+    legacy = catalog["kimi-k2.6-mxfp4-tp8"]
+    cat_flags = legacy["server_cmd"][9:]
+
+    resolved_ms = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="model_sanity"
+    )
+    assert resolved_ms["ppu_count"] == 8
+    assert resolved_ms["server_env"] == legacy["server_env"]
+    # The executor injects prefix caching from the policy; the recipe itself
+    # must not hardcode it, and the resolved command still covers every
+    # legacy serve flag.
+    assert resolved_ms["flags"][-1] == "--enable-prefix-caching"
+    assert set(cat_flags) <= set(resolved_ms["flags"])
+    recipe_doc = yaml.safe_load(recipe.read_text())
+    assert "--enable-prefix-caching" not in recipe_doc["model"]["base_args"]
+    assert "--load-format" not in recipe_doc["model"]["base_args"]
+    assert set(recipe_doc["ppu"]["external_env"]) == set(legacy["server_env"])
+
+    resolved_fs = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="fast_sanity"
+    )
+    assert "--load-format" in resolved_fs["flags"]
+    assert "dummy" in resolved_fs["flags"]
+    idx_ov = resolved_fs["flags"].index("--hf-overrides")
+    assert json.loads(resolved_fs["flags"][idx_ov + 1]) == {"num_hidden_layers": 2}
+
+    # The eval generation block is the sampling contract the golden gate
+    # compares key by key: any drift from the committed 890p golden fails
+    # the run before a score is even compared.
+    policy_doc = yaml.safe_load(policy.read_text())
+    eval_stage = next(
+        stage
+        for stage in policy_doc["tiers"]["model_sanity"]["stages"]
+        if stage["kind"] == "evalscope"
+    )
+    golden = json.loads(
+        (
+            ROOT
+            / "tests"
+            / "e2e"
+            / "models"
+            / "_golden"
+            / "accuracy_kimi_k2_6_mxfp4_890p.json"
+        ).read_text()
+    )
+    assert eval_stage["generation"] == golden["generation"]
+    assert resolved_ms["golden_model_key"] == golden["model"]
+    assert resolved_ms["hf_model_id"] == golden["checkpoint_tail"]
 
 
 def test_config_digest_ignores_ephemeral_endpoint_and_tracks_changes() -> None:

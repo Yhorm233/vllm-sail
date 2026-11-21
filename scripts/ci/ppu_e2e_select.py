@@ -13,6 +13,15 @@ Usage:
 models in each category. Unknown keys are rejected so a typo fails fast. The
 script emits ``matrix=<json>`` for smoke and ``accuracy_matrix=<json>`` for the
 GSM8K accuracy workflow.
+
+``--recipes [SLUGS] [TIER]`` instead selects the model policies under
+``tests/ppu/policy/models`` that define the requested tier (all of them when
+``SLUGS`` is empty) and emits ``recipe_matrix=<json>``. On scheduled Nightly,
+``scheduled_legacy_accuracy_cases`` drops the legacy accuracy cases that a
+policy claims through its ``replaces_legacy_cases`` list; every claim must
+match the legacy case's checkpoint, golden key, board, device count, and
+TP/DP/EP layout, and a mismatch fails the selection instead of silently
+keeping both runs.
 """
 
 from __future__ import annotations

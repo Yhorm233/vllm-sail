@@ -1,0 +1,56 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: kimi-k2.6-mxfp4
+    tokenizer: kimi-k2.6-mxfp4
+  hf_model_id: T-HEAD/Kimi-K2.6-MXFP4-FP8
+  golden_model_key: kimi_k2_6_mxfp4
+  served_name: kimi-k2.6-mxfp4
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  default_features: []
+  external_env:
+    - DG_USE_MOE_DYNAMIC_TILE
+    - HGGC_EMBEDDED_COPY_THRESHOLD
+model:
+  model_id: moonshotai/Kimi-K2.6
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "8"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --max-model-len
+    - "16384"
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "3600"
+  base_env:
+    DG_USE_MOE_DYNAMIC_TILE: "1"
+    HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+variants:
+  default:
+    precision: mxfp4
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  eval_longctx:
+    hardware: zhenwu_m890
+    args: []
+notes: >-
+  Serving parameters follow the checked-in kimi-k2.6-mxfp4-tp8 catalog entry
+  (TP8 on 8 Zhenwu M890 cards). The DG_USE_MOE_DYNAMIC_TILE and
+  HGGC_EMBEDDED_COPY_THRESHOLD server env values are registered in
+  ppu.external_env as the schema requires for DG_/HGGC_ variables. The
+  committed 890p golden (0.9788) was measured at temperature 1.0 / top_p 0.95;
+  the policy eval stage must keep that sampling contract.

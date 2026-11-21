@@ -157,6 +157,46 @@ def test_scheduled_recipe_rejects_invalid_policy_claims(
         select.scheduled_legacy_accuracy_cases(selected)
 
 
+def test_scheduled_recipe_replaces_kimi_tp8_but_keeps_other_legacy() -> None:
+    """The TP8 recipe claims only its own legacy case.
+
+    Sibling cases keep running on the legacy lane until their own recipes
+    land, so the nightly must drop exactly the claimed set -- no more, no
+    fewer. Computing that set from the checked-in policies keeps this test
+    green as other migration PRs land.
+    """
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    claimed = set()
+    for path in (ROOT / "tests/ppu/policy/models").glob("*.yaml"):
+        claimed.update(
+            yaml.safe_load(path.read_text()).get("replaces_legacy_cases", [])
+        )
+    assert "kimi-k2.6-mxfp4-tp8" in claimed
+    assert "kimi-k2.6-mxfp4-tp8" not in remaining
+    assert remaining == [
+        entry["case_id"] for entry in selected if entry["case_id"] not in claimed
+    ]
+
+
+def test_scheduled_recipe_restores_kimi_tp8_when_the_policy_is_removed(
+    tmp_path, monkeypatch
+) -> None:
+    """Disabling the recipe must fall back to the full legacy schedule."""
+    select = _load_select()
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    (tmp_path / "tests/ppu/policy/models/kimi-k2.6.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    monkeypatch.syspath_prepend(str(SELECT.parent))
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    assert "kimi-k2.6-mxfp4-tp8" in remaining
+
+
 def test_scheduled_selector_retires_minimax_once_the_recipe_is_enabled() -> None:
     select = _load_select()
     selected = select.build_accuracy_matrix(_catalog(), "")["include"]
