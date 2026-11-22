@@ -11,12 +11,7 @@ import pytest
 import yaml
 
 from scripts.ci.ppu_ci_command import Rejected
-from scripts.ci.ppu_e2e_select import (
-    CATALOG,
-    build_accuracy_matrix,
-    build_recipe_matrix,
-    scheduled_legacy_accuracy_cases,
-)
+from scripts.ci.ppu_e2e_select import build_recipe_matrix
 from scripts.ci.ppu_pr_nightly import resolve_cases
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,30 +45,17 @@ def test_resolves_multiple_mixed_recipe_and_legacy_cases():
     assert legacy_cases == ["deepseek-v4-int8", "minimax-m3-fp8"]
 
 
-def test_resolves_all_cases_deduplicated_like_scheduled_nightly():
+def test_resolves_all_cases_as_recipe_only_like_scheduled_nightly():
     recipe_cases, recipe_matrix, legacy_cases = resolve_cases(ROOT, "all", True)
     expected_recipe = build_recipe_matrix("", "model_sanity")
     assert recipe_matrix == expected_recipe
     assert recipe_cases == [row["key"] for row in expected_recipe["include"]]
-    catalog = json.loads(CATALOG.read_text())
-    expected_legacy = scheduled_legacy_accuracy_cases(
-        build_accuracy_matrix(catalog, "")["include"]
-    )
-    assert legacy_cases == expected_legacy
-    # Migrated legacy cases must not run twice under `all`.
-    assert "deepseek-v4-mxfp4" not in legacy_cases
-    assert "glm-5.3-mxfp4-tp4" not in legacy_cases
+    assert legacy_cases == []
 
 
-def test_resolves_all_cases_when_recipes_disabled():
-    recipe_cases, recipe_matrix, legacy_cases = resolve_cases(ROOT, "all", False)
-    assert recipe_cases == []
-    assert recipe_matrix is None
-    catalog = json.loads(CATALOG.read_text())
-    expected_legacy = [
-        row["case_id"] for row in build_accuracy_matrix(catalog, "")["include"]
-    ]
-    assert legacy_cases == expected_legacy
+def test_resolves_all_cases_rejected_when_recipes_disabled():
+    with pytest.raises(Rejected, match="disabled"):
+        resolve_cases(ROOT, "all", False)
 
 
 @pytest.mark.parametrize(

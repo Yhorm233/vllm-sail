@@ -171,9 +171,9 @@ Repository writers can request real-weight Nightly accuracy coverage on a PR:
 
 - Single case: `/ci run nightly <case>`
 - Multiple cases: `/ci run nightly <case1>,<case2>` (comma- or space-separated)
-- Full deduplicated Nightly matrix: `/ci run nightly all` (runs all Recipe
-  `model_sanity` policies plus remaining legacy accuracy cases not replaced by
-  Recipe, matching scheduled Nightly)
+- Full Recipe Nightly matrix: `/ci run nightly all` (runs all Recipe
+  `model_sanity` policies, matching scheduled Nightly; legacy accuracy cases
+  remain available by explicit case ID)
 
 Use a Recipe policy slug with a `model_sanity` tier (for example, `glm-5.3`) or
 an exact legacy accuracy case ID (for example, `deepseek-v4-int8-dp-ep`).

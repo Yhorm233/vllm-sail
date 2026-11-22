@@ -130,87 +130,28 @@ def _run_candidate_recipe_select(source, models_csv):
     return selected
 
 
-def _run_candidate_scheduled_legacy(source):
-    script = (
-        "import importlib.util, json, sys\n"
-        "from pathlib import Path\n"
-        "path = Path(sys.argv[1]) / 'scripts/ci/ppu_e2e_select.py'\n"
-        "spec = importlib.util.spec_from_file_location('ppu_e2e_select', path)\n"
-        "mod = importlib.util.module_from_spec(spec)\n"
-        "spec.loader.exec_module(mod)\n"
-        "catalog = json.loads(mod.CATALOG.read_text())\n"
-        "selected = mod.build_accuracy_matrix(catalog, '')['include']\n"
-        "print(json.dumps(mod.scheduled_legacy_accuracy_cases(selected)))\n"
-    )
-    process = subprocess.run(
-        [sys.executable, "-c", script, str(source)],
-        capture_output=True,
-        text=True,
-        env={"PATH": os.environ["PATH"]},
-        timeout=60,
-    )
-    try:
-        cases = json.loads(process.stdout)
-    except ValueError:
-        cases = None
-    if process.returncode or not isinstance(cases, list):
-        raise Rejected("Failed to resolve scheduled legacy accuracy cases.")
-    return cases
-
-
 def resolve_cases(source, case_spec, recipe_enabled):
     cases = parse_case_spec(case_spec)
-    catalog = json.loads((source / "scripts/ci/ppu_e2e_models.json").read_text())
-    accuracy_entries = [
-        entry for entry in catalog if entry.get("category") == "accuracy"
-    ]
-    accuracy_keys = [entry.get("key") for entry in accuracy_entries]
-    if len(accuracy_keys) != len(set(accuracy_keys)):
-        raise Rejected("Duplicate accuracy catalog key.")
-    accuracy_key_set = set(accuracy_keys)
-
     if cases == ("all",):
+        if not recipe_enabled:
+            raise Rejected("Recipe model sanity is disabled.")
+        selected = _run_candidate_recipe_select(source, "")
         recipe_cases = []
-        recipe_matrix = None
-        if recipe_enabled:
-            selected = _run_candidate_recipe_select(source, "")
-            seen_recipe = set()
-            for row in selected:
-                if not isinstance(row, dict):
-                    raise Rejected("Malformed Recipe model sanity matrix entry.")
-                key = row.get("key")
-                policy = source / f"tests/ppu/policy/models/{key}.yaml"
-                if not valid_case(key) or key in seen_recipe or not policy.is_file():
-                    raise Rejected(f"Invalid Recipe model sanity case: {key}.")
-                seen_recipe.add(key)
-                recipe_cases.append(key)
-            if recipe_cases:
-                recipe_matrix = {"include": selected}
-            legacy_cases = _run_candidate_scheduled_legacy(source)
-            seen_legacy = set()
-            for key in legacy_cases:
-                if (
-                    not valid_case(key)
-                    or key in seen_legacy
-                    or key not in accuracy_key_set
-                ):
-                    raise Rejected(f"Invalid scheduled legacy accuracy case: {key}.")
-                seen_legacy.add(key)
-        else:
-            try:
-                selected_legacy = ppu_e2e_select.build_accuracy_matrix(catalog, "")[
-                    "include"
-                ]
-            except ValueError as exc:
-                raise Rejected(str(exc)) from exc
-            legacy_cases = [row["case_id"] for row in selected_legacy]
-            for key in legacy_cases:
-                if not valid_case(key):
-                    raise Rejected(f"Invalid legacy accuracy case: {key}.")
-        if not recipe_cases and not legacy_cases:
-            raise Rejected("No Nightly accuracy cases available.")
-        return recipe_cases, recipe_matrix, legacy_cases
+        seen_recipe = set()
+        for row in selected:
+            if not isinstance(row, dict):
+                raise Rejected("Malformed Recipe model sanity matrix entry.")
+            key = row.get("key")
+            policy = source / f"tests/ppu/policy/models/{key}.yaml"
+            if not valid_case(key) or key in seen_recipe or not policy.is_file():
+                raise Rejected(f"Invalid Recipe model sanity case: {key}.")
+            seen_recipe.add(key)
+            recipe_cases.append(key)
+        if not recipe_cases:
+            raise Rejected("No Recipe model sanity cases available.")
+        return recipe_cases, {"include": selected}, []
 
+    catalog = json.loads((source / "scripts/ci/ppu_e2e_models.json").read_text())
     recipe_cases = []
     legacy_cases = []
     for case in cases:
