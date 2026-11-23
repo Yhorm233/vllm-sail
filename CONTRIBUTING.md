@@ -132,13 +132,20 @@ a repository maintainer can add the `ci-preview` label to opt the PR into the
 `ready` and `ready-run-all-tests`: those labels only authorize the PR author to
 use the trusted default-branch `/ci` executor.
 
-The preview route uses the PR merge commit for both workflow definitions and
-source, publishes its own wheel artifact, and runs pin UT and Recipe Fast
-Sanity. When a scheduled default-branch Nightly build has a matching wheel
-artifact, Preview verifies the wheel hashes, upstream vLLM pin and native build
-fingerprint before reusing the vLLM wheel and SAIL native extensions. It
-repackages SAIL from the PR merge commit. If the artifact is unavailable or
-fails verification, Preview builds both wheels from source.
+The preview route uses the PR merge commit for workflow definitions and source,
+publishes its own wheel artifact, and runs pin UT and Recipe Fast Sanity.
+Formal `/ci run` keeps its full-artifact reuse path when both wheels and the CI
+inputs match.
+
+When a PR needs a wheel build, both routes try a matching scheduled
+default-branch Nightly artifact first. They can fall back to up to two prior
+successful formal builds whose original build ran from a source tree verified
+on the default branch and skipped all native donor downloads. Each native
+candidate must pass the artifact hashes, upstream vLLM pin, SAIL source commit
+and native build fingerprint checks. The build tries the next candidate after
+an unavailable or invalid artifact and compiles from source if none pass.
+On a match, it reuses the vLLM wheel and SAIL native extensions, then repackages
+SAIL from the commit under test.
 
 The PR Fast Sanity lane runs when `PPU_RECIPE_PUBLIC_ENABLED` is unset or set to
 `true`. Setting it to `false` disables the lane. The PPU CI gate still requires

@@ -6,14 +6,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
 
 MANIFEST = "wheel-manifest.json"
 NATIVE_MODULES = ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C")
+FINGERPRINT_COMPAT = "scripts/ci/ppu_native_fingerprint_compat.json"
+FINGERPRINT_COMPAT_PATHS = (
+    ".github/workflows/_ppu-build.yaml",
+    "scripts/ci/build_ppu_wheels.sh",
+    "scripts/ci/ppu_wheel_manifest.py",
+)
 NATIVE_INPUTS = (
     ".github/vllm-main-verified.commit",
     ".github/workflows/_ppu-build.yaml",
@@ -24,6 +32,7 @@ NATIVE_INPUTS = (
     "requirements/build.txt",
     "scripts/ci/build_ppu_wheels.sh",
     "scripts/ci/ppu_image_stack.py",
+    FINGERPRINT_COMPAT,
     "scripts/ci/ppu_wheel_manifest.py",
     "setup.py",
     "vllm_sail/native/manifest.py",
@@ -88,7 +97,10 @@ def wheel_records(directory: Path) -> dict:
             if len(metadata_paths) != 1:
                 raise ValueError(f"invalid wheel metadata: {wheel.name}")
             metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
-            if metadata["Name"].replace("_", "-") != name or not metadata["Version"]:
+            if (
+                metadata.get("Name", "").replace("_", "-") != name
+                or not metadata["Version"]
+            ):
                 raise ValueError(f"unexpected package metadata: {wheel.name}")
             if name == "vllm":
                 # Current upstream builds the frontend executable without the
@@ -123,7 +135,45 @@ def _native_files(source: Path):
                 yield candidate.relative_to(source).as_posix(), candidate
 
 
-def native_fingerprint(
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate fingerprint compatibility key")
+    return result
+
+
+def _legacy_native_digests(
+    compat: bytes, current: dict[str, str]
+) -> dict[str, str] | None:
+    try:
+        versions = json.loads(compat, object_pairs_hook=_unique_json_object)
+    except ValueError:
+        return None
+    if not isinstance(versions, dict) or versions.keys() != set(
+        FINGERPRINT_COMPAT_PATHS
+    ):
+        return None
+    for path, pair in versions.items():
+        if (
+            not isinstance(pair, dict)
+            or pair.keys() != {"current", "previous"}
+            or pair["current"] != current[path]
+            or not _is_sha256(pair["previous"])
+        ):
+            return None
+    # Reconstruct the v2 inputs from before the compatibility table was added.
+    return {
+        path: versions[path]["previous"] if path in versions else digest
+        for path, digest in current.items()
+        if path != FINGERPRINT_COMPAT
+    }
+
+
+def _native_fingerprints(
     source: Path,
     *,
     build_image: str = "",
@@ -132,8 +182,8 @@ def native_fingerprint(
     cmake_hgcc_dir: str = "",
     vllm_sail_hg_flags: str = "",
     vllm_sail_hg_std: str = "20",
-) -> str:
-    """Hash every input and build setting that can change native extensions."""
+    include_legacy: bool = False,
+) -> tuple[str, str | None]:
     digest = hashlib.sha256()
     settings = {
         "build_image": build_image,
@@ -149,11 +199,33 @@ def native_fingerprint(
         digest.update(b"=")
         digest.update(value.encode())
         digest.update(b"\0")
-    for relative, path in sorted(_native_files(source)):
-        digest.update(relative.encode())
-        digest.update(b"\0")
-        digest.update(bytes.fromhex(_sha256_file(path)))
-    return digest.hexdigest()
+
+    def fingerprint(file_digests: dict[str, str]) -> str:
+        result = digest.copy()
+        for relative, file_digest in sorted(file_digests.items()):
+            result.update(relative.encode())
+            result.update(b"\0")
+            result.update(bytes.fromhex(file_digest))
+        return result.hexdigest()
+
+    file_digests = {
+        relative: _sha256_file(path)
+        for relative, path in _native_files(source)
+        if relative != FINGERPRINT_COMPAT
+    }
+    compat = (source / FINGERPRINT_COMPAT).read_bytes()
+    file_digests[FINGERPRINT_COMPAT] = hashlib.sha256(compat).hexdigest()
+    legacy_digests = (
+        _legacy_native_digests(compat, file_digests) if include_legacy else None
+    )
+    return fingerprint(file_digests), (
+        fingerprint(legacy_digests) if legacy_digests is not None else None
+    )
+
+
+def native_fingerprint(source: Path, **settings: str) -> str:
+    """Hash every input and build setting that can change native extensions."""
+    return _native_fingerprints(source, **settings)[0]
 
 
 def verify(
@@ -163,14 +235,17 @@ def verify(
     sail_commit: str | None = None,
 ) -> dict:
     manifest = json.loads((directory / MANIFEST).read_text())
-    if manifest.get("schema") != 1:
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
         raise ValueError("unsupported wheel manifest schema")
-    if manifest["wheels"] != wheel_records(directory):
+    if manifest.get("wheels") != wheel_records(directory):
         raise ValueError(
             "wheel filenames, versions or hashes differ from build manifest"
         )
+    commits = manifest.get("commits")
     for name, expected in (("vllm", vllm_commit), ("vllm-sail", sail_commit)):
-        if expected is not None and manifest.get("commits", {}).get(name) != expected:
+        if expected is not None and (
+            not isinstance(commits, dict) or commits.get(name) != expected
+        ):
             raise ValueError(
                 f"{name} source commit differs from required revision {expected}"
             )
@@ -181,20 +256,19 @@ def verify(
         wheel = directory / manifest["wheels"]["vllm-sail"]["file"]
         if native.get("extensions") != native_extension_records(wheel):
             raise ValueError("native extension hashes differ from build manifest")
-        fingerprint = native.get("fingerprint", "")
-        if len(fingerprint) != 64 or any(
-            c not in "0123456789abcdef" for c in fingerprint
-        ):
+        if not _is_sha256(native.get("fingerprint")):
             raise ValueError("invalid native build fingerprint")
     return manifest
 
 
-def extract_native(directory: Path, output: Path) -> dict:
-    manifest = verify(directory)
+def _require_native(manifest: dict) -> dict:
     native = manifest.get("native_reuse")
     if not native:
         raise ValueError("wheel artifact predates native reuse metadata")
-    wheel = directory / manifest["wheels"]["vllm-sail"]["file"]
+    return native
+
+
+def _extract_native(wheel: Path, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(wheel) as archive:
         members = _native_members(archive)
@@ -204,7 +278,40 @@ def extract_native(directory: Path, output: Path) -> dict:
                 shutil.copyfileobj(source, destination, length=1024 * 1024)
             if target.stat().st_size == 0:
                 raise ValueError(f"empty native extension: {module}")
+
+
+def extract_native(directory: Path, output: Path) -> dict:
+    manifest = verify(directory)
+    native = _require_native(manifest)
+    _extract_native(directory / manifest["wheels"]["vllm-sail"]["file"], output)
     return native
+
+
+def reuse_native(
+    directory: Path,
+    output: Path,
+    wheel_output: Path,
+    *,
+    vllm_commit: str,
+    sail_commit: str | None,
+    sail_source: Path,
+    **settings: str,
+) -> None:
+    manifest = verify(directory, vllm_commit=vllm_commit, sail_commit=sail_commit)
+    native = _require_native(manifest)
+    if native["fingerprint"] not in _native_fingerprints(
+        sail_source, include_legacy=True, **settings
+    ):
+        raise ValueError("native build fingerprint does not match")
+
+    _extract_native(directory / manifest["wheels"]["vllm-sail"]["file"], output)
+    wheel = directory / manifest["wheels"]["vllm"]["file"]
+    # Stage on the destination filesystem so a failed copy cannot leave a wheel
+    # for the next donor or the cold build to pick up.
+    with tempfile.TemporaryDirectory(dir=wheel_output) as staging:
+        staged_wheel = Path(staging) / wheel.name
+        shutil.copyfile(wheel, staged_wheel)
+        staged_wheel.replace(wheel_output / wheel.name)
 
 
 def _git_commit(source: Path) -> str:
@@ -225,7 +332,8 @@ def _git_commit(source: Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("create", "verify", "fingerprint", "extract-native")
+        "command",
+        choices=("create", "verify", "fingerprint", "extract-native", "reuse-native"),
     )
     parser.add_argument("directory", type=Path)
     parser.add_argument("--vllm-source", type=Path)
@@ -239,25 +347,50 @@ def main() -> None:
     parser.add_argument("--vllm-sail-hg-flags", default="")
     parser.add_argument("--vllm-sail-hg-std", default="20")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--wheel-output", type=Path)
     args = parser.parse_args()
+    settings = {
+        "build_image": args.build_image,
+        "pytorch_sail_arch": args.pytorch_sail_arch,
+        "cmake_build_type": args.cmake_build_type,
+        "cmake_hgcc_dir": args.cmake_hgcc_dir,
+        "vllm_sail_hg_flags": args.vllm_sail_hg_flags,
+        "vllm_sail_hg_std": args.vllm_sail_hg_std,
+    }
     if args.command == "verify":
         result = verify(
             args.directory, vllm_commit=args.vllm_commit, sail_commit=args.sail_commit
         )
     elif args.command == "fingerprint":
-        result = native_fingerprint(
-            args.directory,
-            build_image=args.build_image,
-            pytorch_sail_arch=args.pytorch_sail_arch,
-            cmake_build_type=args.cmake_build_type,
-            cmake_hgcc_dir=args.cmake_hgcc_dir,
-            vllm_sail_hg_flags=args.vllm_sail_hg_flags,
-            vllm_sail_hg_std=args.vllm_sail_hg_std,
-        )
+        result = native_fingerprint(args.directory, **settings)
     elif args.command == "extract-native":
         if args.output is None:
             parser.error("extract-native requires --output")
         result = extract_native(args.directory, args.output)
+    elif args.command == "reuse-native":
+        if (
+            args.output is None
+            or args.wheel_output is None
+            or args.sail_source is None
+            or args.vllm_commit is None
+        ):
+            parser.error(
+                "reuse-native requires --output, --wheel-output, "
+                "--sail-source and --vllm-commit"
+            )
+        try:
+            reuse_native(
+                args.directory,
+                args.output,
+                args.wheel_output,
+                vllm_commit=args.vllm_commit,
+                sail_commit=args.sail_commit,
+                sail_source=args.sail_source,
+                **settings,
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            parser.exit(1, f"reuse-native: {error}\n")
+        return
     else:
         if (
             args.vllm_source is None and args.vllm_commit is None
@@ -279,15 +412,7 @@ def main() -> None:
             },
             "wheels": wheels,
             "native_reuse": {
-                "fingerprint": native_fingerprint(
-                    args.sail_source,
-                    build_image=args.build_image,
-                    pytorch_sail_arch=args.pytorch_sail_arch,
-                    cmake_build_type=args.cmake_build_type,
-                    cmake_hgcc_dir=args.cmake_hgcc_dir,
-                    vllm_sail_hg_flags=args.vllm_sail_hg_flags,
-                    vllm_sail_hg_std=args.vllm_sail_hg_std,
-                ),
+                "fingerprint": native_fingerprint(args.sail_source, **settings),
                 "extensions": native_extension_records(sail_wheel),
             },
         }

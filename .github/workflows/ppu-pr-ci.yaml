@@ -39,7 +39,6 @@ jobs:
       pr_head_ref: ${{ steps.validate.outputs.pr_head_ref }}
       skip_ppu: ${{ steps.validate.outputs.skip_ppu }}
       existing_build_run_id: ${{ steps.validate.outputs.existing_build_run_id }}
-      native_reuse_run_id: ${{ steps.validate.outputs.native_reuse_run_id }}
       wheel_source_sha: ${{ steps.validate.outputs.wheel_source_sha }}
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +73,7 @@ jobs:
       pr_head_sha: ${{ inputs.head_sha }}
       skip_ppu: ${{ needs.validate.outputs.skip_ppu == 'true' }}
       existing_build_run_id: ${{ needs.validate.outputs.existing_build_run_id }}
-      native_reuse_run_id: ${{ needs.validate.outputs.native_reuse_run_id }}
+      resolve_native_donors: true
       wheel_source_sha: ${{ needs.validate.outputs.wheel_source_sha }}
 
   report:

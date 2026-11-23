@@ -145,7 +145,7 @@ print(torch.__file__)
 PY
 
 VLLM_SRC="${WORK_DIR}/vllm"
-PREBUILT_EXT_DIR="${WORK_DIR}/prebuilt-extensions"
+NATIVE_REUSE_ROOT="${VLLM_SAIL_NATIVE_REUSE_ROOT:-}"
 NATIVE_REUSE_DIR="${VLLM_SAIL_NATIVE_REUSE_DIR:-}"
 NATIVE_REUSE=0
 
@@ -157,43 +157,48 @@ fingerprint_args=(
     --pytorch-sail-arch "${PYTORCH_SAIL_ARCH}"
     --cmake-build-type "${CMAKE_BUILD_TYPE:-Release}"
     --cmake-hgcc-dir "${CMAKE_HGCC_DIR:-}"
-    --vllm-sail-hg-flags "${VLLM_SAIL_HG_FLAGS:-}"
+    "--vllm-sail-hg-flags=${VLLM_SAIL_HG_FLAGS:-}"
     --vllm-sail-hg-std "${VLLM_SAIL_HG_STD:-20}"
 )
 prepare_native_reuse() {
-    python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" verify \
-        "${NATIVE_REUSE_DIR}" --vllm-commit "${VLLM_REF}" >/dev/null || return 1
-    local current_fingerprint donor_fingerprint
-    current_fingerprint="$(python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" \
-        fingerprint "${ROOT_DIR}" "${fingerprint_args[@]}")" || return 1
-    donor_fingerprint="$(python - "${NATIVE_REUSE_DIR}/wheel-manifest.json" <<'PY'
-import json
-import sys
-
-native = json.load(open(sys.argv[1])).get("native_reuse")
-if not isinstance(native, dict):
-    raise SystemExit(1)
-print(native.get("fingerprint", ""))
-PY
-    )" || return 1
-    [[ -n "${donor_fingerprint}" && "${donor_fingerprint}" == "${current_fingerprint}" ]] || return 1
-    rm -rf "${PREBUILT_EXT_DIR}"
-    python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" extract-native \
-        "${NATIVE_REUSE_DIR}" --output "${PREBUILT_EXT_DIR}" >/dev/null || return 1
-    mapfile -t donor_vllm_wheels < <(
-        find "${NATIVE_REUSE_DIR}" -type f -name 'vllm-*.whl' -print
-    )
-    ((${#donor_vllm_wheels[@]} == 1)) || return 1
-    cp "${donor_vllm_wheels[0]}" "${VLLM_WHEEL_DIR}/" || return 1
-}
-if [[ -n "${NATIVE_REUSE_DIR}" && -d "${NATIVE_REUSE_DIR}" && "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
-    if prepare_native_reuse; then
+    local donor_dir="$1" donor_extensions
+    shift
+    donor_extensions="$(mktemp -d "${WORK_DIR}/donor.XXXXXX")" || return 1
+    echo "Verifying native reuse donor: ${donor_dir}"
+    if python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" reuse-native \
+        "${donor_dir}" --vllm-commit "${VLLM_REF}" --sail-source "${ROOT_DIR}" \
+        --output "${donor_extensions}" --wheel-output "${VLLM_WHEEL_DIR}" \
+        "${fingerprint_args[@]}" "$@"; then
+        PREBUILT_EXT_DIR="${donor_extensions}"
         NATIVE_REUSE=1
         printf 'reuse_mode=native\nreuse_source=%s\n' \
-            "${NATIVE_REUSE_DIR}" >>"${MANIFEST}"
+            "${donor_dir}" >>"${MANIFEST}"
         echo "Native fingerprint matched; reusing vLLM wheel and SAIL extensions"
-    else
-        rm -rf "${PREBUILT_EXT_DIR}" "${VLLM_WHEEL_DIR:?}/"*
+        return 0
+    fi
+    rm -rf "${donor_extensions}"
+    echo "Native reuse donor rejected: ${donor_dir}"
+    return 1
+}
+if [[ "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+    if [[ -n "${NATIVE_REUSE_ROOT}" ]]; then
+        for slot in 1 2 3; do
+            donor_dir="${NATIVE_REUSE_ROOT}/${slot}"
+            source_file="${donor_dir}.source"
+            [[ -d "${donor_dir}" && -f "${source_file}" ]] || continue
+            if ! donor_sail_commit="$(cat -- "${source_file}")" || \
+                [[ ! "${donor_sail_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "Native reuse donor has invalid SAIL source SHA: ${donor_dir}"
+                continue
+            fi
+            if prepare_native_reuse "${donor_dir}" --sail-commit "${donor_sail_commit}"; then
+                break
+            fi
+        done
+    elif [[ -n "${NATIVE_REUSE_DIR}" && -d "${NATIVE_REUSE_DIR}" ]]; then
+        prepare_native_reuse "${NATIVE_REUSE_DIR}" || true
+    fi
+    if ((NATIVE_REUSE == 0)) && [[ -n "${NATIVE_REUSE_ROOT}${NATIVE_REUSE_DIR}" ]]; then
         echo "Native reuse unavailable or invalid; compiling"
     fi
 fi

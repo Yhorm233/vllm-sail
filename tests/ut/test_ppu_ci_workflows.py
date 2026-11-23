@@ -198,7 +198,7 @@ def test_executor_separates_read_only_pr_execution_and_always_reporting():
         "pr_head_sha": "${{ inputs.head_sha }}",
         "skip_ppu": "${{ needs.validate.outputs.skip_ppu == 'true' }}",
         "existing_build_run_id": "${{ needs.validate.outputs.existing_build_run_id }}",
-        "native_reuse_run_id": "${{ needs.validate.outputs.native_reuse_run_id }}",
+        "resolve_native_donors": True,
         "wheel_source_sha": "${{ needs.validate.outputs.wheel_source_sha }}",
     }
     validate = jobs["validate"]
@@ -217,7 +217,6 @@ def test_executor_separates_read_only_pr_execution_and_always_reporting():
             "pr_head_ref",
             "skip_ppu",
             "existing_build_run_id",
-            "native_reuse_run_id",
             "wheel_source_sha",
         )
     }
@@ -279,7 +278,9 @@ def test_every_pr_checkout_verifies_the_requested_sha_before_execution(name, job
     assert inputs["pr_head_sha"]["default"] == ""
     for job_id in job_ids:
         job = config["jobs"][job_id]
-        checkout = checkouts(job)[0]
+        checkout = next(
+            step for step in checkouts(job) if step.get("id") != "donor-checkout"
+        )
         assert checkout["with"]["ref"] == EXPECTED_SHA
         index = job["steps"].index(checkout)
         verify = job["steps"][index + 1]
@@ -366,7 +367,7 @@ def test_pr_pipeline_structure():
         "pr_head_sha",
         "skip_ppu",
         "existing_build_run_id",
-        "native_reuse_run_id",
+        "resolve_native_donors",
         "skip_device_tests",
         "wheel_source_sha",
     }
@@ -384,7 +385,6 @@ def test_pr_pipeline_structure():
     }
     for name in (
         "existing_build_run_id",
-        "native_reuse_run_id",
         "wheel_source_sha",
     ):
         assert inputs[name]["type"] == "string"
@@ -393,7 +393,6 @@ def test_pr_pipeline_structure():
     jobs = config["jobs"]
     assert set(jobs) == {
         "runtime-image",
-        "preview-donor",
         "build",
         "pin-unit-tests",
         "model-tests",
@@ -423,11 +422,11 @@ def test_pr_pipeline_structure():
     assert build["uses"] == "./.github/workflows/_ppu-build.yaml"
     assert build["with"] == {
         "pr_head_sha": "${{ inputs.pr_head_sha || github.sha }}",
-        "native_reuse_run_id": (
-            "${{ inputs.native_reuse_run_id || needs.preview-donor.outputs.run_id || '' }}"
-        ),
+        "resolve_native_donors": "${{ github.event_name == 'pull_request' || inputs.resolve_native_donors }}",
     }
-    assert build["needs"] == ["runtime-image", "preview-donor"]
+    assert inputs["resolve_native_donors"]["type"] == "boolean"
+    assert inputs["resolve_native_donors"]["default"] is False
+    assert build["needs"] == "runtime-image"
     assert jobs["gate"]["needs"] == [
         "runtime-image",
         "build",
@@ -719,9 +718,13 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
         "build_image",
         "vllm_ref",
         "pytorch_sail_arch",
-        "native_reuse_run_id",
+        "resolve_native_donors",
     }
-    for value in call["inputs"].values():
+    assert call["inputs"]["resolve_native_donors"]["type"] == "boolean"
+    assert call["inputs"]["resolve_native_donors"]["default"] is False
+    for key, value in call["inputs"].items():
+        if key == "resolve_native_donors":
+            continue
         assert value["type"] == "string"
         assert value["default"] == ""
         assert not value.get("required", False)
@@ -743,25 +746,51 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
     assert "needs" not in build
     caller = workflow("ppu-build-and-test.yaml")["jobs"]["build"]
     assert caller["uses"] == "./.github/workflows/_ppu-build.yaml"
-    download = next(
+    role = next(step for step in build["steps"] if step.get("id") == "donor-checkout")
+    assert role["if"] == "inputs.resolve_native_donors"
+    assert role["continue-on-error"] is True
+    assert role["with"]["ref"] == "${{ github.sha }}"
+    assert role["with"]["persist-credentials"] is False
+    select = next(step for step in build["steps"] if step.get("id") == "donors")
+    assert select["if"] == "steps.donor-checkout.outcome == 'success'"
+    assert select["continue-on-error"] is True
+    assert select["env"]["WORKFLOW_SHA"] == "${{ github.sha }}"
+    assert select["run"].splitlines() == [
+        'test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$WORKFLOW_SHA"',
+        "python3 -m scripts.ci.ppu_wheel_donors",
+    ]
+    assert select["env"]["CANDIDATE_SHA"] == "${{ inputs.pr_head_sha || github.sha }}"
+    downloads = [
         step
         for step in build["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
-    )
-    assert download["if"] == "inputs.native_reuse_run_id != ''"
-    assert download["continue-on-error"] is True
-    assert download["with"] == {
-        "name": "ppu-wheels-${{ inputs.native_reuse_run_id }}",
-        "path": "artifacts/native-reuse",
-        "github-token": "${{ github.token }}",
-        "run-id": "${{ inputs.native_reuse_run_id }}",
-    }
+    ]
+    assert len(downloads) == 3
+    for slot, download in enumerate(downloads, 1):
+        assert download["if"] == (
+            f"steps.donors.outputs.run_{slot} != '' && steps.donors.outputs.artifact_{slot} != ''"
+        )
+        assert download["continue-on-error"] is True
+        assert download["with"] == {
+            "artifact-ids": f"${{{{ steps.donors.outputs.artifact_{slot} }}}}",
+            "path": f"${{{{ runner.temp }}}}/ppu-native-donors/{slot}",
+            "merge-multiple": True,
+            "github-token": "${{ github.token }}",
+            "run-id": f"${{{{ steps.donors.outputs.run_{slot} }}}}",
+        }
     package = next(
         step
         for step in build["steps"]
         if step.get("name") == "Build or repackage wheels"
     )
-    assert "VLLM_SAIL_NATIVE_REUSE_DIR" in package["env"]
+    assert (
+        package["env"]["VLLM_SAIL_NATIVE_REUSE_ROOT"]
+        == "${{ runner.temp }}/ppu-native-donors"
+    )
+    for slot in range(1, 4):
+        assert package["env"][f"SOURCE_{slot}"] == (
+            f"${{{{ steps.donor-{slot}.outcome == 'success' && steps.donors.outputs.source_{slot} || '' }}}}"
+        )
 
 
 def test_workflow_filenames_distinguish_reusable_calls_from_entrypoints():
@@ -816,10 +845,7 @@ def test_preview_route_requires_the_ci_preview_label():
         "paths": [".github/workflows/**", "scripts/ci/**"],
     }
     assert not (WORKFLOWS / "ppu-pr-preview.yaml").exists()
-    for name, job in config["jobs"].items():
-        if name == "preview-donor":
-            assert job["needs"] == "runtime-image"
-            continue  # Inherits preview admission from runtime-image.
+    for job in config["jobs"].values():
         guard = job["if"]
         assert "github.event_name != 'pull_request'" in guard
         assert "!github.event.pull_request.draft" in guard
@@ -828,50 +854,36 @@ def test_preview_route_requires_the_ci_preview_label():
 
 
 @pytest.mark.parametrize(
-    "event,lookup,donor,formal,expected",
+    "event,formal,full_artifact,run_build,resolve_donors",
     [
-        ("pull_request", "success", "100", "", "100"),
-        ("pull_request", "success", "", "", ""),
-        ("pull_request", "failure", "", "", ""),
-        ("workflow_dispatch", "skipped", "", "101", "101"),
+        ("pull_request", False, "", True, True),
+        ("workflow_dispatch", True, "", True, True),
+        ("workflow_dispatch", True, "101", False, True),
+        ("schedule", False, "", True, False),
     ],
 )
-def test_preview_reuses_native_donor_without_skipping_candidate_build(
-    event, lookup, donor, formal, expected
+def test_shared_native_lookup_preserves_formal_full_reuse(
+    event, formal, full_artifact, run_build, resolve_donors
 ):
     jobs = workflow("ppu-build-and-test.yaml")["jobs"]
-    selection = jobs["preview-donor"]
     context = {
         "github.event_name": event,
         "github.event.action": "synchronize",
         "github.event.pull_request.draft": False,
         "github.event.pull_request.labels.*.name": ["ci-preview"],
-        "github.sha": "a" * 40,
         "github.run_id": "200",
         "needs.runtime-image.result": "success",
-        "needs.preview-donor.result": lookup,
-        "needs.preview-donor.outputs.run_id": donor,
-        "inputs.native_reuse_run_id": formal,
+        "inputs.resolve_native_donors": formal,
+        "inputs.existing_build_run_id": full_artifact,
     }
-    assert bool(expression(selection["if"], context)) == (event == "pull_request")
-    assert selection["runs-on"] == "ubuntu-slim"
-    assert selection["timeout-minutes"] <= 15
-    assert selection["continue-on-error"] is True
-    assert selection["permissions"] == {"contents": "read", "actions": "read"}
-    assert selection["outputs"] == {"run_id": "${{ steps.select.outputs.run_id }}"}
-    checkout = checkouts(selection)[0]
-    assert expression(checkout["with"]["ref"], context) == context["github.sha"]
-    assert checkout["with"]["sparse-checkout"] == "scripts/ci"
-    assert checkout["with"]["persist-credentials"] is False
-    assert not any(
-        step.get("uses", "").startswith("actions/setup-python@")
-        for step in selection["steps"]
+    assert bool(expression(jobs["build"]["if"], context)) == run_build
+    assert (
+        bool(expression(jobs["build"]["with"]["resolve_native_donors"], context))
+        == resolve_donors
     )
-    select = next(step for step in selection["steps"] if step.get("id") == "select")
-    assert select["run"] == "python3 -m scripts.ci.ppu_preview_wheel_donor"
-    assert expression(jobs["build"]["if"], context)
-    assert expression(jobs["build"]["with"]["native_reuse_run_id"], context) == expected
-    assert expression(jobs["recipe-sanity"]["with"]["build_run_id"], context) == "200"
+    assert expression(jobs["recipe-sanity"]["with"]["build_run_id"], context) == (
+        full_artifact or "200"
+    )
 
 
 def test_preview_label_is_distinct_from_formal_ready_authorization():
@@ -1018,7 +1030,9 @@ def test_labeled_preview_propagates_merge_sha_to_build_and_test_checkouts(
         assert expression(caller["with"]["wheel_source_sha"], context) == ""
     for job_id in job_ids:
         job = workflow(leaf_name)["jobs"][job_id]
-        checkout = checkouts(job)[0]
+        checkout = next(
+            step for step in checkouts(job) if step.get("id") != "donor-checkout"
+        )
         assert expression(checkout["with"]["ref"], context) == merge_sha
         verify = job["steps"][job["steps"].index(checkout) + 1]
         assert expression(verify["env"]["EXPECTED_SHA"], context) == merge_sha

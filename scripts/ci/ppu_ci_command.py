@@ -24,7 +24,8 @@ CI_REUSE_FILES = set(
     ".github/workflows/_ppu-build.yaml .github/workflows/_ppu-pin-ut.yaml "
     ".github/workflows/_ppu-model-tests.yaml .github/workflows/_ppu-recipe-fast-sanity.yaml "
     ".github/workflows/_ppu-upstream-reuse.yaml "
-    "scripts/ci/ppu_ci_command.py "
+    "scripts/ci/ppu_ci_command.py scripts/ci/ppu_wheel_donors.py "
+    "scripts/ci/ppu_native_fingerprint_compat.json "
     "scripts/ci/ppu_e2e_recipe_sanity.sh scripts/ci/ppu_recipe.py "
     "scripts/ci/ppu_recipe_runner.py "
     "scripts/ci/ppu_runtime_container.sh scripts/ci/ppu_runtime_image.sh "
@@ -145,15 +146,15 @@ class Controller:
     def api(self, method, path, data=None, params=None):
         return self.gh.request(method, self.root + path, data, params)
 
-    def pages(self, path, key=None, limit=None, **params):
+    def pages(self, path, key=None, limit=None, *, page_size=100, **params):
         page = 1
         while limit is None or page <= limit:
             result = self.api(
-                "GET", path, params={**params, "per_page": 100, "page": page}
+                "GET", path, params={**params, "per_page": page_size, "page": page}
             )
             items = result[key] if key else result
             yield from items
-            if len(items) < 100:
+            if len(items) < page_size:
                 break
             page += 1
 
@@ -288,24 +289,20 @@ class Controller:
             for path in paths
         )
 
-    def reusable_wheels(self, pr, sha):
+    def reusable_wheels(self, sha):
         no_wheel_prefixes = tuple(
             "docs/ tests/ benchmarks/ .github/workflows/ scripts/ tools/".split()
         )
         wheel_output_ignored = set(
             "AGENTS.md CONTRIBUTING.md .gitignore .pre-commit-config.yaml".split()
         )
-        native_files = wheel_output_ignored | set(
-            "LICENSE MANIFEST.in README.md requirements/dev.txt "
-            "requirements/ppu.txt requirements/profiling.txt".split()
-        )
-        native_prefixes = no_wheel_prefixes + ("vllm_sail/",)
         rebuild_prefixes = ("cmake/", "csrc/")
         rebuild_files = set(
             ".github/vllm-main-verified.commit .github/workflows/_ppu-build.yaml "
             "CMakeLists.txt pyproject.toml requirements/build.txt setup.py "
             "scripts/ci/build_ppu_wheels.sh scripts/ci/ppu_image_stack.py "
-            "scripts/ci/ppu_wheel_manifest.py vllm_sail/native/manifest.py "
+            "scripts/ci/ppu_wheel_manifest.py scripts/ci/ppu_native_fingerprint_compat.json "
+            "vllm_sail/native/manifest.py "
             "vllm_sail/native/plugin_manifest.py vllm_sail/native/resources.py "
             "vllm_sail/native/toolchain.py".split()
         )
@@ -313,17 +310,10 @@ class Controller:
         def native_input(path):
             return path in rebuild_files or path.startswith(rebuild_prefixes)
 
-        def native_safe(path):
-            return not native_input(path) and (
-                path in native_files or path.startswith(native_prefixes)
-            )
-
         def wheel_output_relevant(path):
             ignored = path in wheel_output_ignored or path.startswith(no_wheel_prefixes)
             return not ignored or native_input(path)
 
-        paths = self.changed_paths(pr, sha)
-        native_ok = paths is not None and all(native_safe(path) for path in paths)
         for run in self.find_runs()[:20]:
             if (
                 run.get("status") != "completed"
@@ -346,11 +336,9 @@ class Controller:
                 or path.startswith(CI_REUSE_PREFIXES),
             ):
                 return "full", str(run["id"]), source
-            if native_ok and self.trees_match(source, sha, native_input):
-                return "native", str(run["id"]), sha
         return "none", "", ""
 
-    def find_runs(self, pr=None, head_sha=None):
+    def find_runs(self, pr=None, head_sha=None, *, limit=10, page_size=100):
         query = (
             {"created": ">=" + pr["created_at"][:10]} if pr else {"status": "success"}
         )
@@ -358,7 +346,8 @@ class Controller:
         for run in self.pages(
             f"/actions/workflows/{WORKFLOW}/runs",
             "workflow_runs",
-            limit=10,
+            limit=limit,
+            page_size=page_size,
             event="workflow_dispatch",
             **query,
         ):
@@ -594,17 +583,16 @@ class Controller:
         mode, build, source = ("skip", "", "")
         if not skip:
             mode, build, source = best_effort(
-                lambda: self.reusable_wheels(pr, inputs["head_sha"])
+                lambda: self.reusable_wheels(inputs["head_sha"])
             ) or ("none", "", "")
         print(f"Wheel reuse: mode={mode}, run={build}, source={source}")
         existing = build if mode == "full" else ""
-        native = build if mode == "native" else ""
         with open(self.env["GITHUB_OUTPUT"], "a") as output:
             output.write(
                 f"pr_head_ref={pr['head']['ref']}\n"
                 f"skip_ppu={'true' if skip else 'false'}\n"
                 f"existing_build_run_id={existing}\n"
-                f"native_reuse_run_id={native}\nwheel_source_sha={source}\n"
+                f"wheel_source_sha={source}\n"
             )
 
     def report(self):

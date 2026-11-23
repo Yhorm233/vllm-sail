@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests.ut.test_ppu_wheel_manifest import make_donor, make_native_source, manifest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "ci" / "build_ppu_wheels.sh"
@@ -1043,15 +1046,174 @@ def test_runtime_lanes_upgrade_transformers_before_verifying_image_stack(
         assert transformers[0].specifier == expected.specifier
 
 
-def test_native_repack_is_verified_and_falls_back_to_full_build() -> None:
-    text = SCRIPT.read_text()
-    fingerprint = text.index('ppu_wheel_manifest.py" \\\n        fingerprint')
-    verify = text.index('ppu_wheel_manifest.py" verify')
-    extract = text.index('ppu_wheel_manifest.py" extract-native')
-    prebuilt = text.index('export VLLM_SAIL_PREBUILT_EXT_DIR="${PREBUILT_EXT_DIR}"')
-    package = text.index("python setup.py bdist_wheel")
-    assert verify < fingerprint < extract < prebuilt < package
-    assert "if ((NATIVE_REUSE == 0)); then" in text
-    assert 'git init "${VLLM_SRC}"' in text
-    assert "Native reuse unavailable or invalid; compiling" in text
-    assert "|| return 1" in text
+@pytest.mark.parametrize(
+    ("first_failure", "selected"),
+    [
+        (None, 1),
+        ("manifest", 2),
+        ("wheel_hash", 2),
+        ("extension_hash", 2),
+        ("pin", 2),
+        ("sail_commit", 2),
+        ("fingerprint", 2),
+        ("missing_sidecar", 2),
+        ("invalid_sidecar", 2),
+        ("extract", 2),
+        ("copy", 2),
+        ("third", 3),
+        ("all", None),
+        ("legacy", 1),
+    ],
+)
+def test_native_repack_selects_first_verified_donor(
+    tmp_path: Path, first_failure: str | None, selected: int | None
+) -> None:
+    source = make_native_source(tmp_path / "source")
+    helper_path = "scripts/ci/ppu_wheel_manifest.py"
+    shutil.copyfile(ROOT / helper_path, source / helper_path)
+    arch = "ppu_15;ppu_10"
+    fingerprint = manifest.native_fingerprint(
+        source, pytorch_sail_arch=arch, vllm_sail_hg_flags="-O3"
+    )
+    pin, sail_commit = "1" * 40, "2" * 40
+    donor_root = tmp_path / "native-reuse"
+    for slot in (1, 2, 3):
+        donor = donor_root / str(slot)
+        data = make_donor(
+            donor, vllm_commit=pin, sail_commit=sail_commit, fingerprint=fingerprint
+        )
+        failure = first_failure if slot == 1 else None
+        if first_failure == "all":
+            failure = "sail_commit"
+        elif first_failure == "third" and slot < 3:
+            failure = "pin"
+        if failure not in {"missing_sidecar", "legacy"}:
+            expected = "invalid" if failure == "invalid_sidecar" else sail_commit
+            donor.with_suffix(".source").write_text(expected + "\n")
+
+        if failure == "wheel_hash":
+            wheel = donor / data["wheels"]["vllm"]["file"]
+            wheel.write_bytes(wheel.read_bytes() + b"changed")
+        elif failure == "extension_hash":
+            data["native_reuse"]["extensions"]["_C"]["sha256"] = "0" * 64
+        elif failure == "pin":
+            data["commits"]["vllm"] = "0" * 40
+        elif failure == "sail_commit":
+            data["commits"]["vllm-sail"] = "0" * 40
+        elif failure == "fingerprint":
+            data["native_reuse"]["fingerprint"] = "0" * 64
+        (donor / manifest.MANIFEST).write_text(
+            "{" if failure == "manifest" else json.dumps(data)
+        )
+
+    # Inject failures after partial writes while exercising the real CLI and shell.
+    injector = tmp_path / "fail_donor.py"
+    injector.write_text(
+        """
+import os
+import runpy
+import sys
+
+main = runpy.run_path(sys.argv.pop(1))["main"]
+namespace = main.__globals__
+
+def fail_extract(wheel, output):
+    (output / "partial.so").write_bytes(b"partial")
+    raise OSError("injected extraction failure")
+
+def fail_copy(wheel, destination):
+    destination.write_bytes(b"partial")
+    raise OSError("injected copy failure")
+
+if os.environ["TEST_FAILURE"] == "extract":
+    namespace["_extract_native"] = fail_extract
+else:
+    namespace["shutil"].copyfile = fail_copy
+main()
+"""
+    )
+    headers = """
+python() {
+    if [[ "$3" == "$TEST_FIRST_DONOR" && "$TEST_FAILURE" =~ ^(extract|copy)$ ]]; then
+        "$TEST_PYTHON" "$TEST_INJECTOR" "$@"
+    else
+        "$TEST_PYTHON" "$@"
+    fi
+}
+git() {
+    [[ "$1" == init ]]
+    printf 'entered cold build\n'
+}
+"""
+    script = SCRIPT.read_text()
+    start = script.index('VLLM_SRC="${WORK_DIR}/vllm"')
+    cold_init = '    git init "${VLLM_SRC}"'
+    end = script.index(cold_init, start) + len(cold_init)
+    work = tmp_path / "work"
+    wheels = tmp_path / "wheels"
+    work.mkdir()
+    wheels.mkdir()
+    build_manifest = tmp_path / "build-manifest.txt"
+    build_manifest.touch()
+    result = subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-u",
+            "-o",
+            "pipefail",
+            "-c",
+            headers + script[start:end] + "\nfi\n",
+        ],
+        env={
+            **os.environ,
+            "ROOT_DIR": str(source),
+            "WORK_DIR": str(work),
+            "VLLM_WHEEL_DIR": str(wheels),
+            "VLLM_REF": pin,
+            "PYTORCH_SAIL_ARCH": arch,
+            "VLLM_SAIL_NATIVE_REUSE_DIR": str(donor_root / "1"),
+            "VLLM_SAIL_NATIVE_REUSE_ROOT": (
+                "" if first_failure == "legacy" else str(donor_root)
+            ),
+            "VLLM_SAIL_BUILD_IMAGE": "",
+            "CMAKE_BUILD_TYPE": "Release",
+            "CMAKE_HGCC_DIR": "",
+            "VLLM_SAIL_HG_FLAGS": "-O3",
+            "VLLM_SAIL_HG_STD": "20",
+            "MANIFEST": str(build_manifest),
+            "TEST_PYTHON": sys.executable,
+            "TEST_FIRST_DONOR": str(donor_root / "1"),
+            "TEST_FAILURE": first_failure or "",
+            "TEST_INJECTOR": str(injector),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    attempted = [
+        line.rsplit("/", 1)[-1]
+        for line in result.stdout.splitlines()
+        if line.startswith("Verifying native reuse donor: ")
+    ]
+    expected_order = list(range(1, (selected or 3) + 1))
+    if first_failure in {"missing_sidecar", "invalid_sidecar"}:
+        expected_order.remove(1)
+    assert attempted == [str(slot) for slot in expected_order]
+    if selected is None:
+        assert "entered cold build" in result.stdout
+        assert "reuse_source=" not in build_manifest.read_text()
+        assert not list(wheels.iterdir())
+        assert not list(work.iterdir())
+    else:
+        assert "entered cold build" not in result.stdout
+        assert (
+            f"reuse_source={donor_root / str(selected)}\n" in build_manifest.read_text()
+        )
+        assert [wheel.name for wheel in wheels.iterdir()] == [
+            next((donor_root / str(selected)).rglob("vllm-*.whl")).name
+        ]
+        (extensions,) = work.iterdir()
+        assert {path.name for path in extensions.iterdir()} == {
+            f"{module}.abi3.so" for module in manifest.NATIVE_MODULES
+        }

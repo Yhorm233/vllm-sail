@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 import pytest
 import yaml
 
-from scripts.ci.ppu_preview_wheel_donor import select_donor
+from scripts.ci.ppu_wheel_donors import select_donors
 
 REPO = "t-head/vllm-sail"
 ROOT = f"/repos/{REPO}"
@@ -1402,7 +1402,6 @@ def test_validate_skips_ppu_for_non_executable_changes(files, github_output, cap
         "pr_head_ref": "feature/ci",
         "skip_ppu": "true",
         "existing_build_run_id": "",
-        "native_reuse_run_id": "",
         "wheel_source_sha": "",
     }
     assert not any(
@@ -1837,7 +1836,6 @@ def reuse_result(mode, run_id="555", source=OLD):
         "pr_head_ref": "feature/ci",
         "skip_ppu": "false",
         "existing_build_run_id": run_id if mode == "full" else "",
-        "native_reuse_run_id": run_id if mode == "native" else "",
         "wheel_source_sha": source if mode != "none" else "",
     }
 
@@ -1871,7 +1869,7 @@ def test_validate_reuses_complete_wheels_for_wheel_output_ignored_changes(
 @pytest.mark.parametrize(
     "path", ["README.md", "LICENSE", "MANIFEST.in", "requirements/dev.txt"]
 )
-def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output):
+def test_wheel_metadata_changes_block_full_reuse(path, github_output):
     control, gh = reuse_setup(
         pr_files=[
             {"filename": "tests/ut/test.py", "status": "modified"},
@@ -1879,22 +1877,20 @@ def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output)
         ],
         source_changes={path: tree_entry(path, oid=CHANGED)},
     )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", source=SHA
-    )
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
 
 
 @pytest.mark.parametrize(
     "path,mode",
     [
-        ("README.md", "native"),
-        ("LICENSE", "native"),
-        ("MANIFEST.in", "native"),
+        ("README.md", "none"),
+        ("LICENSE", "none"),
+        ("MANIFEST.in", "none"),
         ("AGENTS.md", "full"),
         ("CONTRIBUTING.md", "full"),
-        ("requirements/dev.txt", "native"),
-        ("requirements/ppu.txt", "native"),
-        ("requirements/profiling.txt", "native"),
+        ("requirements/dev.txt", "none"),
+        ("requirements/ppu.txt", "none"),
+        ("requirements/profiling.txt", "none"),
         ("scripts/ci/build_ppu_wheels.sh", "none"),
         ("scripts/ci/ppu_image_stack.py", "none"),
         ("scripts/ci/ppu_wheel_manifest.py", "none"),
@@ -1902,7 +1898,7 @@ def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output)
         ("pyproject.toml", "none"),
         ("CMakeLists.txt", "none"),
         ("csrc/kernel.cu", "none"),
-        ("vllm_sail/file.py", "native"),
+        ("vllm_sail/file.py", "none"),
         ("plugin/hooks.py", "none"),
         ("cmake/build.cmake", "none"),
         (".github/vllm-main-verified.commit", "none"),
@@ -1912,9 +1908,7 @@ def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output)
     ],
 )
 @pytest.mark.parametrize("rename", [False, True])
-def test_source_equivalence_and_current_pr_safety_select_reuse_mode(
-    path, mode, rename, github_output
-):
+def test_source_equivalence_selects_full_reuse(path, mode, rename, github_output):
     inventory_file = {"filename": path, "status": "modified"}
     changes = {path: tree_entry(path, oid=CHANGED)}
     if rename:
@@ -1931,9 +1925,7 @@ def test_source_equivalence_and_current_pr_safety_select_reuse_mode(
         ],
         source_changes=changes,
     )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        mode, source=SHA if mode == "native" else OLD
-    )
+    assert validate_pair(control, gh, github_output) == reuse_result(mode)
 
 
 def test_validate_accepts_older_run_with_identical_ci_files(github_output):
@@ -1953,21 +1945,6 @@ def test_ci_reuse_file_changes_block_full(path, github_output):
     assert validate_pair(control, gh, github_output) == reuse_result("none")
 
 
-def test_native_reuse_does_not_require_ci_file_equivalence(github_output):
-    candidate = run(555, OLD, conclusion="success", head_sha="d" * 40)
-    ci_entry = f".github/workflows/{module().WORKFLOW}"
-    control, gh = reuse_setup(
-        candidates=[candidate],
-        source_changes={
-            "vllm_sail/file.py": tree_entry("vllm_sail/file.py", oid=CHANGED)
-        },
-        main_changes={ci_entry: tree_entry(ci_entry, oid=CHANGED)},
-    )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", source=SHA
-    )
-
-
 def test_pr_file_failure_is_cached_and_does_not_block_full(github_output, capsys):
     control, gh = reuse_setup(pr_files=http_error(503))
     assert validate_pair(control, gh, github_output) == reuse_result("full")
@@ -1975,18 +1952,8 @@ def test_pr_file_failure_is_cached_and_does_not_block_full(github_output, capsys
     assert "503" in capsys.readouterr().err
 
 
-def test_pr_file_failure_disables_native(github_output):
-    control, gh = reuse_setup(
-        pr_files=http_error(503),
-        source_changes={
-            "vllm_sail/file.py": tree_entry("vllm_sail/file.py", oid=CHANGED)
-        },
-    )
-    assert validate_pair(control, gh, github_output) == reuse_result("none")
-
-
 @pytest.mark.parametrize("file", MALFORMED_PR_FILES)
-def test_malformed_pr_repository_paths_disable_native(file, github_output):
+def test_malformed_pr_paths_do_not_enable_full_reuse(file, github_output):
     control, gh = reuse_setup(
         pr_files=[{"filename": "vllm_sail/file.py", "status": "modified"}, file],
         source_changes={
@@ -2000,7 +1967,9 @@ def test_malformed_pr_repository_paths_disable_native(file, github_output):
     "previous",
     ["csrc/kernel.cu", None, "", "docs/../csrc/kernel.cu", "docs/\x00old.md"],
 )
-def test_inconsistent_rename_metadata_disables_native(previous, github_output):
+def test_inconsistent_rename_metadata_does_not_enable_full_reuse(
+    previous, github_output
+):
     control, gh = reuse_setup(
         pr_files=[
             {"filename": "vllm_sail/file.py", "status": "modified"},
@@ -2061,115 +2030,219 @@ def test_invalid_tree_aborts_selection_before_an_older_matching_donor(
     assert not any(c[1].endswith("/actions/runs/554/artifacts") for c in gh.calls)
 
 
-def test_native_selection_continues_to_an_older_matching_donor(github_output):
-    latest = base_tree()
-    latest["csrc/kernel.cu"] = tree_entry("csrc/kernel.cu", oid=CHANGED)
-    candidates = [
-        run(555, OLD, conclusion="success"),
-        run(554, "d" * 40, conclusion="success"),
-    ]
-    control, gh = reuse_setup(
-        pr_files=[
-            {"filename": "tests/ut/test.py", "status": "modified"},
-            {"filename": "vllm_sail/file.py", "status": "modified"},
-        ],
-        candidates=candidates,
-        source_changes={
-            "vllm_sail/file.py": tree_entry("vllm_sail/file.py", oid=CHANGED)
+def donor_steps(started, completed, *, reused=False):
+    return [
+        {"name": "Verify checked-out revision", "conclusion": "success"},
+        {
+            "name": "Download native wheel donor",
+            "conclusion": "success" if reused else "skipped",
         },
-        trees={OLD: tree_payload(list(latest.values()))},
+        {"name": "Build or repackage wheels", "conclusion": "success"},
+        {
+            "name": "Upload wheels",
+            "conclusion": "success",
+            "started_at": started,
+            "completed_at": completed,
+        },
+    ]
+
+
+def donor_artifact(
+    gh,
+    ident,
+    job,
+    *,
+    conclusion="success",
+    expired=False,
+    reused=False,
+    wrong_attempt=False,
+):
+    gh.page(
+        f"/actions/runs/{ident}/attempts/2/jobs",
+        [
+            {
+                "name": job,
+                "conclusion": conclusion,
+                "steps": donor_steps(
+                    "2026-11-19T00:00:00Z", "2026-11-19T00:00:03Z", reused=reused
+                ),
+            }
+        ],
+        "jobs",
     )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", run_id="554", source=SHA
+    gh.page(
+        f"/actions/runs/{ident}/artifacts",
+        [
+            {
+                "id": 2000 + ident,
+                "name": f"ppu-wheels-{ident}",
+                "expired": expired,
+                "created_at": (
+                    "2026-11-18T23:59:59Z" if wrong_attempt else "2026-11-19T00:00:01Z"
+                ),
+            }
+        ],
+        "artifacts",
     )
 
 
 @pytest.mark.parametrize(
-    "build_success,expired", [(True, False), (False, False), (True, True)]
+    "nightly_result", ["success", "expired", "failed", "api_error", "wrong_attempt"]
 )
-def test_preview_uses_only_a_successful_nightly_build_with_a_live_artifact(
-    build_success, expired, github_output, capsys
+def test_shared_selector_prioritizes_nightly_then_cold_history(
+    nightly_result, github_output, capsys
 ):
     control, gh, _ = make_controller()
-    old_source = "d" * 40
-    matching = {
-        "id": 555,
+    newer_source = "d" * 40
+    inherited_source = "e" * 40
+    candidate = "f" * 40
+    nightly = run(
+        555,
+        event="schedule",
+        path=".github/workflows/nightly-wheels.yaml",
+        head_sha=SHA,
+        head_repository={"full_name": REPO},
+        conclusion="failure",  # Independent publication can fail.
+    )
+    route = "/actions/workflows/nightly-wheels.yaml/runs"
+    params = {
+        "branch": "main",
         "event": "schedule",
         "status": "completed",
-        "conclusion": "failure",  # The publication job may fail independently.
-        "path": ".github/workflows/nightly-wheels.yaml",
-        "head_branch": "main",
-        "head_sha": SHA,
-        "repository": {"full_name": REPO},
-        "head_repository": {"full_name": REPO},
+        "per_page": 5,
     }
+    if nightly_result == "api_error":
+        gh.add(
+            "GET",
+            ROOT + route,
+            http_error(503),
+            params={**params, "page": 1},
+        )
+    else:
+        gh.page(
+            route,
+            [
+                {**nightly, "id": 900},
+                {**nightly, "id": 559, "event": "workflow_dispatch"},
+                {
+                    **nightly,
+                    "id": 558,
+                    "head_repository": {"full_name": "fork/vllm-sail"},
+                },
+                {**nightly, "id": 556, "head_sha": newer_source},
+                nightly,
+            ],
+            "workflow_runs",
+            **params,
+        )
     gh.page(
-        "/actions/workflows/nightly-wheels.yaml/runs",
+        RUNS,
         [
-            {**matching, "id": 900},  # Current run.
-            {**matching, "id": 559, "event": "workflow_dispatch"},
-            {**matching, "id": 558, "head_repository": {"full_name": "fork/vllm-sail"}},
-            {**matching, "id": 556, "head_sha": old_source},
-            matching,
+            run(
+                554,
+                inherited_source,
+                conclusion="success",
+                head_repository={"full_name": REPO},
+            ),
+            run(553, OLD, conclusion="success", head_repository={"full_name": REPO}),
         ],
         "workflow_runs",
-        branch="main",
-        event="schedule",
-        status="completed",
+        event="workflow_dispatch",
+        status="success",
+        per_page=20,
     )
     base = [tree_entry("csrc/kernel.cu")]
-    add_tree(gh, old_source, tree_payload([tree_entry("csrc/kernel.cu", oid=CHANGED)]))
+    add_tree(
+        gh, newer_source, tree_payload([tree_entry("csrc/kernel.cu", oid=CHANGED)])
+    )
     add_tree(gh, SHA, tree_payload(base))
+    add_tree(gh, OLD, tree_payload(base))
+    add_tree(gh, inherited_source, tree_payload(base))
+    # Use the tested candidate, distinct from the workflow revision.
     add_tree(
         gh,
-        ENV["GITHUB_SHA"],
-        tree_payload([*base, tree_entry("scripts/ci/preview.py")]),
+        candidate,
+        tree_payload([*base, tree_entry(".github/workflows/_ppu-build.yaml")]),
     )
-    gh.page(
-        "/actions/runs/555/jobs",
-        [
-            {
-                "name": "build / PPU wheel build",
-                "conclusion": "success" if build_success else "failure",
-            }
-        ],
-        "jobs",
-        filter="latest",
+    for ident in (553, 554):
+        donor_artifact(gh, ident, "ppu / build / PPU wheel build", reused=ident == 554)
+    donor_artifact(
+        gh,
+        555,
+        "build / PPU wheel build",
+        conclusion=nightly_result if nightly_result == "failed" else "success",
+        expired=nightly_result == "expired",
+        wrong_attempt=nightly_result == "wrong_attempt",
     )
-    if build_success:
-        gh.page(
-            "/actions/runs/555/artifacts",
-            [{"name": "ppu-wheels-555", "expired": expired}],
-            "artifacts",
-        )
+    gh.add(
+        "GET",
+        ROOT + f"/compare/{OLD}...main",
+        {"status": "ahead", "merge_base_commit": {"sha": OLD}},
+    )
 
-    select_donor(control)
+    select_donors(control, candidate)
 
-    assert github_output.read_text() == (
-        "run_id=555\n" if build_success and not expired else "run_id=\n"
-    )
-    assert not capsys.readouterr().err
+    expected = [(555, SHA), (553, OLD)] if nightly_result == "success" else [(553, OLD)]
+    assert dict(line.split("=") for line in github_output.read_text().splitlines()) == {
+        f"{key}_{slot}": str(value)
+        for slot, (ident, source) in enumerate(expected, 1)
+        for key, value in {
+            "run": ident,
+            "artifact": 2000 + ident,
+            "source": source,
+        }.items()
+    }
+    err = capsys.readouterr().err
+    assert ("503" in err) if nightly_result == "api_error" else not err
     assert all(call[0] == "GET" for call in gh.calls)
+    assert not any(f"/compare/{inherited_source}" in call[1] for call in gh.calls)
 
 
-def test_preview_donor_lookup_failure_has_no_build_dependency(github_output):
+@pytest.mark.parametrize(
+    "merged,equivalent,expected",
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_history_requires_source_on_main_or_identical_to_merged_tree(
+    merged, equivalent, expected
+):
+    from scripts.ci.ppu_wheel_donors import trusted_formal_source
+
     control, gh, _ = make_controller()
     gh.add(
         "GET",
-        ROOT + "/actions/workflows/nightly-wheels.yaml/runs",
-        http_error(503),
-        params={
-            "page": 1,
-            "per_page": 100,
-            "branch": "main",
-            "event": "schedule",
-            "status": "completed",
+        ROOT + f"/compare/{OLD}...main",
+        {"status": "diverged", "merge_base_commit": {"sha": SHA}},
+    )
+    gh.add(
+        "GET",
+        ROOT + f"/compare/{SHA}...main",
+        {"status": "ahead", "merge_base_commit": {"sha": SHA}},
+    )
+    gh.add(
+        "GET",
+        ROOT + "/pulls/7",
+        {
+            "merged": merged,
+            "merge_commit_sha": SHA,
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
         },
     )
+    add_tree(gh, OLD, tree_payload([tree_entry("vllm_sail/file.py")]))
+    add_tree(
+        gh,
+        SHA,
+        tree_payload(
+            [
+                tree_entry("vllm_sail/file.py", oid=BLOB if equivalent else CHANGED),
+            ]
+        ),
+    )
 
-    select_donor(control)
-
-    assert github_output.read_text() == "run_id=\n"
+    assert trusted_formal_source(control, 7, OLD) is expected
 
 
 def test_tree_cache_is_shared_across_donors_and_current_main(github_output):

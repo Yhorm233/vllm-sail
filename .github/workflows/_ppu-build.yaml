@@ -19,10 +19,10 @@ on:
         description: Semicolon-separated HG architectures (blank uses ppu_15;ppu_10)
         type: string
         default: ""
-      native_reuse_run_id:
-        description: Prior trusted run whose vLLM wheel and native SAIL extensions may be reused
-        type: string
-        default: ""
+      resolve_native_donors:
+        description: Look for verified native donors before building a PR
+        type: boolean
+        default: false
     outputs:
       image:
         description: Build image recorded for downstream tests
@@ -79,6 +79,29 @@ jobs:
             if (process.env.ACTIONS_CACHE_MODE !== 'none') {
               core.setFailed('PPU CI requires cache-mode: none');
             }
+      - name: Check out donor selection code
+        if: inputs.resolve_native_donors
+        id: donor-checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve native wheel candidates
+        if: steps.donor-checkout.outcome == 'success'
+        id: donors
+        timeout-minutes: 3
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          test "$(git -c safe.directory="$PWD" rev-parse HEAD)" = "$WORKFLOW_SHA"
+          python3 -m scripts.ci.ppu_wheel_donors
+
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
         with:
@@ -94,20 +117,66 @@ jobs:
         id: image
         run: printf 'image=%s\n' "$VLLM_SAIL_BUILD_IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Download native wheel donor
-        if: inputs.native_reuse_run_id != ''
+      - name: Download native wheel donor 1
+        id: donor-1
+        if: steps.donors.outputs.run_1 != '' && steps.donors.outputs.artifact_1 != ''
+        timeout-minutes: 3
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ppu-wheels-${{ inputs.native_reuse_run_id }}
-          path: artifacts/native-reuse
+          artifact-ids: ${{ steps.donors.outputs.artifact_1 }}
+          path: ${{ runner.temp }}/ppu-native-donors/1
+          merge-multiple: true
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.native_reuse_run_id }}
+          run-id: ${{ steps.donors.outputs.run_1 }}
+
+      - name: Download native wheel donor 2
+        id: donor-2
+        if: steps.donors.outputs.run_2 != '' && steps.donors.outputs.artifact_2 != ''
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.donors.outputs.artifact_2 }}
+          path: ${{ runner.temp }}/ppu-native-donors/2
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.donors.outputs.run_2 }}
+
+      - name: Download native wheel donor 3
+        id: donor-3
+        if: steps.donors.outputs.run_3 != '' && steps.donors.outputs.artifact_3 != ''
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.donors.outputs.artifact_3 }}
+          path: ${{ runner.temp }}/ppu-native-donors/3
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.donors.outputs.run_3 }}
 
       - name: Build or repackage wheels
+        shell: bash
         env:
-          VLLM_SAIL_NATIVE_REUSE_DIR: ${{ inputs.native_reuse_run_id != '' && format('{0}/artifacts/native-reuse', github.workspace) || '' }}
-        run: bash scripts/ci/build_ppu_wheels.sh
+          VLLM_SAIL_NATIVE_REUSE_ROOT: ${{ runner.temp }}/ppu-native-donors
+          SOURCE_1: ${{ steps.donor-1.outcome == 'success' && steps.donors.outputs.source_1 || '' }}
+          SOURCE_2: ${{ steps.donor-2.outcome == 'success' && steps.donors.outputs.source_2 || '' }}
+          SOURCE_3: ${{ steps.donor-3.outcome == 'success' && steps.donors.outputs.source_3 || '' }}
+        run: |
+          set -euo pipefail
+          slot=0
+          for source in "$SOURCE_1" "$SOURCE_2" "$SOURCE_3"; do
+            slot=$((slot + 1))
+            if [[ "$source" =~ ^[0-9a-f]{40}$ ]]; then
+              printf '%s\n' "$source" > "$VLLM_SAIL_NATIVE_REUSE_ROOT/$slot.source"
+            fi
+          done
+          # Older checkouts still understand the single-donor input.
+          if [[ -f "$VLLM_SAIL_NATIVE_REUSE_ROOT/1.source" ]]; then
+            export VLLM_SAIL_NATIVE_REUSE_DIR="$VLLM_SAIL_NATIVE_REUSE_ROOT/1"
+          fi
+          bash scripts/ci/build_ppu_wheels.sh
 
       - name: Upload wheels
         if: success()

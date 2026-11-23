@@ -456,7 +456,7 @@ def test_manual_workflow_does_not_change_pr_gate():
         "upstream-reuse",
     ]
     assert not any("ops-" in job_id for job_id in pipeline)
-    assert pipeline["build"]["needs"] == ["runtime-image", "preview-donor"]
+    assert pipeline["build"]["needs"] == "runtime-image"
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/ppu-ops-tests.yaml").read_text()
     )

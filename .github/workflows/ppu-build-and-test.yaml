@@ -34,10 +34,10 @@ on:
         description: Validated SAIL source of the reused or repackaged wheels
         type: string
         default: ""
-      native_reuse_run_id:
-        description: Trusted donor for vLLM and native SAIL extensions
-        type: string
-        default: ""
+      resolve_native_donors:
+        description: Select matching native wheel donors for formal PR builds
+        type: boolean
+        default: false
       skip_device_tests:
         description: Build wheels only, without pin-UT, model checks or upstream-reuse lanes
         type: boolean
@@ -178,33 +178,8 @@ jobs:
       - name: Record runtime preflight completion
         id: ready
         run: printf 'ready_epoch=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
-
-  preview-donor:
-    name: Find a Nightly wheel donor for Preview
-    needs: runtime-image
-    if: github.event_name == 'pull_request' && needs.runtime-image.result == 'success'
-    runs-on: ubuntu-slim
-    timeout-minutes: 2
-    continue-on-error: true
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      run_id: ${{ steps.select.outputs.run_id }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          sparse-checkout: scripts/ci
-          persist-credentials: false
-      - name: Find matching wheels on the default branch
-        id: select
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -m scripts.ci.ppu_preview_wheel_donor
-
   build:
-    needs: [runtime-image, preview-donor]
+    needs: runtime-image
     if: >-
       ${{ !cancelled() &&
       (github.event_name != 'pull_request' ||
@@ -220,7 +195,7 @@ jobs:
     uses: ./.github/workflows/_ppu-build.yaml
     with:
       pr_head_sha: ${{ inputs.pr_head_sha || github.sha }}
-      native_reuse_run_id: ${{ inputs.native_reuse_run_id || needs.preview-donor.outputs.run_id || '' }}
+      resolve_native_donors: ${{ github.event_name == 'pull_request' || inputs.resolve_native_donors }}
 
   pin-unit-tests:
     name: PPU pin UT

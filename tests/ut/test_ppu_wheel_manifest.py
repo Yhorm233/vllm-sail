@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -49,6 +50,35 @@ def record(directory: Path) -> dict:
     data = {"schema": 1, "wheels": manifest.wheel_records(directory)}
     (directory / manifest.MANIFEST).write_text(json.dumps(data))
     return data
+
+
+def make_donor(
+    directory: Path, *, vllm_commit: str, sail_commit: str, fingerprint: str
+) -> dict:
+    directory.mkdir(parents=True)
+    make_wheels(directory)
+    data = record(directory)
+    data["commits"] = {"vllm": vllm_commit, "vllm-sail": sail_commit}
+    sail_wheel = directory / data["wheels"]["vllm-sail"]["file"]
+    data["native_reuse"] = {
+        "fingerprint": fingerprint,
+        "extensions": manifest.native_extension_records(sail_wheel),
+    }
+    (directory / manifest.MANIFEST).write_text(json.dumps(data))
+    return data
+
+
+def make_native_source(directory: Path) -> Path:
+    for relative in manifest.NATIVE_INPUTS:
+        relative = {
+            "cmake": "cmake/fixture.cmake",
+            "csrc": "csrc/fixture.hg",
+        }.get(relative, relative)
+        path = directory / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"old {relative}\n".encode())
+    (directory / manifest.FINGERPRINT_COMPAT).write_text("{}\n")
+    return directory
 
 
 def test_preserves_real_wheel_versions_and_verifies_hashes(tmp_path: Path) -> None:
@@ -255,6 +285,81 @@ def test_extract_native_requires_verified_reuse_metadata(tmp_path: Path) -> None
     }
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        *manifest.FINGERPRINT_COMPAT_PATHS,
+        "csrc/fixture.hg",
+        "settings",
+        "unknown_fingerprint",
+        "extra_path",
+        "missing_path",
+        "incorrect_previous",
+        "malformed_map",
+    ],
+)
+def test_native_reuse_bridges_only_exact_v2_inputs(tmp_path: Path, change) -> None:
+    source = make_native_source(tmp_path / "source")
+    settings = {"build_image": "image@sha256:one", "vllm_sail_hg_flags": "-O3"}
+    # Produced independently by the unmodified 714079e fingerprint function.
+    previous = "a5ec5996d87cec44e15e912a1b2fae9982ef009376632b54f0db9bd9e4ad15d4"
+    versions = {}
+    for relative in manifest.FINGERPRINT_COMPAT_PATHS:
+        path = source / relative
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        path.write_text(f"new {relative}\n")
+        versions[relative] = {
+            "current": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "previous": before,
+        }
+    compat = source / manifest.FINGERPRINT_COMPAT
+    unconfigured_fingerprint = manifest.native_fingerprint(source, **settings)
+    if change == "extra_path":
+        versions["csrc/fixture.hg"] = versions[manifest.FINGERPRINT_COMPAT_PATHS[0]]
+    elif change == "missing_path":
+        del versions[manifest.FINGERPRINT_COMPAT_PATHS[0]]
+    elif change == "incorrect_previous":
+        versions[manifest.FINGERPRINT_COMPAT_PATHS[0]]["previous"] = "0" * 64
+    compat.write_text("{" if change == "malformed_map" else json.dumps(versions))
+    current = manifest.native_fingerprint(source, **settings)
+    assert current not in {previous, unconfigured_fingerprint}
+
+    if change in (*manifest.FINGERPRINT_COMPAT_PATHS, "csrc/fixture.hg"):
+        (source / change).write_text("changed again\n")
+    elif change == "settings":
+        settings["vllm_sail_hg_flags"] = "-O2"
+    elif change == "unknown_fingerprint":
+        previous = "0" * 64
+
+    donor = tmp_path / "donor"
+    output = tmp_path / "extensions"
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    make_donor(donor, vllm_commit="1" * 40, sail_commit="2" * 40, fingerprint=previous)
+
+    def reuse() -> None:
+        manifest.reuse_native(
+            donor,
+            output,
+            wheels,
+            vllm_commit="1" * 40,
+            sail_commit="2" * 40,
+            sail_source=source,
+            **settings,
+        )
+
+    if change is None:
+        reuse()
+        assert len(list(output.glob("*.so"))) == len(manifest.NATIVE_MODULES)
+        assert len(list(wheels.glob("vllm-*.whl"))) == 1
+    else:
+        with pytest.raises(ValueError, match="native build fingerprint does not match"):
+            reuse()
+        assert not output.exists()
+        assert not list(wheels.iterdir())
+
+
 def test_create_accepts_verified_upstream_commit_for_native_repack(
     tmp_path: Path,
 ) -> None:
@@ -281,7 +386,9 @@ def test_create_accepts_verified_upstream_commit_for_native_repack(
     assert result.returncode == 0, result.stderr
     data = manifest.verify(tmp_path, vllm_commit=commit)
     assert data["native_reuse"]["extensions"]
-    assert len(data["native_reuse"]["fingerprint"]) == 64
+    assert data["native_reuse"]["fingerprint"] == manifest.native_fingerprint(
+        ROOT, build_image="image@sha256:one", pytorch_sail_arch="ppu_15;ppu_10"
+    )
 
 
 def test_verify_rejects_null_native_metadata_and_empty_extensions(
