@@ -728,7 +728,14 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
         assert value["type"] == "string"
         assert value["default"] == ""
         assert not value.get("required", False)
-    assert set(call["outputs"]) == {"image", "ready_epoch"}
+    assert set(call["outputs"]) == {
+        "image",
+        "ready_epoch",
+        "repo",
+        "commit",
+        "branch",
+        "tag",
+    }
     assert call["outputs"]["image"]["value"] == "${{ jobs.build.outputs.image }}"
     assert (
         call["outputs"]["ready_epoch"]["value"]
@@ -741,6 +748,10 @@ def test_build_leaf_preserves_retry_identity_and_image_output():
     assert build["outputs"] == {
         "image": "${{ steps.image.outputs.image }}",
         "ready_epoch": "${{ steps.ready.outputs.ready_epoch }}",
+        "repo": "${{ steps.source.outputs.repo }}",
+        "commit": "${{ steps.source.outputs.commit }}",
+        "branch": "${{ steps.source.outputs.branch }}",
+        "tag": "${{ steps.source.outputs.tag }}",
     }
     assert "if" not in build
     assert "needs" not in build

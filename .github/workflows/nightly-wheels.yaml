@@ -63,6 +63,10 @@ jobs:
     uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
     with:
       artifact_name: ppu-wheels-${{ github.run_id }}
+      repo: ${{ needs.build.outputs.repo }}
+      commit: ${{ needs.build.outputs.commit }}
+      branch: ${{ needs.build.outputs.branch }}
+      tag: ${{ needs.build.outputs.tag }}
       template_repository: t-head/ci-infra
       template_ref: main
     secrets:
@@ -79,8 +83,8 @@ jobs:
       - name: Show wheel downloads and source identity
         env:
           UPLOAD_URL: ${{ needs.publish.outputs.upload_url }}
-          SOURCE_BRANCH: ${{ needs.prepare.outputs.branch }}
-          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          SOURCE_BRANCH: ${{ needs.build.outputs.branch }}
+          SOURCE_SHA: ${{ needs.build.outputs.commit }}
           BUILD_IMAGE: ${{ needs.build.outputs.image }}
         run: |
           test -n "$UPLOAD_URL"
