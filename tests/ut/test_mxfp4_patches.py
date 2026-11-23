@@ -802,6 +802,24 @@ def test_deepseek_v4_mxfp4_selector_preserves_activation_mode(
 
 
 @pytest.mark.upstream_source
+@pytest.mark.parametrize("name", ["_use_k3_situ_aiter", "_use_k3_situ_int4_gfx942"])
+def test_rocm_requant_does_not_select_aiter_on_ppu(
+    upstream_source_root, monkeypatch, name
+):
+    """PPU 的 CUDA 兼容身份不能触发 ROCm 专用权重重排。"""
+    platforms = ModuleType("vllm.platforms")
+    platforms.current_platform = SimpleNamespace(is_rocm=lambda: False)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
+    monkeypatch.setitem(sys.modules, "vllm._aiter_ops", None)
+    select = function(
+        upstream_source_root / "vllm/model_executor/layers/quantization/mxfp4.py",
+        name,
+        {},
+    )
+    assert select(SimpleNamespace()) is False
+
+
+@pytest.mark.upstream_source
 @pytest.mark.parametrize(
     "local,local_name,upstream,upstream_name",
     [

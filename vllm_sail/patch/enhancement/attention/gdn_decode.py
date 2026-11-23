@@ -20,7 +20,7 @@ from vllm_sail.patch.utils import patch
 
 logger = init_logger(__name__)
 _META = dict(
-    reason="PPU GDN decode selects PLA, native CUDA or Triton using real kernel capabilities, not stub schemas.",
+    reason="PPU GDN decode selects PLA, native CUDA or Triton using real kernel capabilities, not stub schemas, and hashes the PLA preference for JIT/AOT caches.",
     affected_versions=">=0.32.0,<0.33.0",
     remove_when="GDN exposes a platform decode backend resolver and native implementation capability checks.",
 )
@@ -43,6 +43,19 @@ class _EnvironmentVariables(dict):
 _getters = _EnvironmentVariables(upstream_envs.environment_variables)
 _getters["VLLM_GDN_DECODE_KERNEL"] = _decode_kernel
 patch("vllm.envs", "environment_variables", **_META)(_getters)
+
+_upstream_compile_factors = upstream_envs.compile_factors
+
+
+@patch("vllm.envs", "compile_factors", **_META)
+def compile_factors():
+    factors = _upstream_compile_factors()
+    if not current_platform.is_ppu():
+        return factors
+    # auto 的 PLA 偏好会改变层的执行路径；JIT/AOT 共享此环境因子入口。
+    # 仅追加已解析的规范值，保留上游忽略项、其他 getter 和非 PPU 行为。
+    return {**factors, "VLLM_SAIL_USE_PLA": envs.VLLM_SAIL_USE_PLA}
+
 
 _upstream_init = QwenGatedDeltaNetAttention.__init__
 _upstream_unsupported_reason = (

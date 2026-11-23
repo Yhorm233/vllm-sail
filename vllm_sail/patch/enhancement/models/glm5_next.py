@@ -106,10 +106,40 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return original(q)
 
 
+def init_mega_moe_experts(self, vllm_config, config, quant_config, prefix):
+    # PPU MODIFICATION: begin — GLM 的新 block-FP8 adapter 需要 MXFP8，
+    # SAIL MegaMoE 当前仅消费 MXFP4；在冷加载和预加载进程中一致拒绝。
+    if current_platform.is_ppu():
+        raise NotImplementedError(
+            "GLM-5.3 block-FP8 MegaMoE requires MXFP8 expert weights; "
+            "SAIL MegaMoE only supports MXFP4. Select a non-MegaMoE backend."
+        )
+    # PPU MODIFICATION: end
+    return _upstream_init_mega_moe_experts(
+        self, vllm_config, config, quant_config, prefix
+    )
+
+
 # Registration is explicit so an environment without the glm5next model family
 # (older transformers) imports this module and skips it instead of failing the
 # whole plugin install.
 if not _unavailable:
+    from vllm.models.glm5next.common.model import Glm5NextMoE
+
+    _upstream_init_mega_moe_experts = Glm5NextMoE._init_mega_moe_experts
+    patch(
+        "vllm.models.glm5next.common.model",
+        "Glm5NextMoE._init_mega_moe_experts",
+        reason=(
+            "GLM block-FP8 MegaMoE uses an MXFP8-only subclass that may capture "
+            "the upstream expert base before plugin installation. SAIL MegaMoE "
+            "only supports MXFP4; reject this unsupported path consistently on "
+            "PPU instead of admitting the NVIDIA provider in preloaded processes."
+        ),
+        affected_versions=_AFFECTED,
+        remove_when="SAIL MegaMoE implements GLM block-FP8/MXFP8 expert loading.",
+    )(init_mega_moe_experts)
+
     patch(
         _PROVIDER,
         "fwht128_quant_fp8",

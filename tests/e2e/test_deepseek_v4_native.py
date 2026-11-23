@@ -26,7 +26,17 @@ def runtime():
 
 @pytest.mark.parametrize("dtype_name", ["float32", "float16", "bfloat16"])
 @pytest.mark.parametrize(
-    "shape", [(1, 256, 6), (17, 256, 6), (33, 384, 6), (17, 256, 8)]
+    "shape",
+    [
+        (1, 256, 6),
+        (17, 256, 6),
+        (33, 384, 6),
+        (17, 256, 8),
+        # 空行覆盖 FP32 hash 快路径，以及各 dtype 的通用 hash/non-hash launch。
+        (0, 256, 6),
+        (0, 384, 6),
+        (0, 256, 8),
+    ],
 )
 @pytest.mark.parametrize("routing", ["bias", "hash32", "hash64"])
 @pytest.mark.parametrize("renormalize", [False, True])
@@ -72,6 +82,7 @@ def test_topk_softplus_sqrt(runtime, dtype_name, shape, routing, renormalize):
         padding,
     )
     torch.cuda.synchronize()
+    assert weights.shape == indices.shape == source_rows.shape == (tokens, topk)
 
     scores = torch.nn.functional.softplus(logits.float()).sqrt()
     expected_ids = (
@@ -93,6 +104,80 @@ def test_topk_softplus_sqrt(runtime, dtype_name, shape, routing, renormalize):
     )
     assert bool((weights[padding] == 0).all())
     assert bool((indices[padding] == -1).all())
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("index_name", ["int32", "uint32", "int64"])
+@pytest.mark.parametrize("hash_index_name", ["int32", "int64"])
+@pytest.mark.parametrize(
+    "experts,hash_routing,renormalize",
+    [(192, False, True), (384, False, False), (256, True, True), (384, True, False)],
+)
+def test_topk_split_instances_preserve_image_padding_and_stream_contract(
+    runtime, dtype_name, index_name, hash_index_name, experts, hash_routing, renormalize
+):
+    """实际 op 覆盖九个 TU、hash-index 类型、五个 image sentinel 和普通 stream。"""
+    torch = runtime
+    topk, sentinel = 6, 5
+    ids_cpu = torch.tensor([4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4])
+    padding_cpu = torch.zeros(ids_cpu.numel(), dtype=torch.bool)
+    padding_cpu[2] = padding_cpu[7] = True
+    generator = torch.Generator().manual_seed(53)
+    logits_cpu = torch.randn(ids_cpu.numel(), experts, generator=generator).to(
+        getattr(torch, dtype_name)
+    )
+    logits_cpu[padding_cpu] = float("nan")
+    bias_cpu = torch.linspace(-0.25, 0.25, experts)
+    vl_cpu = torch.zeros(experts)
+    vl_cpu[-topk:] = torch.linspace(4, 5, topk)
+    table_cpu = (
+        torch.arange(19)[:, None] * 7 + torch.arange(topk)[None, :] * 13
+    ) % experts
+    logits, bias, bias_vl = logits_cpu.cuda(), bias_cpu.cuda(), vl_cpu.cuda()
+    ids = ids_cpu.to(getattr(torch, hash_index_name)).cuda()
+    table = (
+        table_cpu.to(getattr(torch, hash_index_name)).cuda() if hash_routing else None
+    )
+    padding = padding_cpu.cuda()
+    shape = (ids_cpu.numel(), topk)
+    weights = torch.empty(shape, device="cuda", dtype=torch.float32)
+    indices = torch.empty(shape, device="cuda", dtype=getattr(torch, index_name))
+    rows = torch.empty(shape, device="cuda", dtype=torch.int32)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.ops._moe_C.topk_softplus_sqrt(
+            weights,
+            indices,
+            rows,
+            logits,
+            renormalize,
+            1.5,
+            bias,
+            ids,
+            table,
+            padding,
+            bias_vl,
+            sentinel,
+        )
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    scores = torch.nn.functional.softplus(logits_cpu.float()).sqrt()
+    image = (ids_cpu >= sentinel) & (ids_cpu < sentinel + 5)
+    selection = scores + torch.where(image[:, None], vl_cpu, bias_cpu)
+    expected_ids = selection.topk(topk, dim=-1).indices
+    if hash_routing:
+        expected_ids[~image] = table_cpu[ids_cpu[~image]]
+    expected = scores.gather(1, expected_ids)
+    if renormalize:
+        expected /= expected.sum(-1, keepdim=True)
+    expected *= 1.5
+    expected[padding_cpu] = 0
+    # uint32 的 -1 哨兵是 2**32-1；在 CPU 上转为 int64 后独立比较。
+    expected_ids[padding_cpu] = (2**32 - 1) if index_name == "uint32" else -1
+    torch.testing.assert_close(indices.cpu().long(), expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(weights.cpu(), expected, rtol=2e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("hash_routing", [False, True])
@@ -284,7 +369,9 @@ def _kv_only_expected(torch, backing, mode, kv, positions, slots, rope_cache, sc
                 torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448)
             )
             encoded = (groups * torch.exp2(-exponent[:, None])).clamp(-448, 448)
-            start = offset * payload_width
+            # V4.1 stores each 512-byte payload immediately followed by its
+            # 16 scales. V4 retains separate payload and scale page regions.
+            start = offset * (528 if mxfp8 else payload_width)
             expected[block, start : start + quant_dims] = (
                 encoded.to(torch.float8_e4m3fn).view(torch.uint8).flatten()
             )
@@ -292,7 +379,11 @@ def _kv_only_expected(torch, backing, mode, kv, positions, slots, rope_cache, sc
                 expected[block, start + 448 : start + 576] = rounded[448:].view(
                     torch.uint8
                 )
-            start = block_size * payload_width + offset * scale_stride
+            start = (
+                offset * 528 + payload_width
+                if mxfp8
+                else block_size * payload_width + offset * scale_stride
+            )
             expected[block, start : start + exponent.numel()] = (exponent + 127).byte()
             if not mxfp8:
                 expected[block, start + 7] = 0
@@ -318,7 +409,7 @@ def _assert_kv_only_cache(torch, actual, expected, mode, slots):
                 expected[region].contiguous().view(torch.bfloat16),
             )
         else:
-            region = (block, slice(offset * 512 + 448, (offset + 1) * 512))
+            region = (block, slice(offset * 528 + 448, offset * 528 + 512))
             _assert_ulp(
                 torch,
                 actual[region].contiguous().view(torch.float8_e4m3fn),

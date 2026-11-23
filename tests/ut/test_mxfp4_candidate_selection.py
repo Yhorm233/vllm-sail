@@ -14,7 +14,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tests.support.source import ROOT, definition, function
+from tests.support.source import ROOT, definition, function, load_moe_oracle
 from vllm_sail.registry.moe_backends._extend import extend_enum
 
 PATCH = "vllm_sail/registry/moe_backends/mxfp4.py"
@@ -58,10 +58,20 @@ def selection(
     supports=lambda *_: True,
     upstream,
     lora=False,
+    padded=False,
+    trace=None,
 ):
     """Run upstream's selector body with the PPU helpers installed as globals."""
-    calls, warnings = [], []
-    standard, batch = object(), object()
+    calls, warnings = ([], []) if trace is None else trace
+    formats = function(
+        upstream.parent.parent / "modular_kernel.py",
+        "FusedMoEActivationFormat",
+        {"Enum": Enum},
+    )
+    standard, batch = formats.Standard, formats.BatchedExperts
+    activation_format = (
+        formats.PaddedStandard if padded else batch if batched else standard
+    )
 
     def own_format(backend):
         return batch if backend.name.startswith("BATCHED_") else standard
@@ -74,7 +84,7 @@ def selection(
                 # Upstream's FusedMoEExperts.is_supported_config() rejects a
                 # kernel whose activation format differs from the MoE layout,
                 # which is what drops the sibling PPU candidate.
-                if activation_format is not own_format(backend):
+                if not own_format(backend).is_superset(activation_format):
                     return False, "activation format fixture"
                 return supports(backend, activation), "unsupported candidate fixture"
 
@@ -91,7 +101,7 @@ def selection(
 
     namespace = {
         "Mxfp4MoeBackend": Backend,
-        "mk": NS(FusedMoEActivationFormat=NS(Standard=standard, BatchedExperts=batch)),
+        "mk": NS(FusedMoEActivationFormat=formats),
         "kMxfp4Static": "weights",
         "kFp8Dynamic128Sym": "fp8-block",
         "kFp8DynamicTokenSym": "fp8-token",
@@ -137,22 +147,22 @@ def selection(
         "_get_requested_backends",
         "_warn_on_bf16_fallback",
         "_requested_kernel_cls",
-        "_return_or_raise",
     ):
         if helper != "_requested_kernel_cls" or any(
             isinstance(node, ast.FunctionDef) and node.name == helper
             for node in ast.parse(upstream.read_text()).body
         ):
             function(upstream, helper, namespace)
+    load_moe_oracle(upstream, "Mxfp4MoEKernelOracle", namespace)
     config = NS(
         moe_backend="explicit" if explicit else "auto",
-        moe_parallel_config=NS(use_batched_activation_format=batched),
+        activation_format=activation_format,
         is_lora_enabled=lora,
     )
     result = function(upstream, "select_mxfp4_moe_backend", namespace)(
         config, activation_key=requested
     )
-    return result, calls, warnings, batch if batched else standard
+    return result, calls, warnings, activation_format
 
 
 def test_plugin_does_not_copy_the_selector_body() -> None:
@@ -163,6 +173,74 @@ def test_plugin_does_not_copy_the_selector_body() -> None:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     }
     assert "select_mxfp4_moe_backend" not in defined
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "backend_name", ["FLASHINFER_TRTLLM_MXFP4_BF16", "FLASHINFER_TRTLLM_MXFP4_MXFP8"]
+)
+@pytest.mark.parametrize("winner", [0, 1, 2])
+def test_real_trtllm_mapping_keeps_mxfp8_candidate_and_probe_order(
+    modules, real_oracle_source, backend_name, winner
+):
+    """真实 upstream mapping 经 PPU 委托再由共享 oracle 探测；不证明专家设备准入。"""
+    candidates, probes, rejected = [], [], []
+    for index, name in enumerate(
+        (
+            "TrtLlmMxfp4ExpertsMonolithic",
+            "TrtLlmMxfp4Mxfp8ExpertsModular",
+            "TrtLlmMxfp4ExpertsModular",
+        )
+    ):
+        cls = type(name, (), {})
+
+        def supports(cls, config, weight, activation, fmt, index=index):
+            probes.append((cls, config, weight, activation, fmt))
+            return index == winner, "source-boundary rejection"
+
+        cls.is_supported_config = staticmethod(supports)
+        candidates.append(cls)
+    modules(
+        "vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe",
+        **{cls.__name__: cls for cls in candidates},
+    )
+    formats = function(
+        real_oracle_source.parent.parent / "modular_kernel.py",
+        "FusedMoEActivationFormat",
+        {"Enum": Enum},
+    )
+    namespace = {
+        "Mxfp4MoeBackend": Backend,
+        "B12X_BACKENDS": (Backend.B12X_MXFP4_MXFP8, Backend.B12X_MXFP4_BF16),
+        "_PPU_W4A16_BACKENDS": (),
+        "kFp8Dynamic128Sym": "fp8-block",
+        "kMxfp8Dynamic": "mxfp8",
+        "kFp8StaticTensorSym": "fp8",
+        "kMxfp4Dynamic": "mxfp4",
+        "logger": NS(debug_once=lambda *args: rejected.append(args)),
+    }
+    namespace["_upstream_backend_to_kernel_cls"] = function(
+        real_oracle_source, "backend_to_kernel_cls", namespace
+    )
+    mapping = function(PATCH, "backend_to_kernel_cls", namespace)
+    backend = Backend[backend_name]
+    assert mapping(backend) == candidates
+    key = function(real_oracle_source, "_backend_activation_key", namespace)(backend)
+    assert key == ("mxfp8" if backend_name.endswith("MXFP8") else None)
+    oracle_cls = load_moe_oracle(real_oracle_source, "Mxfp4MoEKernelOracle", namespace)
+    config = NS(activation_format=formats.Standard)
+    cls, failures = oracle_cls(config, "weights", "checkpoint").try_backend(
+        backend, activation_key=key
+    )
+    assert cls is candidates[winner]
+    assert failures == [
+        (cls, "source-boundary rejection") for cls in candidates[:winner]
+    ]
+    assert probes == [
+        (cls, config, "weights", key, formats.Standard)
+        for cls in candidates[: winner + 1]
+    ]
+    assert len(rejected) == winner
 
 
 @pytest.mark.upstream_source
@@ -283,6 +361,40 @@ def test_w4a4_candidate_rejection_warns_for_bf16_fallback(real_oracle_source):
         (Backend.MARLIN, "weights", None, format),
     ]
     assert warnings == [Backend.MARLIN]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.upstream_source
+def test_ppu_candidates_do_not_treat_padded_standard_as_standard(
+    real_oracle_source, explicit
+):
+    """共享 oracle 必须拒绝两种 PPU 格式，且失败选择不产生回退成功警告。"""
+    calls = []
+
+    def supports(*args):
+        calls.append(args)
+        return True
+
+    probes, warnings = [], []
+    with pytest.raises(
+        ValueError if explicit else NotImplementedError, match="activation format"
+    ):
+        selection(
+            [Backend.PPU_DEEPGEMM_MXFP4],
+            requested="mxfp4",
+            explicit=explicit,
+            padded=True,
+            supports=supports,
+            upstream=real_oracle_source,
+            trace=(probes, warnings),
+        )
+    assert calls == []
+    assert [entry[0] for entry in probes] == [
+        Backend.PPU_DEEPGEMM_MXFP4,
+        Backend.BATCHED_PPU_DEEPGEMM_MXFP4,
+    ]
+    assert all(entry[3].name == "PaddedStandard" for entry in probes)
+    assert warnings == []
 
 
 @pytest.fixture

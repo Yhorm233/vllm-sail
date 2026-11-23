@@ -464,7 +464,6 @@ def mhc_fused_post_pre_delayed_tilelang(
 _ALIAS_CONSUMERS = {
     "mhc_pre_delayed_tilelang": (
         "vllm.models.deepseek_v41.nvidia.model",
-        "vllm.models.deepseek_v41.nvidia.specialized_decode.boundary.boundary",
     ),
     "mhc_fused_post_pre_delayed_tilelang": (
         "vllm.models.deepseek_v41.nvidia.ops.mega_mhc",

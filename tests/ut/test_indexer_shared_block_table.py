@@ -480,6 +480,8 @@ def test_selected_upstream_producer_preserves_the_same_table(
         use_flattening=False,
         supports_varlen=False,
         use_pcp=False,
+        use_shardq=False,
+        fused_mqa_topk_eligible=False,
         max_prefill_buffer_size=128,
         indexer_uses_fp4=False,
         vllm_config=object(),

@@ -272,6 +272,14 @@ def ppu_sparse_attn_indexer(
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
+        # ShardQ 的 chunk 行号对应紧凑查询；cache 写入和 decode 保留原始行序。
+        prefill_q, prefill_q_scale, prefill_weights = q_quant, q_scale, weights
+        if (indices := prefill_metadata.shardq_gather_indices) is not None:
+            assert candidate_blocks is None
+            prefill_q, prefill_weights = q_quant[indices], weights[indices]
+            if q_scale is not None:
+                prefill_q_scale = q_scale[indices]
+
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
@@ -301,10 +309,10 @@ def ppu_sparse_attn_indexer(
                     chunk.cu_seq_lens,
                 )
 
-            q_slice = q_quant[chunk.token_start : chunk.token_end]
+            q_slice = prefill_q[chunk.token_start : chunk.token_end]
             q_scale_slice = (
-                q_scale[chunk.token_start : chunk.token_end]
-                if q_scale is not None
+                prefill_q_scale[chunk.token_start : chunk.token_end]
+                if prefill_q_scale is not None
                 else None
             )
             # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
@@ -323,7 +331,7 @@ def ppu_sparse_attn_indexer(
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
                         (k_quant_cast, k_scale_cast),
-                        weights[chunk.token_start : chunk.token_end],
+                        prefill_weights[chunk.token_start : chunk.token_end],
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                         clean_logits=False,
@@ -334,7 +342,7 @@ def ppu_sparse_attn_indexer(
                     logits = int8_mqa_logits(
                         q_slice_cast,
                         (k_quant_cast, k_scale_cast),
-                        weights[chunk.token_start : chunk.token_end],
+                        prefill_weights[chunk.token_start : chunk.token_end],
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                         clean_logits=False,
@@ -344,7 +352,7 @@ def ppu_sparse_attn_indexer(
                     logits = fp8_mqa_logits(
                         q_slice_cast,
                         (k_quant_cast, k_scale_cast),
-                        weights[chunk.token_start : chunk.token_end],
+                        prefill_weights[chunk.token_start : chunk.token_end],
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
                         clean_logits=False,

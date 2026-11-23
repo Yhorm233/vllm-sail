@@ -53,13 +53,13 @@ def _model_classes():
     """
     from vllm.model_executor.models.registry import ModelRegistry
 
-    from vllm_sail.models import register_model
+    from vllm_sail import register_out_of_tree
     from vllm_sail.models.minimax_m3 import (
         MiniMaxM3SparseForCausalLM,
         MiniMaxM3SparseForConditionalGeneration,
     )
 
-    register_model()
+    register_out_of_tree()
     for arch, _cls in (
         ("MiniMaxM3SparseForCausalLM", MiniMaxM3SparseForCausalLM),
         (

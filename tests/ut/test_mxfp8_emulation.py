@@ -250,6 +250,10 @@ def test_upstream_dequantizes_at_load_or_per_forward(
             return getattr(self.data, name)
 
     modules("vllm.envs", VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD=dequant_at_load)
+    modules(
+        "vllm.model_executor.model_loader.reload.direct",
+        direct_reload_enabled=lambda: False,
+    )
     namespace = {
         "torch": SimpleNamespace(
             nn=SimpleNamespace(

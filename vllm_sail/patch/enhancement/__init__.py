@@ -41,6 +41,8 @@ from vllm_sail.patch.enhancement import residual  # noqa: F401
 # Leaf-style modules (like residual/): define their replacements without vLLM
 # imports at module scope, so installation is explicit.
 compressed_tensors_ppu.install()
+from vllm_sail.patch.enhancement import linear_quant_target  # noqa: F401
+
 triton_warmup.install()
 fused_moe_ppu.install()
 mega_moe.install()

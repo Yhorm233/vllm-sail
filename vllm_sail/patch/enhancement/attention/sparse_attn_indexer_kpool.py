@@ -97,7 +97,9 @@ _FORWARD_PPU_REASON = (
     "PPUs (890P/SM89) delegate to the upstream fp8 path. Upstream has no "
     "forward_ppu; installed additively and reached through the "
     "custom_op_dispatch patch (enabled path) or the forward_native "
-    "redirect (disabled path)."
+    "redirect (disabled path). The INT8 path rejects PCP and DCP before "
+    "cache access because distributed pool/tail input gathering and "
+    "global top-k merging are not implemented."
 )
 _FORWARD_PPU_REMOVE_WHEN = (
     "upstream's kpool indexer grows a platform hook, or PPU stops overriding this op."
@@ -114,12 +116,18 @@ _FORWARD_NATIVE_REMOVE_WHEN = (
 )
 
 
-def fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k):
+def fp8_mqa_logits(
+    q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k,
+    logits_dtype: torch.dtype = torch.float32,
+):
     """Keep GLM's FP8 producers on SAIL's legacy FP8 scoring API."""
     if not current_platform.is_ppu():
         return _upstream_mqa_logits(
-            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k,
+            logits_dtype=logits_dtype,
         )
+    if logits_dtype != torch.float32:
+        raise ValueError("SAIL GLM FP8 logits require indexer_logits_dtype='float32'")
     from vllm_sail.utils import deep_gemm
 
     q_values, q_scale = q
@@ -133,14 +141,16 @@ def fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k):
 
 def fp8_paged_mqa_logits(
     q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
-    max_model_len, indices=None,
+    max_model_len, logits_dtype: torch.dtype = torch.float32, indices=None,
 ):
     """Generate the FP8 schedule from the device-built per-query GLM rows."""
     if not current_platform.is_ppu():
         return _upstream_paged_mqa_logits(
             q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
-            max_model_len, indices=indices,
+            max_model_len, logits_dtype=logits_dtype, indices=indices,
         )
+    if logits_dtype != torch.float32:
+        raise ValueError("SAIL GLM FP8 logits require indexer_logits_dtype='float32'")
     from vllm_sail.utils import deep_gemm
 
     q_values, q_scale = q
@@ -206,12 +216,25 @@ def forward_ppu(
             "PPU INT8 kpool indexer requires decode context parallel size 1; "
             "distributed cache mapping and global top-k merge are not implemented"
         )
+    # PCP 使用 rank-local K/gate，却提供 rank-major 展开的 slot mapping；
+    # INT8 池和 tail 写入尚无对应 gather，不能仅替换 prefill 的 cu_seq_lens。
+    parallel = getattr(self, "_parallel_config", None)
+    if getattr(parallel, "prefill_context_parallel_size", 1) > 1:
+        raise NotImplementedError(
+            "PPU INT8 kpool indexer requires prefill context parallel size 1; "
+            "PCP pool/tail cache input gathering is not implemented"
+        )
 
     # ``topk_backend`` selects among the CUDA top-k dispatches
     # (cooperative/persistent). The PPU op always uses the ``torch.ops._C``
     # top-k kernels exercised by the DSA INT8 path, so the flag is accepted for
     # signature parity with ``forward_cuda`` and ignored.
     del topk_backend
+    # INT8 输出 dtype 随 producer weights，不通过事后转换冒充另一种归约。
+    if self.logits_dtype != weights.dtype:
+        raise ValueError(
+            "SAIL GLM INT8 indexer_logits_dtype must match the producer weights dtype"
+        )
     if isinstance(q_quant, tuple):
         q_values, q_scale = q_quant
     else:

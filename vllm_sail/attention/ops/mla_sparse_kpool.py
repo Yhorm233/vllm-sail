@@ -827,6 +827,13 @@ def ppu_sparse_attn_indexer_kpool(
                 positions[num_decode_tokens:num_tokens].to(torch.int32),
             )
 
+        # ShardQ 只压缩评分查询；池写入、tail 更新和 decode 使用完整 token 流。
+        prefill_q, prefill_weights, prefill_positions = q_quant, weights, positions
+        if (indices := prefill_metadata.shardq_gather_indices) is not None:
+            prefill_q, prefill_weights = q_quant[indices], weights[indices]
+            if positions is not None:
+                prefill_positions = positions[indices]
+
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(total_seq_lens, head_dim)
         k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
@@ -844,12 +851,12 @@ def ppu_sparse_attn_indexer_kpool(
                     chunk.block_table,
                     chunk.cu_seq_lens,
                 )
-            q_slice = q_quant[chunk.token_start : chunk.token_end]
+            q_slice = prefill_q[chunk.token_start : chunk.token_end]
             k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
             logits = int8_mqa_logits(
                 q_slice,
                 (k_quant, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
+                prefill_weights[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
                 clean_logits=False,
@@ -880,9 +887,11 @@ def ppu_sparse_attn_indexer_kpool(
             )
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
-                if positions is not None:
+                if prefill_positions is not None:
                     q_seq = (
-                        positions[chunk.token_start : chunk.token_end].to(torch.int32)
+                        prefill_positions[chunk.token_start : chunk.token_end].to(
+                            torch.int32
+                        )
                         + 1
                     )
                     expanded = _expand_pools(pool_ids, q_seq, index_kpool, topk_tokens)

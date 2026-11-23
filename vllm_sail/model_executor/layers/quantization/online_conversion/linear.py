@@ -7,7 +7,7 @@ from vllm.model_executor.layers.linear import LinearMethodBase, UnquantizedLinea
 from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
-from .loading import guard_weights
+from .loading import guard_weights, reject_direct_reload
 from .quant_utils import dequantize_fp8, quantize_int8
 
 
@@ -29,6 +29,7 @@ class Fp8ConversionLinearMethod(LinearMethodBase):
         params_dtype,
         **extra_weight_attrs,
     ):
+        reject_direct_reload()
         if params_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("Conversion requires BF16 or FP16 activations")
         if self.source_dtype == "fp8" and any(
@@ -90,6 +91,7 @@ class Fp8ConversionLinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale_inv", scale)
 
     def process_weights_after_loading(self, layer):
+        reject_direct_reload()
         if self.converted:
             return
         weight = (

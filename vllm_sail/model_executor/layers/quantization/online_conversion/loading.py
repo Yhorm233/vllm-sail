@@ -10,6 +10,18 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 
+def reject_direct_reload():
+    """在分配或加载权重前拒绝无法重放的一次性转换。"""
+    from vllm import envs
+
+    if envs.VLLM_RELOAD_MODE == "direct":
+        raise ValueError(
+            "SAIL online conversion does not support VLLM_RELOAD_MODE=direct: "
+            "conversion replaces source weights and retires source scales; "
+            "restart with the source checkpoint instead"
+        )
+
+
 def checked_loader(loader, expected_dtype):
     @wraps(loader)
     def load(param, loaded_weight, *args, **kwargs):

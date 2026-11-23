@@ -142,7 +142,7 @@ def _rebind_consumers():
         (
             (
                 "vllm.model_executor.kernels.attention.dsa.candidate_blocks",
-                "vllm.models.step5.nvidia.ops.sparse_indexer",
+                "vllm.models.step5.common.ops.sparse_indexer",
             ),
             _original_supported,
             is_deep_select_supported,

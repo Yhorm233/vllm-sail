@@ -343,6 +343,11 @@ def fused_gate(vllm_config) -> tuple[bool, str]:
     nvfp4 = ppu_envs.VLLM_SAIL_PPU_KV_NVFP4
     if not current_platform.is_ppu():
         return False, "gate-platform: not PPU"
+    if getattr(vllm_config, "lora_config", None) is not None:
+        return (
+            False,
+            "gate-lora: fused wo_a projection does not apply the adapter delta",
+        )
     cap = current_platform.get_device_capability()
     if cap is None or (cap.major, cap.minor) not in _PPU_FUSED_CAPABILITIES:
         return False, f"gate-cap: capability {cap} not in {_PPU_FUSED_CAPABILITIES}"

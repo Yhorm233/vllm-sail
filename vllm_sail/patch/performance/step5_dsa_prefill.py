@@ -122,7 +122,7 @@ def _record_route(metadata, requested, paged, stage, reason=None, *, layout=None
 
 
 def _install_native_decode(adapter_module):
-    target = "vllm.models.step5.nvidia.ops.sparse_decode_attention"
+    target = "vllm.models.step5.common.ops.sparse_decode_attention"
     try:
         module = importlib.import_module(target)
     except ModuleNotFoundError as exc:
@@ -135,7 +135,7 @@ def _install_native_decode(adapter_module):
     # Also update consumer aliases already imported; later imports get the new
     # wrapper anyway.
     aliases = [(name, attr) for name, loaded in list(sys.modules.items())
-               if name.startswith("vllm.models.step5.nvidia") and loaded is not None
+               if (name == target or name.startswith("vllm.models.step5.nvidia.")) and loaded is not None
                for attr, value in list(vars(loaded).items()) if value is original]
     for name, attr in aliases:
         patch(name, attr, reason="Explicit native tries the new precompiled BF16 decode; unsupported inputs fall back before launch.",

@@ -91,7 +91,7 @@ def __init__(self, device: torch.device):
     )
     # PPU MODIFICATION: begin — no flashinfer.attn_scores on PPU; its native
     # E4M3 runs upstream's Triton scorer like SM90.
-    from .ops.sparse_indexer_scores import paged_mqa_logits_sm90
+    from ..common.ops.sparse_indexer_scores import paged_mqa_logits_sm90
 
     self._logits = paged_mqa_logits_sm90
     # PPU MODIFICATION: end
@@ -113,7 +113,7 @@ def warmup_prefill_scoring(self, max_regions, topk, paired_heads, device):
     context grows, and paired logits compile for ``next_n = 2``; either
     would otherwise compile mid-serving on the first such prefill.
     """
-    from .ops.prefill_indexer_metadata import prefill_indexer_chunk_size
+    from ..common.ops.prefill_indexer_metadata import prefill_indexer_chunk_size
 
     rows = torch.arange(2, device=device)
     owners = torch.zeros(2, dtype=torch.long, device=device)

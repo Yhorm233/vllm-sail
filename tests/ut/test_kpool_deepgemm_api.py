@@ -31,6 +31,9 @@ class Tensor:
     def stride(self, dim):
         return 1
 
+    def dim(self):
+        return len(self.shape)
+
 
 @pytest.fixture(params=[False, True], ids=["cold", "preloaded"])
 def kpool(modules, patch_utils_module, monkeypatch, request):
@@ -56,7 +59,13 @@ def kpool(modules, patch_utils_module, monkeypatch, request):
 
         return record
 
-    modules("torch", float8_e4m3fn="fp8", contiguous_format="contiguous")
+    modules(
+        "torch",
+        float8_e4m3fn="fp8",
+        float32="fp32",
+        bfloat16="bf16",
+        contiguous_format="contiguous",
+    )
     platform = NS(ppu=True)
     platform.is_ppu = lambda: platform.ppu
     modules("vllm.platforms", current_platform=platform)
@@ -179,10 +188,92 @@ def test_glm_wrappers_preserve_non_ppu_calls(kpool, paged):
         assert (
             kpool.provider.fp8_fp4_paged_mqa_logits(*args, indices=ids) == "cuda_decode"
         )
-        assert kpool.calls == [("cuda_decode", args, {"indices": ids})]
+        assert kpool.calls == [
+            ("cuda_decode", args, {"logits_dtype": "fp32", "indices": ids})
+        ]
     else:
         assert kpool.provider.fp8_fp4_mqa_logits(*args) == "cuda_prefill"
-        assert kpool.calls == [("cuda_prefill", args, {})]
+        assert kpool.calls == [("cuda_prefill", args, {"logits_dtype": "fp32"})]
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+def test_glm_wrappers_forward_explicit_positional_dtype(kpool, paged, dtype):
+    kpool.platform.ppu = False
+    args = tuple(object() for _ in range(7 if paged else 6))
+    if paged:
+        ids = object()
+        assert (
+            kpool.provider.fp8_fp4_paged_mqa_logits(*args, dtype, ids) == "cuda_decode"
+        )
+        assert kpool.calls == [
+            ("cuda_decode", args, {"logits_dtype": dtype, "indices": ids})
+        ]
+    else:
+        assert kpool.provider.fp8_fp4_mqa_logits(*args, dtype) == "cuda_prefill"
+        assert kpool.calls == [("cuda_prefill", args, {"logits_dtype": dtype})]
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_glm_ppu_rejects_non_fp32_before_inspecting_or_scoring_inputs(kpool, paged):
+    compute = (
+        kpool.provider.fp8_fp4_paged_mqa_logits
+        if paged
+        else kpool.provider.fp8_fp4_mqa_logits
+    )
+    args = tuple(object() for _ in range(7 if paged else 6))
+    with pytest.raises(ValueError, match="indexer_logits_dtype='float32'"):
+        compute(*args, logits_dtype="bf16")
+    assert kpool.calls == []
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+def test_glm_non_ppu_reaches_real_unified_provider(
+    kpool, upstream_source_root, paged, dtype
+):
+    name = "fp8_fp4_paged_mqa_logits" if paged else "fp8_fp4_mqa_logits"
+    calls, output = [], object()
+
+    def implementation(*args, **kwargs):
+        calls.append((args, kwargs))
+        return output
+
+    namespace = {
+        "_lazy_init": lambda: None,
+        "_missing": lambda: pytest.fail("real provider must reach implementation"),
+        "_" + name + "_impl": implementation,
+        "torch": NS(float32="fp32", contiguous_format="contiguous"),
+    }
+    original = function(
+        upstream_source_root / "vllm/utils/deep_gemm.py", name, namespace
+    )
+    attribute = "_upstream_paged_mqa_logits" if paged else "_upstream_mqa_logits"
+    setattr(kpool.patch, attribute, original)
+    kpool.platform.ppu = False
+    q, kv, weights, starts, ends = (
+        object(),
+        object(),
+        object(),
+        object(),
+        Tensor((2, 3)),
+    )
+    args = (
+        (q, kv, weights, starts, ends, object(), 65)
+        if paged
+        else (q, kv, weights, starts, ends, 65)
+    )
+    kwargs = {"logits_dtype": dtype}
+    if paged:
+        kwargs["indices"] = object()
+    assert getattr(kpool.provider, name)(*args, **kwargs) is output
+    assert len(calls) == 1
+    passed, options = calls[0]
+    assert all(
+        actual is expected for actual, expected in zip(passed, args, strict=True)
+    )
+    assert options == kwargs
 
 
 @pytest.mark.upstream_source

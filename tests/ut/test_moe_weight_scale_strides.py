@@ -121,6 +121,21 @@ def test_host_tma_configuration_does_not_reach_owned_kernel(modules, enabled):
     )
 
 
+@pytest.mark.parametrize(
+    "sorted_a,sorted_c", [(True, False), (False, True), (True, True)]
+)
+def test_sorted_activation_buffers_cannot_reach_pointer_kernel(sorted_a, sorted_c):
+    launch = function(PATCH, "invoke_fused_moe_triton_kernel", {})
+    with pytest.raises(ValueError, match="unsorted activation buffers"):
+        launch(*([None] * 18), A_is_sorted=sorted_a, C_is_sorted=sorted_c)
+
+
+def test_upstream_down_projection_tuning_keeps_ppu_pointer_fallback():
+    # An absent separate down config prevents the upstream sorted-A TMA path.
+    lookup = function(PATCH, "get_moe_configs", {})
+    assert lookup(32, 128, "fp8_w8a8", 128, 128, down_moe=True) is None
+
+
 @pytest.mark.parametrize("shape,strides,expected", SCALES)
 @pytest.mark.parametrize("capability", [80, 89, 90])
 def test_weight_scale_strides_reach_the_kernel(

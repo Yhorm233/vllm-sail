@@ -57,12 +57,7 @@ def _get_priority_backends(
     )
     from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 
-    activation_format = (
-        mk.FusedMoEActivationFormat.BatchedExperts
-        if moe_config.moe_parallel_config.use_batched_activation_format
-        or moe_config.moe_backend == "batched_triton"
-        else mk.FusedMoEActivationFormat.Standard
-    )
+    activation_format = moe_config.activation_format
     requested = ppu_envs.VLLM_SAIL_MOE_BACKEND
     deep_gemm_enabled = (
         is_deep_gemm_supported()
@@ -149,9 +144,12 @@ def map_unquantized_backend(
 def select_unquantized_moe_backend(
     moe_config: FusedMoEConfig,
 ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
+    # LoRA 的布局门控和专家选择归 upstream；不得由 batched PPU 快分支绕过。
+    if moe_config.is_lora_enabled:
+        return _upstream_select_unquantized_moe_backend(moe_config)
     if (
         moe_config.moe_backend == "ppu_deep_gemm"
-        and moe_config.moe_parallel_config.use_batched_activation_format
+        and moe_config.activation_format.is_batched
     ):
         backend = UnquantizedMoeBackend.BATCHED_PPU_DEEPGEMM
         for kernel_cls in backend_to_kernel_cls(backend):

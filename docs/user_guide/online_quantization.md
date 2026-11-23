@@ -118,6 +118,9 @@ MoE decoding and scale statistics exclude padding; target padding is zero-filled
 BF16 MoE execution inherits the unquantized backend's EPLB capability. INT8 MoE
 inherits the target method's capability limits. Preprocessed source weights and
 weight reload are not supported workflows. Restart with the source checkpoint to change conversion mode.
+启用 `VLLM_RELOAD_MODE=direct` 时，SAIL 在线转换会在分配源权重前报错：
+一次性转换会替换源参数并释放源 scale，无法安全重放 direct reload。
+转换完成后的 post-load 调用也保留此检查；未参与转换的浮点层不受此限制。
 Backend-specific shape and execution restrictions still apply.
 
 Conversion avoids a full intermediate BF16 model, but still temporarily holds the

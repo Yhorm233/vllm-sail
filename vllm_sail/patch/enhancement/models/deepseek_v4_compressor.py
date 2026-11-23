@@ -75,7 +75,14 @@ def __init__(
         requires_grad=False,
     )
 
-    self.fused_wkv_wgate = MergedColumnParallelLinear(
+    # CPU packs the weight for its GEMM and frees the raw copy, so it keeps
+    # the quant-method forward and upcasts the BF16 output itself.
+    kv_score_linear = (
+        MergedColumnParallelLinear
+        if current_platform.is_cpu()
+        else DeepseekV4CompressorKVScoreLinear
+    )
+    self.fused_wkv_wgate = kv_score_linear(
         self.hidden_size,
         [self.coff * self.head_dim, self.coff * self.head_dim],
         bias=False,

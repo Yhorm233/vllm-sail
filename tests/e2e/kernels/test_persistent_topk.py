@@ -34,6 +34,60 @@ def assert_topk(torch, logits, indices, lengths):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("experts", [32, 128])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_softmax_topk_graph_replay_without_programmatic_dependency(
+    topk_runtime, experts, renormalize
+):
+    """PPU SM80/89 的普通 graph launch 保持 top-k 数值和重放输入更新。"""
+    torch = topk_runtime
+    logits = torch.linspace(-2, 2, experts, device="cuda").repeat(5, 1)
+    weights = torch.empty((5, 8), dtype=torch.float32, device="cuda")
+    indices = torch.empty((5, 8), dtype=torch.int32, device="cuda")
+    token_expert_indices = torch.empty_like(indices)
+
+    def run():
+        torch.ops._moe_C.topk_softmax(
+            weights, indices, token_expert_indices, logits, renormalize, None, None
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for sign in (1, -1, 1):
+        logits.copy_(sign * torch.linspace(-2, 2, experts, device="cuda"))
+        graph.replay()
+        expected_weights, expected_ids = logits.softmax(-1).topk(8, dim=-1)
+        if renormalize:
+            expected_weights /= expected_weights.sum(-1, keepdim=True)
+        torch.testing.assert_close(indices.long(), expected_ids, rtol=0, atol=0)
+        torch.testing.assert_close(weights, expected_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("experts", [32, 128, 256])
+@pytest.mark.parametrize("groups", [1, 4])
+@pytest.mark.parametrize("scoring_func", [0, 1])
+def test_grouped_topk_padding_preserves_unpadded_routing(
+    topk_runtime, experts, groups, scoring_func
+):
+    """新增可选 mask 不改变有效 token 路由，padding 输出 -1 和零权重。"""
+    torch = topk_runtime
+    scores = torch.linspace(-1, 1, experts, device="cuda").repeat(4, 1)
+    bias = torch.zeros(experts, device="cuda")
+    args = (scores, groups, min(groups, 2), 8, True, 2.0, bias, scoring_func)
+    original_weights, original_ids = torch.ops._moe_C.grouped_topk(*args)
+    padding = torch.tensor([False, True, False, True], device="cuda")
+    weights, ids = torch.ops._moe_C.grouped_topk(*args, padding)
+    torch.testing.assert_close(
+        weights[~padding], original_weights[~padding], rtol=0, atol=0
+    )
+    torch.testing.assert_close(ids[~padding], original_ids[~padding], rtol=0, atol=0)
+    assert bool((weights[padding] == 0).all())
+    assert bool((ids[padding] == -1).all())
+
+
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
 @pytest.mark.parametrize("rows", [1, 64, 128])
 @pytest.mark.parametrize(
@@ -81,6 +135,44 @@ def test_aligned_stride_with_misaligned_base(topk_runtime, top_k, rows, offset):
     torch.ops._C.persistent_topk(logits, lengths, indices, workspace, top_k, width)
     torch.cuda.synchronize()
     assert_topk(torch, logits, indices, lengths)
+
+
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("offset", [0, 1, 2])
+@pytest.mark.parametrize("rows", [1, 64, 128])
+def test_bf16_dtype_and_shifted_base_contract(topk_runtime, top_k, offset, rows):
+    """BF16 使用真实两字节输入；共享内存不足时必须显式拒绝。"""
+    torch = topk_runtime
+    width = 32769
+    storage = torch.empty((rows, width + 8), dtype=torch.bfloat16, device="cuda")
+    logits = storage[:, offset : width + offset]
+    values = torch.arange(width, dtype=torch.float32, device="cuda") / width
+    logits.copy_(values)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    props = torch.cuda.get_device_properties(logits.device)
+    if props.shared_memory_per_block_optin < 128 * 1024:
+        with pytest.raises(RuntimeError, match="requires 128 KiB shared memory"):
+            torch.ops._C.persistent_topk(
+                logits, lengths, indices, workspace, top_k, width
+            )
+        return
+    torch.ops._C.persistent_topk(logits, lengths, indices, workspace, top_k, width)
+    torch.cuda.synchronize()
+    assert_topk(torch, logits, indices, lengths)
+
+
+def test_bf16_strided_columns_are_rejected(topk_runtime):
+    torch = topk_runtime
+    logits = torch.empty((1, 2048), dtype=torch.bfloat16, device="cuda")[:, ::2]
+    lengths = torch.full((1,), 1024, dtype=torch.int32, device="cuda")
+    indices = torch.empty((1, 512), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    with pytest.raises(
+        RuntimeError, match="bfloat16 logits columns must be contiguous"
+    ):
+        torch.ops._C.persistent_topk(logits, lengths, indices, workspace, 512, 1024)
 
 
 @pytest.mark.parametrize("top_k", [512, 2048])

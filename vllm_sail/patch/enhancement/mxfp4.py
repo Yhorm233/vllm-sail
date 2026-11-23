@@ -551,12 +551,6 @@ def install() -> None:
         activation_key=None,
     ):
         if mxfp4_backend in _ppu_backends("w4a16"):
-            import vllm.envs as envs
-
-            if (envs.VLLM_MARLIN_INPUT_DTYPE or "").lower() in ("int8", "fp8"):
-                raise ValueError(
-                    "PPU MXFP4 BF16 experts require 16-bit activation weight packing; unset VLLM_MARLIN_INPUT_DTYPE."
-                )
             mxfp4_backend = oracle.Mxfp4MoeBackend.MARLIN
         if mxfp4_backend in _ppu_backends("w4a16mma"):
             from vllm_sail.model_executor.layers.fused_moe.deep_gemm_utils import (
@@ -630,12 +624,6 @@ def install() -> None:
         _cache_permute_indices: dict | None = None,
     ):
         if mxfp4_backend in _ppu_backends("w4a16"):
-            import vllm.envs as envs
-
-            if (envs.VLLM_MARLIN_INPUT_DTYPE or "").lower() in ("int8", "fp8"):
-                raise ValueError(
-                    "PPU MXFP4 BF16 experts require 16-bit activation weight packing; unset VLLM_MARLIN_INPUT_DTYPE."
-                )
             mxfp4_backend = oracle.Mxfp4MoeBackend.MARLIN
         if mxfp4_backend in _ppu_backends("w4a16mma"):
             from vllm_sail.model_executor.layers.fused_moe.deep_gemm_utils import (

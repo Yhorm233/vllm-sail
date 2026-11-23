@@ -16,7 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
-from .loading import guard_weights
+from .loading import guard_weights, reject_direct_reload
 from .quant_utils import dequantize_fp8, quantize_int8
 
 
@@ -36,6 +36,7 @@ class Fp8SourceMoE:
         params_dtype,
         **extra_weight_attrs,
     ):
+        reject_direct_reload()
         if params_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("Conversion requires BF16 or FP16 activations")
         if (
@@ -209,6 +210,7 @@ class Fp8ToBf16MoEMethod(Fp8SourceMoE, UnquantizedFusedMoEMethod):
         self.supports_pre_processed_weights = False
 
     def process_weights_after_loading(self, layer):
+        reject_direct_reload()
         if self.converted:
             return
         self._convert(layer, to_int8=False)
@@ -232,6 +234,7 @@ class Fp8ToInt8MoEMethod(Fp8SourceMoE, FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
+        reject_direct_reload()
         if self.converted:
             return
         from vllm.model_executor.layers.fused_moe.oracle import int8 as oracle

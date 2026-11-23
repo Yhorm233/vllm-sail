@@ -30,12 +30,12 @@ replacing a module-global ``@triton.jit`` helper effective.
 
 from __future__ import annotations
 
-from vllm.models.step5.nvidia.ops import (
+from vllm.models.step5.common.ops import (
     indexer_norm_rope as _indexer,
-    qkv_indexer_norm_rope as _joint,
     sparse_indexer_scores as _scores,
     summary_update as _summary,
 )
+from vllm.models.step5.nvidia.ops import qkv_indexer_norm_rope as _joint
 
 from vllm_sail.models.step5.ops import soft_fp8
 from vllm_sail.patch.utils import patch
@@ -64,7 +64,7 @@ def _install(module: str, name: str, replacement) -> None:
 
 # Device helpers: resolved by upstream kernels through module globals.
 _install(
-    "vllm.models.step5.nvidia.ops.summary_update",
+    "vllm.models.step5.common.ops.summary_update",
     "_store_summary",
     soft_fp8._store_summary,
 )
@@ -76,7 +76,7 @@ _install(
 
 # Launch sites: E4M3 query arguments are passed as bytes on PPU.
 _install(
-    "vllm.models.step5.nvidia.ops.indexer_norm_rope",
+    "vllm.models.step5.common.ops.indexer_norm_rope",
     "_indexer_norm_rope",
     soft_fp8.ByteFP8Launch(
         _indexer._indexer_norm_rope,
@@ -96,14 +96,14 @@ _install(
     ),
 )
 _install(
-    "vllm.models.step5.nvidia.ops.sparse_indexer_scores",
+    "vllm.models.step5.common.ops.sparse_indexer_scores",
     "_direct_scores",
     soft_fp8.ByteFP8Launch(
         _scores._direct_scores, soft_fp8._direct_scores, byte_args=(0,)
     ),
 )
 _install(
-    "vllm.models.step5.nvidia.ops.sparse_indexer_scores",
+    "vllm.models.step5.common.ops.sparse_indexer_scores",
     "_paged_scores_sm90",
     soft_fp8.ByteFP8Launch(
         _scores._paged_scores_sm90, soft_fp8._paged_scores_sm90, byte_args=(0,)

@@ -143,6 +143,53 @@ def test_invalid_checkpoint_metadata(changes):
         validate_fp8_config(config)
 
 
+@pytest.mark.parametrize("mode", ["layerwise", "direct"])
+def test_direct_reload_guard_is_lazy_and_explicit(modules, mode):
+    modules("vllm", envs=SimpleNamespace(VLLM_RELOAD_MODE=mode))
+    reject = function(
+        QUANT + "online_conversion/loading.py", "reject_direct_reload", {}
+    )
+    if mode == "direct":
+        with pytest.raises(ValueError, match="VLLM_RELOAD_MODE=direct"):
+            reject()
+    else:
+        assert reject() is None
+
+
+@pytest.mark.parametrize(
+    "file,name,args",
+    [
+        (
+            "linear",
+            "Fp8ConversionLinearMethod.create_weights",
+            [128, [128], 128, 128, None],
+        ),
+        ("moe", "Fp8SourceMoE.create_weights", [4, 128, 128, None]),
+        ("linear", "Fp8ConversionLinearMethod.process_weights_after_loading", []),
+        ("moe", "Fp8ToBf16MoEMethod.process_weights_after_loading", []),
+        ("moe", "Fp8ToInt8MoEMethod.process_weights_after_loading", []),
+    ],
+)
+@pytest.mark.parametrize("converted", [False, True])
+def test_direct_reload_fails_before_allocation_or_one_shot_return(
+    modules, file, name, args, converted
+):
+    """真实入口在读取权重、分配内存或 converted 提前返回前拒绝 direct。"""
+    modules("vllm", envs=SimpleNamespace(VLLM_RELOAD_MODE="direct"))
+    reject = function(
+        QUANT + "online_conversion/loading.py", "reject_direct_reload", {}
+    )
+    entry = function(
+        QUANT + f"online_conversion/{file}.py", name, {"reject_direct_reload": reject}
+    )
+    method = SimpleNamespace(converted=converted)
+    layer = SimpleNamespace()
+    with pytest.raises(ValueError, match="restart with the source checkpoint"):
+        entry(method, layer, *args)
+    assert vars(layer) == {}
+    assert vars(method) == {"converted": converted}
+
+
 def test_config_validation_does_not_mutate_input():
     config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
     before = repr(config)

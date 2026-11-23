@@ -80,7 +80,6 @@ def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
                 is_pooling_model=self.is_pooling_model,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
-                use_replayssm=self.cache_config.use_replayssm,
                 slot_mapping_modes=slot_mapping_modes,
             )
 
@@ -122,6 +121,7 @@ def rejection_sample(
     fly_window_size: int = 0,
     fly_entropy_threshold: float = 0.3,
     fly_entropy_top_k: int = 3,
+    skip_masked_vocab_blocks: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     draft_logits = None
@@ -408,6 +408,7 @@ def rejection_sample(
         CONTEXT_WIDTH=context_width,
         WATERMARK=watermark,
         DEDUPLICATE_CONTEXTS=watermarking_skip_mask is not None,
+        SKIP_MASKED_BLOCKS=skip_masked_vocab_blocks,
     )
 
     # Insert the resampled tokens into the output sampled.
@@ -424,7 +425,9 @@ def rejection_sample(
         expanded_idx_mapping,
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        # PPU MODIFICATION: begin
         # Keep the PPU sampled-count update within one warp.
         num_warps=1,
+        # PPU MODIFICATION: end
     )
     return sampled, num_sampled

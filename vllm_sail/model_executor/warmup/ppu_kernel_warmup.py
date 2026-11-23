@@ -12,9 +12,12 @@ from typing import TYPE_CHECKING
 # These globals are supplied by bind_body; keep imports static-only.
 if TYPE_CHECKING:
     from vllm.model_executor.warmup.kernel_warmup import (
+        _rocm_aiter_gemm_warmup,
         _warmup_bf16x3_router_gemm,
+        _warmup_flashinfer_attention,
         _warmup_gemm_rs_ar,
         _warmup_ll_bf16_router_gemm,
+        _warmup_skinny_gemm,
         b12x_warmup,
         current_platform,
         cutedsl_warmup,
@@ -28,10 +31,10 @@ if TYPE_CHECKING:
         kimi_k3_triton_warmup,
         logger,
         mamba_triton_warmup,
-        mixed_batch_attention_warmup,
         qwen4_exp_qsa_triton_warmup,
         qwen_triton_warmup,
         qwen_vl_triton_warmup,
+        replayssm_lifecycle_warmup,
         time,
         watermark_sample_warmup,
     )
@@ -71,6 +74,7 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
     qwen_vl_triton_warmup(worker.model_runner)
     mamba_triton_warmup(worker.model_runner)
+    replayssm_lifecycle_warmup(worker.model_runner)
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
@@ -96,6 +100,11 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
         # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
         # to the shared JIT warmup infrastructure.
         # https://github.com/vllm-project/vllm/pull/47451
+        # PPU MODIFICATION: begin
+        # PPU 继承 CUDA 身份，但不能导入 NVIDIA skinny GEMM 的 CuTeDSL 实现。
+        if not current_platform.is_ppu():
+            _warmup_skinny_gemm(worker.get_model())
+        # PPU MODIFICATION: end
         cutedsl_warmup()
 
     if process_local_only:
@@ -107,6 +116,7 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
         )
 
         rocm_segmented_attn_autotune_warmup(worker)
+        _rocm_aiter_gemm_warmup(worker)
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
@@ -123,7 +133,9 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
 
     b12x_warmup(worker, cudagraph_capture_sizes)
 
+    # PPU MODIFICATION: begin
     if current_platform.is_cuda() and not current_platform.is_ppu():
+        # PPU MODIFICATION: end
         # The MSA kernels, and the CuTe DSL their modules import, are CUDA-only.
         from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
             minimax_m3_msa_warmup,
@@ -151,26 +163,4 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
-    # FlashInfer attention warmup
-    # Only warmup if the model has FlashInfer attention groups
-    # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
-    if (
-        not worker.model_runner.is_pooling_model
-        and worker.model_runner.attn_groups
-        # NOTE: This should be `any` instead of `all` but other hybrid attention
-        # backends don't support this dummy run. Once we remove
-        # `build_for_cudagraph_capture`, we can change it to `any`.
-        and all(
-            _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
-            for group in groups
-        )
-    ):
-        logger.info_once("Warming up FlashInfer attention.")
-        mixed_batch_attention_warmup(worker)
+    _warmup_flashinfer_attention(worker)

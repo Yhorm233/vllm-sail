@@ -8,6 +8,53 @@ import pytest
 pytestmark = pytest.mark.ppu
 
 
+@pytest.mark.parametrize("tokens", [16, 4096])
+@pytest.mark.parametrize("heads", [32, 64])
+def test_mxfp4_builder_copies_grouped_schedule(monkeypatch, tokens, heads):
+    """The builder must accommodate the real grouped DeepGEMM metadata ABI."""
+    import torch
+
+    import vllm_sail
+
+    vllm_sail.register_out_of_tree()
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_ppu() or torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("Grouped MXFP4 metadata requires Zhenwu M890")
+
+    from vllm_sail.patch.enhancement.attention import mla_indexer
+    from vllm_sail.utils import deep_gemm
+
+    # Isolate the upstream constructor's unrelated model/distributed setup.
+    # The patched constructor and metadata producer are both real providers.
+    def upstream_init(builder):
+        builder.device = "cuda"
+        builder.indexer_uses_fp4 = True
+        builder.kv_cache_spec = SimpleNamespace(
+            indexer_n_head=heads, indexer_q_head_dim=128
+        )
+        builder.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=tokens),
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace()),
+        )
+
+    monkeypatch.setattr(mla_indexer, "_upstream_builder_init", upstream_init)
+    builder = SimpleNamespace()
+    mla_indexer._builder_init_wrapper(builder)
+    contexts = torch.full((tokens, 1), 128, dtype=torch.int32, device="cuda")
+    request_ids = torch.arange(tokens, dtype=torch.int32, device="cuda") // 2
+    metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        contexts, 64, builder.num_sms, (1, heads, 128, torch.int8), indices=request_ids
+    )
+    assert metadata.shape[1] == 4
+    assert metadata.shape[0] > tokens
+    # Exact operation in the upstream builder; no padding/truncation adapter.
+    schedule = builder.scheduler_metadata_buffer[: metadata.shape[0]]
+    schedule[:] = metadata
+    torch.cuda.synchronize()
+    assert torch.equal(schedule, metadata)
+
+
 def _allocate_v41_indexer_cache(compress_ratio, dim):
     import torch
     from vllm.models.deepseek_v41.attention import DeepseekV4IndexerCache

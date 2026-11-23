@@ -160,8 +160,10 @@ class _AttentionBackendEnum(enum.Enum):
 
 def _moe_config(*, batched: bool = False, has_bias: bool = False, backend="auto"):
     return types.SimpleNamespace(
-        moe_parallel_config=types.SimpleNamespace(
-            use_batched_activation_format=batched
+        activation_format=(
+            _ActivationFormat.BatchedExperts
+            if batched or backend == "batched_triton"
+            else _ActivationFormat.Standard
         ),
         moe_backend=backend,
         has_bias=has_bias,

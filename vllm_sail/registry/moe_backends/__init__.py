@@ -65,6 +65,9 @@ _ORACLE_ALIAS_CONSUMERS = {
         ),
     },
     "mxfp4": {
+        "_backend_activation_key": (
+            "vllm.model_executor.layers.quantization.online.mxfp4",
+        ),
         "backend_to_kernel_cls": (
             "vllm.model_executor.layers.quantization.mxfp4",
             "vllm.model_executor.layers.quantization.quark.quark_moe",

@@ -44,15 +44,13 @@ def _weight_permutation(num_bits: int, is_a_8bit: bool) -> tuple[int, ...]:
     )
 
 
-def gptq_marlin_repack(
-    b_q_weight, size_k: int, size_n: int, num_bits: int, is_a_8bit: bool
-):
+def gptq_marlin_repack(b_q_weight, size_k: int, size_n: int, num_bits: int):
     import torch
 
     if num_bits not in (4, 8):
         raise ValueError("Marlin repacking supports 4 or 8 bits")
     pack = 32 // num_bits
-    tile_k = 32 if is_a_8bit else 16
+    tile_k = 16
     if size_k % tile_k or size_n % 64:
         raise ValueError(
             "Marlin repacking requires aligned K tiles and N divisible by 64"
@@ -68,9 +66,7 @@ def gptq_marlin_repack(
     ).reshape(size_k, size_n)
     tiled = unpacked.reshape(size_k // tile_k, tile_k, size_n // 16, 16)
     tiled = tiled.permute(0, 2, 1, 3).reshape(size_k // 16, size_n * 16)
-    order = torch.tensor(
-        _weight_permutation(num_bits, is_a_8bit), device=b_q_weight.device
-    )
+    order = torch.tensor(_weight_permutation(num_bits, False), device=b_q_weight.device)
     tiled = (
         tiled.reshape(-1, order.numel())
         .index_select(1, order)
@@ -106,7 +102,7 @@ def install() -> None:
     if not hasattr(torch.ops._C, "gptq_marlin_repack"):
         library = torch.library.Library("_C", "FRAGMENT")
         library.define(
-            "gptq_marlin_repack(Tensor b_q_weight, SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor"
+            "gptq_marlin_repack(Tensor b_q_weight, SymInt size_k, SymInt size_n, int num_bits) -> Tensor"
         )
         library.impl("gptq_marlin_repack", gptq_marlin_repack, "CUDA")
         _libraries.append(library)

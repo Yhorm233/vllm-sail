@@ -73,12 +73,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     Tensor !lora_ids,"
       "                     Tensor? maybe_expert_map) -> () ");
 #ifndef USE_ROCM
+  #ifdef VLLM_ENABLE_LUT_B_MOE
+  #endif
 
   // Apply grouped topk routing to select experts.
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "
       "topk_group, int topk, bool renormalize, float "
-      "routed_scaling_factor, Tensor bias, int scoring_func) -> (Tensor, "
+      "routed_scaling_factor, Tensor bias, int scoring_func, Tensor? "
+      "is_padding=None) -> (Tensor, "
       "Tensor)");
 #endif
 }
@@ -97,6 +100,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
          TORCH_BOX(&batched_moe_align_block_size));
   m.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
 #ifndef USE_ROCM
+  #ifdef VLLM_ENABLE_LUT_B_MOE
+  #endif
   m.impl("grouped_topk", TORCH_BOX(&grouped_topk));
 #endif
 }

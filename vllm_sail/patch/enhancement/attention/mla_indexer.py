@@ -338,10 +338,17 @@ def _builder_init_wrapper(self, *args, **kwargs) -> None:
     from vllm_sail.utils.deep_gemm import get_num_sms
 
     self.num_sms = get_num_sms()
-    # All reference policies size schedules by their selected blocks per CU.
-    # Upstream narrows this capacity to the actual returned metadata shape.
+    # Grouped MXFP4 schedules contain four int32 fields per row plus one
+    # row per expanded query. Legacy INT8/FP8 schedules have two fields and
+    # no query rows. Reserve the full decode capacity before graph capture;
+    # upstream narrows only the row dimension when copying each schedule.
+    rows = self.num_sms * _indexer_module.PPU_DEEP_GEMM_TB_PER_CU + 1
+    columns = 2
+    if self.indexer_uses_fp4:
+        rows += self.vllm_config.scheduler_config.max_num_batched_tokens
+        columns = 4
     self.scheduler_metadata_buffer = torch.empty(
-        (self.num_sms * _indexer_module.PPU_DEEP_GEMM_TB_PER_CU + 1, 2),
+        (rows, columns),
         dtype=torch.int32,
         device=self.device,
     )

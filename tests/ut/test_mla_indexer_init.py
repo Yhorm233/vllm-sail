@@ -8,7 +8,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tests.support.modules import load_patch
-from tests.support.source import assert_accepts_upstream_keywords
+from tests.support.source import assert_accepts_upstream_keywords, function
 
 PATCH = "vllm_sail/patch/enhancement/attention/mla_indexer.py"
 TARGET = "vllm.v1.attention.backends.mla.indexer"
@@ -32,6 +32,7 @@ def builder_factory(modules, patch_utils_module):
         capability=89,
         text_heads=32,
         kpool=1,
+        max_tokens=4096,
     ):
         calls = []
 
@@ -49,6 +50,7 @@ def builder_factory(modules, patch_utils_module):
                 self.num_sms = 3
                 self.scheduler_metadata_buffer = NS(shape=("upstream",))
                 self.vllm_config = NS(
+                    scheduler_config=NS(max_num_batched_tokens=max_tokens),
                     model_config=NS(
                         hf_config=NS(model_type="multimodal_wrapper"),
                         hf_text_config=NS(
@@ -56,7 +58,7 @@ def builder_factory(modules, patch_utils_module):
                             index_head_dim=128,
                             index_kpool=kpool,
                         ),
-                    )
+                    ),
                 )
 
             @staticmethod
@@ -143,6 +145,33 @@ def builder_factory(modules, patch_utils_module):
     return make
 
 
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("capability", [80, 89])
+def test_fused_mqa_topk_schema_does_not_select_sm100_on_ppu(
+    upstream_source_root, capability
+):
+    """CUDA 兼容身份与 stub schema 不能绕过 SM100 的真实设备门控。"""
+
+    class Ops:
+        def __getattr__(self, name):
+            raise AssertionError("PPU 不应探测或调用未编译的 fused MQA op")
+
+    available = function(
+        upstream_source_root
+        / "vllm/model_executor/kernels/attention/dsa/fused_mqa_topk.py",
+        "fused_mqa_topk_available",
+        {
+            "current_platform": NS(
+                is_cuda=lambda: True,
+                is_device_capability_family=lambda family: capability // 10
+                == family // 10,
+            ),
+            "torch": NS(ops=NS(_C=Ops())),
+        },
+    )
+    assert available() is False
+
+
 def test_ppu_fp4_constructor_delegates_then_adds_fork_state(builder_factory):
     builder_cls, calls = builder_factory(ppu=True, fp4=True)
     builder = builder_cls("config", block_table_width=29, device="ppu:0")
@@ -152,7 +181,7 @@ def test_ppu_fp4_constructor_delegates_then_adds_fork_state(builder_factory):
     assert builder.indexer_n_head == 64
     assert builder.indexer_q_head_dim == 128
     assert builder.num_sms == 7
-    assert builder.scheduler_metadata_buffer.shape == (7 * 8 + 1, 2)
+    assert builder.scheduler_metadata_buffer.shape == (7 * 8 + 1 + 4096, 4)
     assert builder.scheduler_metadata_buffer.dtype == "int32"
     assert builder.scheduler_metadata_buffer.device == "ppu:0"
 
@@ -167,6 +196,19 @@ def test_ppu_fp8_constructor_keeps_geometry_and_reserves_sail_schedule(builder_f
     assert builder.indexer_q_head_dim == 128
     assert builder.num_sms == 7
     assert builder.scheduler_metadata_buffer.shape == (7 * 8 + 1, 2)
+
+
+@pytest.mark.parametrize("max_tokens", [16, 4096, 8192])
+def test_fp4_schedule_can_copy_full_expanded_query_batch(builder_factory, max_tokens):
+    builder_cls, _ = builder_factory(ppu=True, fp4=True, max_tokens=max_tokens)
+    builder = builder_cls("config")
+    rows, columns = builder.scheduler_metadata_buffer.shape
+    # The grouped SAIL ABI adds one row per query, including MTP queries
+    # sharing a request. The upstream copy slices rows, never columns.
+    for blocks_per_cu in (1, 2, 4, 8):
+        returned_shape = (builder.num_sms * blocks_per_cu + 1 + max_tokens, 4)
+        assert rows >= returned_shape[0]
+        assert columns == returned_shape[1]
 
 
 def test_legacy_indexer_derives_missing_geometry_from_model_config(builder_factory):

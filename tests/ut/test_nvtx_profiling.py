@@ -800,3 +800,313 @@ def test_sche_mark_format_with_nvtx(
         "total_tokens=5,req_id:num_tokens={'r1': 5}",
         "finish_req: {'z'}",
     ]
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("outcome", ["output", "sample", "failure"])
+def test_real_engine_steps_keep_aborts_after_wait_and_close_ranges(
+    upstream_source_root,
+    profiling_pkg,
+    fake_vllm,
+    nvtx_stub,
+    monkeypatch,
+    queued,
+    outcome,
+):
+    """执行完整真实 step；仅在 executor、scheduler 和诊断边界替身。"""
+    from collections import deque
+    from concurrent.futures import Future
+    from contextlib import contextmanager
+    from typing import cast
+
+    from tests.support.source import function
+
+    path = upstream_source_root / "vllm/v1/engine/core.py"
+    name = "step_with_batch_queue" if queued else "step"
+    provider = function(path, "EngineCore." + name, {"Future": Future, "cast": cast})
+    monkeypatch.setattr(fake_vllm.EngineCore, name, provider)
+    monkeypatch.setenv("VLLM_SAIL_NVTX_PROFILE", "1")
+    profiling_pkg.install()
+    tracing = importlib.import_module("vllm_sail.profiling.nvtx")
+    pushes, pops, calls = [], [], []
+    monkeypatch.setattr(tracing, "_torch_range_push", pushes.append)
+    monkeypatch.setattr(tracing, "_torch_range_pop", lambda: pops.append(1))
+    core = fake_vllm.EngineCore()
+    output, model_output, details, grammar = object(), object(), object(), object()
+    scheduled = _sched_output()
+    deferred = queued and outcome == "sample"
+    next_scheduled = _sched_output(pending_structured_output_tokens=True)
+    drafts = object()
+    sampled_future = Future()
+    sampled_future.set_result(model_output)
+    error = RuntimeError("owned executor failed")
+    future, exec_future = Future(), Future()
+    if outcome == "failure":
+        (exec_future if queued else future).set_exception(error)
+        if queued:
+            future.set_result(None)
+    else:
+        future.set_result(None if outcome == "sample" and not queued else model_output)
+        exec_future.set_result(None)
+
+    @contextmanager
+    def capture(actual):
+        assert actual is scheduled
+        yield details
+
+    @contextmanager
+    def diagnostic(actual):
+        assert actual is scheduled or (deferred and actual is next_scheduled)
+        calls.append("diagnostic-enter")
+        try:
+            yield
+        finally:
+            calls.append("diagnostic-exit")
+
+    def execute(actual, *, non_block):
+        assert actual is (next_scheduled if deferred else scheduled)
+        assert non_block is True
+        calls.append("execute")
+        return exec_future if deferred else future
+
+    def sample(actual, *, non_block=False):
+        assert actual is grammar and non_block is deferred
+        calls.append("sample")
+        return sampled_future if deferred else model_output
+
+    def grammar_bitmask(actual):
+        assert actual is (next_scheduled if deferred else scheduled)
+        if deferred:
+            calls.append(("grammar", actual))
+        return grammar
+
+    def update_drafts(value, actual):
+        assert value is drafts and actual is next_scheduled
+        calls.append(("drafts", value, actual))
+
+    def update(actual, value):
+        assert actual is scheduled and value is model_output
+        assert calls[-1] == "aborts"
+        calls.append("update")
+        return output
+
+    core.scheduler = SimpleNamespace(
+        has_requests=lambda: not queued or deferred,
+        schedule=lambda throttle: (next_scheduled if deferred else scheduled)
+        if throttle is True
+        else pytest.fail("throttle lost"),
+        get_grammar_bitmask=grammar_bitmask,
+        update_from_output=update,
+        update_draft_token_ids_in_output=update_drafts,
+    )
+
+    def take_drafts():
+        calls.append("take-drafts")
+        return drafts
+
+    core.model_executor = SimpleNamespace(
+        execute_model=execute,
+        sample_tokens=sample,
+        take_draft_token_ids=take_drafts,
+    )
+    core.is_mm_encoder_only = core.is_pooling_model = False
+    core.check_for_draft_tokens = deferred
+    core._should_throttle_prefills = lambda: True
+    core.capture_iteration_details = capture
+    core.log_error_detail = diagnostic
+    core._wait_for_output = types.MethodType(
+        function(path, "EngineCore._wait_for_output", {}), core
+    )
+    core._process_aborts_queue = lambda: calls.append("aborts")
+    core._attach_iteration_details = lambda actual, value: calls.append((actual, value))
+    core._attach_weight_version = lambda actual: calls.append(("weight", actual))
+    core.batch_queue = deque([(future, scheduled, exec_future)])
+    core.batch_queue_size = 2
+    if outcome == "failure":
+        with pytest.raises(RuntimeError) as raised:
+            getattr(core, name)()
+        assert raised.value is error
+        assert calls[-1] == "diagnostic-exit" and "aborts" not in calls
+    else:
+        result, executed = getattr(core, name)()
+        assert result is output and executed is (not queued or deferred)
+        abort_index = calls.index("aborts")
+        assert calls[abort_index : abort_index + 4] == [
+            "aborts",
+            "update",
+            (output, details),
+            ("weight", output),
+        ]
+        assert ("sample" in calls) is (outcome == "sample")
+        if deferred:
+            assert calls[abort_index + 4 :] == [
+                "take-drafts",
+                ("drafts", drafts, next_scheduled),
+                ("grammar", next_scheduled),
+                "sample",
+            ]
+            assert list(core.batch_queue) == [
+                (sampled_future, next_scheduled, exec_future)
+            ]
+        elif queued:
+            assert not core.batch_queue
+    assert pushes == ["[prof_range]: iter 0"] and pops == [1]
+    assert core.iteration == 1
+    assert (
+        original_of(
+            getattr(fake_vllm.EngineCore, name),
+            "vllm.v1.engine.core.EngineCore." + name,
+        )
+        is provider
+    )
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_real_no_forward_runner_keeps_state_updates_and_exception_identity(
+    upstream_source_root,
+    profiling_pkg,
+    fake_vllm,
+    nvtx_stub,
+    monkeypatch,
+    v2,
+    fail,
+):
+    from contextlib import nullcontext
+
+    from tests.support.source import function
+
+    calls, pushes, pops = [], [], []
+    result, error = object(), RuntimeError("state update failed")
+    source = "gpu/model_runner.py" if v2 else "gpu_model_runner.py"
+    provider = function(
+        upstream_source_root / "vllm/v1/worker" / source,
+        "GPUModelRunner.execute_model",
+        {
+            "has_kv_transfer_group": lambda: False,
+            "has_ec_transfer": lambda: False,
+            "record_function_or_nullcontext": lambda label: nullcontext(),
+            "EMPTY_MODEL_RUNNER_OUTPUT": result,
+        },
+    )
+    cls = fake_vllm.GPUModelRunnerV2 if v2 else fake_vllm.GPUModelRunner
+    monkeypatch.setattr(cls, "execute_model", provider)
+    monkeypatch.setenv("VLLM_SAIL_NVTX_PROFILE", "1")
+    profiling_pkg.install()
+    tracing = importlib.import_module("vllm_sail.profiling.nvtx")
+    monkeypatch.setattr(tracing, "_torch_range_push", pushes.append)
+    monkeypatch.setattr(tracing, "_torch_range_pop", lambda: pops.append(1))
+    owner = cls()
+    scheduled = _sched_output(total_num_scheduled_tokens=0, num_scheduled_tokens={})
+
+    def update(actual):
+        assert actual is scheduled
+        calls.append("update")
+        if fail:
+            raise error
+
+    if v2:
+        owner.draft_tokens_handler = SimpleNamespace(
+            begin_step=lambda actual: calls.append(("begin", actual))
+        )
+        owner.update_pp_decode_requests = lambda: calls.append("pp")
+        owner.finish_requests = update
+        owner.free_states = lambda actual: calls.append(("free", actual))
+        owner.add_requests = lambda actual: calls.append(("add", actual))
+        owner.update_requests = lambda actual: calls.append(("requests", actual))
+        owner.encoder_cache = owner.aux_output_connector = None
+        owner.block_tables = SimpleNamespace(
+            apply_staged_writes=lambda: calls.append("writes")
+        )
+        owner.kv_connector = SimpleNamespace(
+            no_forward=lambda actual: result
+            if actual is scheduled
+            else pytest.fail("schedule lost")
+        )
+        owner._merge_ec_connector_no_forward = (
+            lambda actual, value: value
+            if actual is scheduled
+            else pytest.fail("schedule lost")
+        )
+    else:
+        owner.execute_model_state = owner.speculative_config = None
+        owner.synchronize_input_prep = nullcontext
+        owner._update_states = update
+    if fail:
+        with pytest.raises(RuntimeError) as raised:
+            owner.execute_model(scheduled)
+        assert raised.value is error
+    else:
+        assert owner.execute_model(scheduled) is result
+    expected = [("begin", scheduled), "pp", "update"] if v2 else ["update"]
+    if v2 and not fail:
+        expected += [
+            ("free", scheduled),
+            ("add", scheduled),
+            ("requests", scheduled),
+            "writes",
+        ]
+    assert calls == expected
+    expected_pushes = ["[prof_range]: iter 0"]
+    if v2:
+        expected_pushes.append("total bs=0, P bs=0")
+    assert pushes == expected_pushes
+    assert len(pops) == (2 if v2 else 1) and owner.iteration == 1
+    if not v2:
+        assert owner._ppu_nvtx_prof_scheduler_output is None
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("deferred", [False, True])
+def test_real_scheduler_update_preserves_output_sets_and_inflight_fence(
+    upstream_source_root,
+    profiling_pkg,
+    fake_vllm,
+    nvtx_stub,
+    monkeypatch,
+    deferred,
+):
+    from tests.support.source import function
+
+    provider = function(
+        upstream_source_root / "vllm/v1/core/sched/scheduler.py",
+        "Scheduler._update_after_schedule",
+        {},
+    )
+    monkeypatch.setattr(fake_vllm.Scheduler, "_update_after_schedule", provider)
+    monkeypatch.setenv("VLLM_SAIL_NVTX_PROFILE", "1")
+    profiling_pkg.install()
+    owner = fake_vllm.Scheduler()
+
+    class RequestBoundary:
+        def __init__(self):
+            self.num_computed_tokens = 3
+            self.num_in_flight_tokens = 1
+            self.num_tokens = 5
+            self.num_output_placeholders = 0
+            self.use_structured_output = True
+            self.last_sched_seq = 7
+
+    request = RequestBoundary()
+    owner.requests = {"r1": request}
+    owner.defer_block_free, owner.sched_step_seq = deferred, 11
+    owner._inflight_prefills = {request}
+    owner.finished_req_ids, owner.reset_preempted_req_ids = {"r9"}, {"r8"}
+    output = _sched_output(
+        num_scheduled_tokens={"r1": 2},
+        finished_req_ids=owner.finished_req_ids,
+        preempted_req_ids=owner.reset_preempted_req_ids,
+        has_structured_output_requests=False,
+    )
+    assert owner._update_after_schedule(output) is None
+    assert (request.num_computed_tokens, request.num_in_flight_tokens) == (5, 3)
+    assert request.last_sched_seq == (11 if deferred else 7)
+    assert not request.is_prefill_chunk and not owner._inflight_prefills
+    assert output.has_structured_output_requests is True
+    assert output.finished_req_ids == {"r9"} and output.preempted_req_ids == {"r8"}
+    assert not owner.finished_req_ids and not owner.reset_preempted_req_ids
+    assert output.finished_req_ids is not owner.finished_req_ids
+    assert output.preempted_req_ids is not owner.reset_preempted_req_ids
+    assert "finish_req: {'r9'}" in nvtx_stub["marks"]

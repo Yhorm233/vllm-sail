@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from types import SimpleNamespace as NS
 
 import pytest
@@ -28,7 +31,11 @@ def gdn_provider(modules, monkeypatch, upstream_source_root):
         has_device_capability=lambda _: True,
     )
     modules("vllm.platforms", current_platform=platform)
-    logger = NS(info_once=lambda *a: None, warning_once=lambda *a: None)
+    logger = NS(
+        info_once=lambda *a: None,
+        warning_once=lambda *a: None,
+        warning=lambda *a: pytest.fail(f"意外的环境因子警告：{a}"),
+    )
     modules("vllm.logger", init_logger=lambda _: logger)
     torch = NS(
         float32="fp32",
@@ -52,10 +59,31 @@ def gdn_provider(modules, monkeypatch, upstream_source_root):
             raise ValueError("upstream choice rejected")
         return value
 
+    def ignored_getter():
+        pytest.fail("上游忽略的缓存路径及凭据 getter 不应求值")
+
     env_module = modules(
-        "vllm.envs", environment_variables={"VLLM_GDN_DECODE_KERNEL": original_getter}
+        "vllm.envs",
+        environment_variables={
+            "VLLM_GDN_DECODE_KERNEL": original_getter,
+            "SAIL_TEST_UNRELATED": lambda: 7,
+            "VLLM_CACHE_ROOT": ignored_getter,
+            "VLLM_API_KEY": ignored_getter,
+        },
+        os=os,
+        logger=logger,
     )
     env_module.__getattr__ = lambda name: env_module.environment_variables[name]()
+    # 真实 normalize_value 的 primitive 分支；不导入 Torch/config 全模块。
+    modules(
+        "vllm.config.utils",
+        normalize_value=function(
+            upstream_source_root / "vllm/config/utils.py", "normalize_value", {}
+        ),
+    )
+    original_compile_factors = function(
+        upstream_source_root / "vllm/envs.py", "compile_factors", env_module.__dict__
+    )
     path = (
         upstream_source_root
         / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
@@ -128,6 +156,7 @@ def gdn_provider(modules, monkeypatch, upstream_source_root):
         provider=provider,
         originals=originals,
         original_getters=original_getters,
+        original_compile_factors=original_compile_factors,
     )
 
 
@@ -136,6 +165,7 @@ def gdn_provider(modules, monkeypatch, upstream_source_root):
     "attribute",
     [
         "environment_variables",
+        "compile_factors",
         "__init__",
         "_fused_gdn_decode_unsupported_reason",
         "_can_use_fused_gdn_mtp_decode",
@@ -147,9 +177,14 @@ def test_decode_patches_record_originals_and_reject_reapplication(
     from vllm_sail.patch.utils import PATCH_MARKER, patch
 
     f = gdn_provider
-    if attribute == "environment_variables":
+    if attribute in ("environment_variables", "compile_factors"):
         module, target = "vllm.envs", attribute
-        replacement, original = f.env.environment_variables, f.original_getters
+        replacement = getattr(f.env, attribute)
+        original = (
+            f.original_getters
+            if attribute == "environment_variables"
+            else f.original_compile_factors
+        )
     else:
         module = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
         target = f"QwenGatedDeltaNetAttention.{attribute}"
@@ -248,7 +283,12 @@ def test_stub_falls_through_real_upstream_forward_to_normal_core(
     f = gdn_provider
     monkeypatch.setenv("VLLM_SAIL_USE_PLA", "0")
     layer = f.layer(None, f.config)
+    _exercise_real_gdn_forward(f, layer, None)
+
+
+def _exercise_real_gdn_forward(f, layer, qkvz_input):
     calls = []
+    projections = []
 
     class Tensor:
         dtype = "bf16"
@@ -275,7 +315,13 @@ def test_stub_falls_through_real_upstream_forward_to_normal_core(
     )
     f.torch.zeros = lambda *a, **kw: Tensor()
     f.torch.empty = lambda *a, **kw: Tensor()
-    layer.in_proj_qkvz = layer.in_proj_ba = lambda _: (Tensor(), None)
+
+    def project(name, value):
+        projections.append((name, value))
+        return Tensor(), None
+
+    layer.in_proj_qkvz = lambda value: project("qkvz", value)
+    layer.in_proj_ba = lambda value: project("ba", value)
     layer.split_ba = lambda _: (Tensor(), Tensor())
     layer._output_projection = lambda *a: "norm + output"
     layer.key_dim, layer.value_dim, layer.tp_size, layer.prefix = 256, 512, 1, "gdn"
@@ -284,8 +330,25 @@ def test_stub_falls_through_real_upstream_forward_to_normal_core(
         "QwenGatedDeltaNetAttention.forward_cuda",
         dict(torch=f.torch, _encode_layer_name=lambda name: name),
     )
-    assert forward(layer, Tensor()) == "norm + output"
+    hidden = Tensor()
+    assert forward(layer, hidden, qkvz_input=qkvz_input) == "norm + output"
     assert calls == ["normal core"]
+    assert projections == [
+        ("qkvz", hidden if qkvz_input is None else qkvz_input),
+        ("ba", hidden),
+    ]
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_qwen35_direct_cuda_entry_preserves_projection_inputs_and_ppu_core(
+    gdn_provider, monkeypatch, prequantized
+):
+    f = gdn_provider
+    monkeypatch.setenv("VLLM_SAIL_USE_PLA", "0")
+    layer = f.layer(None, f.config)
+    quantized = object() if prequantized else None
+    _exercise_real_gdn_forward(f, layer, quantized)
 
 
 @pytest.mark.upstream_source
@@ -301,3 +364,117 @@ def test_auto_native_selection_updates_the_spec_decode_flag(
     layer = f.layer(None, f.config)
     assert layer.gdn_decode_kernel == "cuda"
     assert layer.enable_fused_gdn_spec_decode is speculative
+
+
+def _real_compile_cache_helpers(f, upstream_source_root, mega):
+    # Config 和 Inductor 是明确边界替身；执行真实共享 helper 和 AOT 调用者。
+    hash_factors = function(
+        upstream_source_root / "vllm/config/utils.py",
+        "hash_factors",
+        dict(hashlib=hashlib, json=json),
+    )
+    namespace = dict(
+        envs=f.env,
+        hash_factors=hash_factors,
+        get_inductor_factors=lambda: ["test-inductor-boundary"],
+    )
+    path = upstream_source_root / "vllm/compilation/caching.py"
+    shared = function(path, "compute_env_and_config_hashes", namespace)
+    aot = function(path, "aot_compile_hash_factors", namespace)
+    f.env.VLLM_USE_MEGA_AOT_ARTIFACT = mega
+    config_factors = {"model": {"dtype": "bf16"}}
+    config = NS(compile_factors=lambda: config_factors)
+    return hash_factors, shared, aot, config, config_factors
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("requested", ["auto", "cuda", "pla", "triton"])
+@pytest.mark.parametrize("mega", [False, True])
+def test_real_jit_aot_factors_track_decode_and_resolved_pla_preference(
+    gdn_provider, monkeypatch, upstream_source_root, requested, mega
+):
+    f = gdn_provider
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", requested)
+    f.torch._C._dispatch_has_kernel_for_dispatch_key = lambda *a: True
+    hash_factors, shared, aot, config, config_factors = _real_compile_cache_helpers(
+        f, upstream_source_root, mega
+    )
+    for key, getter in f.original_getters.items():
+        if key != "VLLM_GDN_DECODE_KERNEL":
+            assert f.env.environment_variables[key] is getter
+    assert f.original_compile_factors.__globals__ is f.env.__dict__
+    hashes = {}
+    # 规范名、legacy alias 以及显式 false/空值覆盖 alias 的优先级。
+    for canonical, legacy, use_pla in (
+        ("1", None, True),
+        (None, "1", True),
+        ("0", "1", False),
+        ("", "1", False),
+        (None, "0", False),
+    ):
+        for name, value in (
+            ("VLLM_SAIL_USE_PLA", canonical),
+            ("VLLM_PPU_USE_PLA", legacy),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        env_hash, config_hash, raw_env, raw_config = shared(config)
+        assert raw_env["VLLM_GDN_DECODE_KERNEL"] == requested
+        assert raw_env["VLLM_SAIL_USE_PLA"] is use_pla
+        assert "VLLM_PPU_USE_PLA" not in raw_env
+        assert raw_env["SAIL_TEST_UNRELATED"] == 7
+        assert "VLLM_CACHE_ROOT" not in raw_env
+        assert "VLLM_API_KEY" not in raw_env
+        assert raw_config is config_factors
+        assert config_hash == hash_factors(config_factors)
+        assert env_hash == hash_factors(raw_env)
+        expected_aot = [env_hash, config_hash]
+        if mega:
+            expected_aot.append("test-inductor-boundary")
+        assert aot(config) == expected_aot
+        layer = f.layer(None, f.config)
+        active = "pla" if requested == "auto" and use_pla else requested
+        if active == "auto":
+            active = "cuda"
+        assert layer.gdn_decode_kernel == active
+        assert layer.enable_fused_gdn_spec_decode is (active == "cuda")
+        if use_pla in hashes:
+            assert env_hash == hashes[use_pla]
+        hashes[use_pla] = env_hash
+    assert hashes[True] != hashes[False]
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("mega", [False, True])
+def test_non_ppu_jit_aot_factors_preserve_upstream_values_and_result_ownership(
+    gdn_provider, monkeypatch, upstream_source_root, mega
+):
+    f = gdn_provider
+    f.platform.ppu = False
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
+    hash_factors, shared, aot, config, config_factors = _real_compile_cache_helpers(
+        f, upstream_source_root, mega
+    )
+    for value in ("0", "1"):
+        monkeypatch.setenv("VLLM_SAIL_USE_PLA", value)
+        original = f.original_compile_factors()
+        assert "VLLM_SAIL_USE_PLA" not in original
+        result = shared(config)
+        assert result == (
+            hash_factors(original),
+            hash_factors(config_factors),
+            original,
+            config_factors,
+        )
+        expected = list(result[:2])
+        if mega:
+            expected.append("test-inductor-boundary")
+        assert aot(config) == expected
+    # 非 PPU wrapper 必须直接返回 provider 的对象，不复制或追加因子。
+    original = f.original_compile_factors()
+    monkeypatch.setitem(
+        f.env.compile_factors.__globals__, "_upstream_compile_factors", lambda: original
+    )
+    assert f.env.compile_factors() is original

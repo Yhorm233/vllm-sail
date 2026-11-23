@@ -31,12 +31,12 @@ import functools
 import torch
 from vllm.models.step5.nvidia import flashinfer_sparse as _sparse
 from vllm.models.step5.nvidia.flashinfer_sparse import Step5FlashInferSparse
-from vllm.models.step5.nvidia.ops import (
+from vllm.models.step5.common.ops import (
     indexer_norm_rope as _indexer,
-    qkv_indexer_norm_rope as _joint,
     sparse_indexer as _pack,
 )
-from vllm.models.step5.nvidia.sparse_summary_cache import (
+from vllm.models.step5.nvidia.ops import qkv_indexer_norm_rope as _joint
+from vllm.models.step5.common.sparse_summary_cache import (
     Step5SparseSummaryCacheLayer,
 )
 
@@ -74,7 +74,7 @@ def _install(module: str, name: str, replacement) -> None:
     )(replacement)
 
 
-# Copied from vllm.models.step5.nvidia.ops.indexer_norm_rope.indexer_norm_rope.
+# Copied from vllm.models.step5.common.ops.indexer_norm_rope.indexer_norm_rope.
 def indexer_norm_rope(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -314,7 +314,7 @@ def qkv_indexer_norm_rope(
     return q.transpose(0, 1), k, w.transpose(0, 1), main_q, main_k, main_v
 
 
-# Copied from vllm.models.step5.nvidia.ops.sparse_indexer._pack_summaries.
+# Copied from vllm.models.step5.common.ops.sparse_indexer._pack_summaries.
 def _pack_summaries(
     mean, block_table, regions, slots=None, seq_lens=None, num_sms=0, *, live_only=False
 ):
@@ -531,12 +531,12 @@ _fp16_logits = bind_body(logits, _sparse)
 # Device helpers resolved by _pack_summary_pages through module globals; with
 # byte summaries they compute upstream's offsets.
 _install(
-    "vllm.models.step5.nvidia.ops.sparse_indexer",
+    "vllm.models.step5.common.ops.sparse_indexer",
     "_copy_summary_page",
     soft_fp8._copy_summary_page,
 )
 _install(
-    "vllm.models.step5.nvidia.ops.sparse_indexer",
+    "vllm.models.step5.common.ops.sparse_indexer",
     "_copy_summary_tile",
     soft_fp8._copy_summary_tile,
 )
@@ -566,7 +566,7 @@ def _pack_summaries_launcher(mean, *args, **kwargs):
 # model.py imports both launchers inside its forward, so the module attributes
 # are what it calls; pack_*summary_pages resolve _pack_summaries the same way.
 _install(
-    "vllm.models.step5.nvidia.ops.indexer_norm_rope",
+    "vllm.models.step5.common.ops.indexer_norm_rope",
     "indexer_norm_rope",
     _indexer_norm_rope_launcher,
 )
@@ -576,14 +576,14 @@ _install(
     _qkv_indexer_norm_rope_launcher,
 )
 _install(
-    "vllm.models.step5.nvidia.ops.sparse_indexer",
+    "vllm.models.step5.common.ops.sparse_indexer",
     "_pack_summaries",
     _pack_summaries_launcher,
 )
 
 
 @patch(
-    "vllm.models.step5.nvidia.sparse_summary_cache",
+    "vllm.models.step5.common.sparse_summary_cache",
     "Step5SparseSummaryCacheLayer.get_kv_cache_spec",
     reason=_REASON,
     affected_versions=_AFFECTED,

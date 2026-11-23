@@ -94,6 +94,40 @@ def test_deep_gemm_helpers_are_rebound_to_the_ppu_wrapper(
     assert f"{module_name}.{attribute}" in getattr(target, PATCH_MARKER)
 
 
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "vllm.model_executor.layers.quantization.fp8",
+        "vllm.model_executor.layers.quantization.input_quant_fp8",
+    ],
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ppu_deep_gemm_consumers_do_not_probe_cuda_jit_compiler(
+    monkeypatch, installed, module_name, enabled
+):
+    """验证真实安装的按值绑定；不启动 nvcc，也不声明 PPU DeepGEMM 计算可用。"""
+    import vllm.utils.deep_gemm as cuda_deep_gemm
+    from vllm.platforms import current_platform
+
+    import vllm_sail.utils.deep_gemm as ppu_deep_gemm
+
+    def forbidden(*args):
+        pytest.fail("PPU support probe must not enter the CUDA nvcc gate")
+
+    monkeypatch.setattr(cuda_deep_gemm, "_deep_gemm_nvcc_path", forbidden)
+    monkeypatch.setattr(cuda_deep_gemm, "_nvcc_version", forbidden)
+    monkeypatch.setattr(type(current_platform), "is_ppu", lambda self: True)
+    monkeypatch.setattr(ppu_deep_gemm.envs, "VLLM_USE_DEEP_GEMM", enabled)
+    monkeypatch.setattr(ppu_deep_gemm, "has_deep_gemm", lambda: True)
+    support = _patched(module_name, "is_deep_gemm_supported")
+    assert support is ppu_deep_gemm.is_deep_gemm_supported
+    support.cache_clear()
+    try:
+        assert support() is enabled
+    finally:
+        support.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # kernel_warmup
 # ---------------------------------------------------------------------------
@@ -187,7 +221,9 @@ def test_kernel_warmup_delegates_off_ppu_and_runs_ppu_warmup_on_ppu(
     for name in (
         "qwen_vl_triton_warmup",
         "mamba_triton_warmup",
+        "replayssm_lifecycle_warmup",
         "_warmup_gemm_rs_ar",
+        "_warmup_flashinfer_attention",
         "flashinfer_sparse_mla_decode_autotune_warmup",
         "deepseek_v4_sparse_mla_attention_warmup",
         "b12x_warmup",

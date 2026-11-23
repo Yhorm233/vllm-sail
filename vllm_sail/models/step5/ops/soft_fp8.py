@@ -29,11 +29,11 @@ change, and are installed by
 from __future__ import annotations
 
 import torch
-from vllm.models.step5.nvidia.ops.indexer_norm_rope import (
+from vllm.models.step5.common.ops.indexer_norm_rope import (
     _layer_norm_stats,
     _rms_norm_variance,
 )
-from vllm.models.step5.nvidia.ops.summary_update import (
+from vllm.models.step5.common.ops.summary_update import (
     _maximum,
     _update_decode_values,
 )
@@ -120,7 +120,7 @@ def _indexer_store_value(value, HALF: tl.constexpr):
     return stored
 
 
-# Copied from vllm.models.step5.nvidia.ops.summary_update._store_summary.
+# Copied from vllm.models.step5.common.ops.summary_update._store_summary.
 @triton.jit
 def _store_summary(
     Mean,
@@ -141,7 +141,7 @@ def _store_summary(
     tl.store(Mean + address + dim, stored)
 
 
-# Copied from vllm.models.step5.nvidia.ops.indexer_norm_rope._indexer_norm_rope.
+# Copied from vllm.models.step5.common.ops.indexer_norm_rope._indexer_norm_rope.
 @triton.jit(do_not_specialize=["CSA_ROWS", "TOKENS"])
 def _indexer_norm_rope(
     Q,
@@ -262,7 +262,7 @@ def _indexer_norm_rope(
         tl.store(WOut + offset, w.to(tl.float32) * HEADS**-0.5)
 
 
-# Copied from vllm.models.step5.nvidia.ops.sparse_indexer_scores._direct_scores.
+# Copied from vllm.models.step5.common.ops.sparse_indexer_scores._direct_scores.
 @triton.jit
 def _direct_scores(
     Q,
@@ -372,7 +372,7 @@ def _direct_scores(
         tl.store(Scores + row * SCORE_ROW + region, result, region < CAPACITY)
 
 
-# Copied from vllm.models.step5.nvidia.ops.sparse_indexer_scores._paged_scores_sm90.
+# Copied from vllm.models.step5.common.ops.sparse_indexer_scores._paged_scores_sm90.
 @triton.jit(do_not_specialize=["TABLE_ROW", "REGIONS"])
 def _paged_scores_sm90(
     Q,
@@ -485,7 +485,7 @@ def paged_mqa_logits_sm90(
     A packed page holds 32 keys followed by one FP32 scale per key: 260 bytes
     per key for E4M3 bytes, 258 FP16 elements per key for FP16.
     """
-    # Copied from vllm.models.step5.nvidia.ops.sparse_indexer_scores.
+    # Copied from vllm.models.step5.common.ops.sparse_indexer_scores.
     batch, next_n, heads, dim = q.shape
     # PPU MODIFICATION: begin — E4M3 bytes or their exact FP16 values.
     assert (q.dtype, kv_fused.dtype) in (
@@ -526,7 +526,7 @@ def paged_mqa_logits_sm90(
     return output
 
 
-# Copied from vllm.models.step5.nvidia.ops.sparse_indexer._copy_summary_page.
+# Copied from vllm.models.step5.common.ops.sparse_indexer._copy_summary_page.
 @triton.jit
 def _copy_summary_page(
     Mean,
@@ -580,7 +580,7 @@ def _copy_summary_page(
     # PPU MODIFICATION: end
 
 
-# Copied from vllm.models.step5.nvidia.ops.sparse_indexer._copy_summary_tile.
+# Copied from vllm.models.step5.common.ops.sparse_indexer._copy_summary_tile.
 @triton.jit
 def _copy_summary_tile(
     Mean,

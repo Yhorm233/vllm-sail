@@ -8,6 +8,9 @@
 // Note: We register under namespace "_C" so ops are accessible as
 // torch.ops._C.<op_name> for compatibility with existing code.
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+#ifdef VLLM_ENABLE_FUSED_MQA_TOPK
+#endif
+
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   // The dummy arguments are here so we can correctly fuse with RMSNorm.
   ops.def(
@@ -232,6 +235,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 #ifdef VLLM_ENABLE_BEAM_KERNELS
 #endif
 
+#ifdef VLLM_ENABLE_QWEN4_EXP_HC_UP_GATE_MIX
+#endif
+
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
 #endif
 
@@ -386,6 +392,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+#ifdef VLLM_ENABLE_FUSED_MQA_TOPK
+#endif
   ops.impl("vocab_parallel_embedding", TORCH_BOX(&vocab_parallel_embedding));
 
   // Per-token group quantization

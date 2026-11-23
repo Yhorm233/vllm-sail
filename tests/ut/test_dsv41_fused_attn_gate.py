@@ -83,6 +83,7 @@ def _config(
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf),
         parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+        lora_config=None,
     )
 
 
@@ -316,6 +317,19 @@ def test_gate_accepts_both_ppu_capabilities(gate, cap) -> None:
     ok, report = gate.module.fused_gate(_config())
     assert ok
     assert report.startswith(f"all gates open: cap={cap[0]}.{cap[1]} ")
+
+
+def test_lora_closes_fused_gate_before_the_wheel_probe(gate, monkeypatch) -> None:
+    config = _config()
+    config.lora_config = object()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("LoRA 配置不应探测 fused wheel")
+
+    monkeypatch.setattr(importlib.util, "find_spec", forbidden)
+    ok, report = gate.module.fused_gate(config)
+    assert not ok and report.startswith("gate-lora:")
+    assert gate.module.PPUDeepseekV4MegaAttnAttention.is_available_for(config) is False
 
 
 def test_gate_missing_wheel_closes(gate) -> None:
@@ -749,6 +763,63 @@ def test_selector_foreign_class_never_gated(selector) -> None:
     selector.state["selected"] = other
     assert selector.select(object()) is other
     assert selector.gate_state["calls"] == []
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.parametrize(
+    "backend", [None, "FLASHMLA_MEGA_ATTN_DSV41", "FLASHMLA_SPARSE"]
+)
+def test_actual_selector_lora_fallback_is_not_promoted_back_to_fused(
+    gate, selector, monkeypatch, upstream_source_root, lora, backend
+):
+    from tests.support.source import function
+
+    names = (
+        "FLASHINFER_MLA_SPARSE",
+        "FLASHINFER_MLA_SPARSE_SM120",
+        "FLASHINFER_MLA_SPARSE_DSV4",
+        "FLASHINFER_MLA_SPARSE_DSV41",
+        "FLASHMLA_MEGA_ATTN_DSV41",
+        "FLASHMLA_SPARSE",
+        "FLASHMLA_SPARSE_DSV4",
+        "FLASHMLA_SPARSE_DSV41",
+    )
+    enum = SimpleNamespace(**{name: object() for name in names})
+    monkeypatch.setattr(
+        selector.classes.upstream_mega,
+        "is_available_for",
+        lambda _: True,
+        raising=False,
+    )
+    original = function(
+        upstream_source_root / "vllm/models/deepseek_v41/nvidia/model.py",
+        "_select_dsv4_attn_cls",
+        {
+            "AttentionBackendEnum": enum,
+            "current_platform": gate.platform,
+            "DeepseekV4FlashMLAAttention": selector.classes.upstream_flashmla,
+            "DeepseekV4MegaAttnAttention": selector.classes.upstream_mega,
+        },
+    )
+    target = "vllm.models.deepseek_v41.nvidia.model._select_dsv4_attn_cls"
+    monkeypatch.setitem(getattr(selector.select, selector.marker), target, original)
+    provider = sys.modules["vllm_sail.models.deepseek_v41.flash_mla_mega_attn"]
+    monkeypatch.setattr(provider, "fused_gate", gate.module.fused_gate)
+    gate.set_wheel("api")
+    config = _config()
+    config.lora_config = object() if lora else None
+    config.attention_config = SimpleNamespace(
+        backend=getattr(enum, backend) if backend else None
+    )
+    config.parallel_config.prefill_context_parallel_size = 1
+    if lora:
+        assert original(config) is selector.classes.upstream_flashmla
+    assert selector.select(config) is (
+        selector.classes.baseline if lora else selector.classes.ppu_fused
+    )
+    if lora:
+        assert any("gate-lora:" in args[0] for _, args in selector.logs)
 
 
 def test_selector_patch_metadata(selector) -> None:

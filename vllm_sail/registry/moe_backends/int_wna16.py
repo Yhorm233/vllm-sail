@@ -151,10 +151,7 @@ def select_wna16_moe_backend(
     """
     # PPU MODIFICATION: begin — an explicit PPU DeepGEMM request cannot use the
     # standard-layout expert when the layer runs the batched activation format.
-    if (
-        config.moe_backend in _PPU_ALIASES
-        and config.moe_parallel_config.use_batched_activation_format
-    ):
+    if config.moe_backend in _PPU_ALIASES and config.activation_format.is_batched:
         return _select_batched_ppu_backend(
             config,
             weight_key,
@@ -181,9 +178,6 @@ def make_wna16_moe_kernel(
     backend: WNA16MoEBackend = WNA16MoEBackend.MARLIN,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> mk.FusedMoEKernel:
-    from vllm.model_executor.layers.fused_moe.all2all_utils import (
-        maybe_make_prepare_finalize,
-    )
     from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
         CPUExpertsInt4,
     )
@@ -197,7 +191,7 @@ def make_wna16_moe_kernel(
         XPUExpertsWNA16,
     )
     from vllm.model_executor.layers.fused_moe.experts.zentorch_moe import (
-        ZentorchExpertsInt4,
+        ZentorchExpertsWNA16,
     )
 
     # PPU MODIFICATION: begin — plugin experts are not in upstream's allowlist.
@@ -211,7 +205,7 @@ def make_wna16_moe_kernel(
 
     # Currently, we only support TrtLlmMxint4ExpertsMonolithic, MarlinExperts,
     # BatchedMarlinExperts, XPUExpertsWNA16, CPUExpertsInt4,
-    # ZentorchExpertsInt4, the Humming grouped/indexed experts, and
+    # ZentorchExpertsWNA16, the Humming grouped/indexed experts, and
     # Int4EmulationTritonExperts
     allowed_experts: tuple[type[mk.FusedMoEExperts], ...] = (
         MarlinExperts,
@@ -224,7 +218,7 @@ def make_wna16_moe_kernel(
         TrtLlmMxint4ExpertsMonolithic,
         XPUExpertsWNA16,
         CPUExpertsInt4,
-        ZentorchExpertsInt4,
+        ZentorchExpertsWNA16,
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
     )
@@ -232,36 +226,12 @@ def make_wna16_moe_kernel(
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
     assert experts_cls in allowed_experts
 
-    is_monolithic = experts_cls.is_monolithic()
-
-    prepare_finalize = maybe_make_prepare_finalize(
-        moe=moe_config,
-        quant_config=moe_quant_config,
-        routing_tables=routing_tables,
-        allow_new_interface=True,
-        use_monolithic=is_monolithic,
-    )
-    assert prepare_finalize is not None
-
-    logger.info_once("Using %s", prepare_finalize.__class__.__name__, scope="local")
-    logger.info_once("Using %s", experts_cls.__name__, scope="local")
-
-    extra_args: dict[str, Any] = {}
-    if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
-        max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
-        assert max_num_tokens is not None
-        extra_args["max_num_tokens"] = max_num_tokens
-        extra_args["num_dispatchers"] = prepare_finalize.num_dispatchers()
-
-    experts = experts_cls(
-        moe_config=moe_config,
-        quant_config=moe_quant_config,
-        **extra_args,
-    )
-
-    return mk.FusedMoEKernel(
-        prepare_finalize,
-        experts,
+    return make_moe_kernel(
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        routing_tables,
+        experts_log="Using %s",
     )
 
 
@@ -284,7 +254,6 @@ def _backend_incompatibility_reason(
             allow_tile_padding,
         )
     from compressed_tensors.quantization import QuantizationArgs
-    from vllm import envs
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 
     from vllm_sail.patch.enhancement.models.moe_marlin_gate import (
@@ -299,8 +268,6 @@ def _backend_incompatibility_reason(
         quant_config, "actorder", None
     ) in ("group", "dynamic"):
         return "PPU W4A16 does not consume GPTQ activation ordering"
-    if (envs.VLLM_MARLIN_INPUT_DTYPE or "").lower() in ("int8", "fp8"):
-        return "PPU W4A16 requires 16-bit activation packing"
     if quant_config.group_size != 32 or not supports_marlin_layout(
         moe_config, 32, allow_tile_padding
     ):

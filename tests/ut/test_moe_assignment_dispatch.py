@@ -135,6 +135,7 @@ def context(modules, resident, source_root=None, copied=True, functional=False):
         calls.append((args, kwargs))
 
     namespace[kernel_name] = kernel
+    modules("vllm.model_executor.layers.fused_moe", get_config=lambda: None)
     modules(
         "vllm_sail.model_executor.layers.fused_moe.triton_kernels",
         moe_sum_reduce_triton=lambda *a: pytest.fail("unexpected large-batch path"),
@@ -198,6 +199,7 @@ def check_apply(modules, resident, router, source_root=None, copied=True):
             use_fp8_w8a8=False,
             use_int8_w8a8=False,
             config_name=lambda dtype: None,
+            act_scale_is_tensor_wide=lambda name: False,
         ),
         expects_unquantized_inputs=False,
         quant_dtype=None,

@@ -103,11 +103,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
 
 
 def _select_ppu_backend(config, weight_key, activation_key, backend):
-    activation_format = (
-        mk.FusedMoEActivationFormat.BatchedExperts
-        if config.moe_parallel_config.use_batched_activation_format
-        else mk.FusedMoEActivationFormat.Standard
-    )
+    activation_format = config.activation_format
     if (
         activation_format == mk.FusedMoEActivationFormat.BatchedExperts
         and backend == Fp8MoeBackend.PPU_DEEPGEMM

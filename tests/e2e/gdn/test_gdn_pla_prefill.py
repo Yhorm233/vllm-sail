@@ -755,6 +755,18 @@ def test_prefill_pla_output_layout() -> None:
     assert pla_o.dtype is inp.q.dtype
     assert pla_state.shape == (len(seq_lens), HV, DV, DK)
     assert pla_state.dtype is torch.float32
+    assert pla_state[0].is_contiguous()
+
+    # MRv2 scatters complete contiguous rows rather than assigning a strided
+    # view. Exercise that actual consumer and preserve untouched cache slots.
+    from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
+
+    cache = torch.zeros((3, HV, DV, DK), device=DEVICE, dtype=torch.float32)
+    slots = torch.tensor([2, 0], device=DEVICE, dtype=torch.int32)
+    scatter_states(cache, pla_state, slots)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(cache[slots.long()], pla_state, rtol=0, atol=0)
+    assert torch.count_nonzero(cache[1]).item() == 0
 
 
 def test_prefill_pla_core_attn_out_buffer() -> None:

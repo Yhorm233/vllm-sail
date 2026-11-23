@@ -18,7 +18,7 @@ schema = 1
 
 # The exact upstream vLLM tag the corpus is translated from. Bumping this means
 # re-running tools/port_upstream_kernels.py and reviewing the diff.
-upstream_ref = "8b10bda57ceab3a741d2fb3718af48cef691023e"
+upstream_ref = "047f6bfbb22cf4815162125f107e6dd90c72478a"
 
 # Compiled tiers, in the order CMake receives them. `x` must never appear here.
 # Must stay above [tiers]: a bare key after a table header belongs to that table.
@@ -72,6 +72,26 @@ _moe_C_stable_libtorch = "_upstream_moe_C"
 # Each replacement must match exactly once after sailify, or generation fails.
 [overlay.replace_text."csrc/moe/grouped_topk_kernels.cu"]
 "return hggc::std::isfinite(val);" = "return isfinite(cuda_cast<float, T>(val));"
+
+# HGGC 的兼容 SM80/89 标识不能选择 NVIDIA 的 redux 指令。
+# 保留同一 32-lane 归约，使用 upstream 现有 shuffle fallback。
+[overlay.replace_text."csrc/topk_histogram_4096.cuh"]
+"warp_reduce_sum_full(uint32_t v) {\n#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)" = "warp_reduce_sum_full(uint32_t v) {\n#if !defined(__HGGCCC__) && defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)"
+"warp_reduce_or_full(uint32_t v) {\n#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)" = "warp_reduce_or_full(uint32_t v) {\n#if !defined(__HGGCCC__) && defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)"
+
+# PPU 1.0/1.5 不使用 PDL；普通 launch 保留相同 kernel、网格、stream 和参数。
+# 公共 header 通过十个 TU 的 include 闭包进入生成语料，不是编译 TU。
+[overlay.replace_text."csrc/moe/topk_softplus_sqrt_kernels.cuh"]
+"  #if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)\n  hggcGridDependencySynchronize();" = "  #if !defined(__HGGCCC__) && defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)\n  hggcGridDependencySynchronize();"
+"  #if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)\n  hggcTriggerProgrammaticLaunchCompletion();" = "  #if !defined(__HGGCCC__) && defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)\n  hggcTriggerProgrammaticLaunchCompletion();"
+"#if (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))\n  hggcGridDependencySynchronize();" = "#if !defined(__HGGCCC__) && (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))\n  hggcGridDependencySynchronize();"
+"#if (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))\n    hggcTriggerProgrammaticLaunchCompletion();\n#endif\n    return;" = "#if !defined(__HGGCCC__) && (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))\n    hggcTriggerProgrammaticLaunchCompletion();\n#endif\n    return;"
+"#if (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))\n    hggcTriggerProgrammaticLaunchCompletion();\n#endif\n  }\n}" = "#if !defined(__HGGCCC__) && (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))\n    hggcTriggerProgrammaticLaunchCompletion();\n#endif\n  }\n}"
+"  hggcLaunchConfig_t config = {};\n  config.gridDim = (num_rows + 3) / 4;" = "#if defined(__HGGCCC__)\n  const float scale = static_cast<float>(routed_scaling_factor);\n  kernel<<<(num_rows + 3) / 4, 128, 0, stream>>>(\n      input, output, indices, num_rows, num_experts, scale, input_ids, tid2eid,\n      is_padding, bias_vl, image_sentinel_lo);\n#else\n  hggcLaunchConfig_t config = {};\n  config.gridDim = (num_rows + 3) / 4;"
+"                     bias_vl, image_sentinel_lo);\n}\n#endif\n\n// ====================== TopK softplus_sqrt things" = "                     bias_vl, image_sentinel_lo);\n#endif\n}\n#endif\n\n// ====================== TopK softplus_sqrt things"
+"#ifndef USE_ROCM\n    hggcLaunchConfig_t config = {};" = "#if !defined(USE_ROCM) && !defined(__HGGCCC__)\n    hggcLaunchConfig_t config = {};"
+# 通用 launcher 也需拒绝零行网格；保留非 HGGC 行为和所有非空 launch 参数。
+"  const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;" = "#if defined(__HGGCCC__)\n  if (num_rows == 0) return;\n#endif\n  const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;"
 
 # PPU 1.0/1.5 do not use programmatic dependent launch. Reuse upstream's
 # ordinary launch branch while retaining the same kernel and arguments.
@@ -141,8 +161,8 @@ _moe_C_stable_libtorch = "_upstream_moe_C"
 "#include <hggc_runtime.h>" = "#include <hggc_runtime.h>\n#if defined(__HGGCCC__)\n#include <hggc_pipeline_primitives.h>\n#endif"
 "  const uint32_t smem_addr =" = "#if defined(__HGGCCC__)\n  __pipeline_memcpy_async(smem_ptr, gmem_ptr, 16);\n#else\n  const uint32_t smem_addr ="
 "               : \"r\"(smem_addr), \"l\"(gmem_ptr));" = "               : \"r\"(smem_addr), \"l\"(gmem_ptr));\n#endif"
-"  asm volatile(\"cp.async.commit_group;\\n\" ::);" = "#if defined(__HGGCCC__)\n  __pipeline_commit();\n#else\n  asm volatile(\"cp.async.commit_group;\\n\" ::);\n#endif"
-"  asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");" = "#if defined(__HGGCCC__)\n  __pipeline_commit();\n  __pipeline_wait_prior(0);\n#else\n  asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");\n#endif"
+"  asm volatile(\"cp.async.commit_group;\u005Cn\" ::);" = "#if defined(__HGGCCC__)\n  __pipeline_commit();\n#else\n  asm volatile(\"cp.async.commit_group;\u005Cn\" ::);\n#endif"
+"  asm volatile(\"cp.async.wait_all;\u005Cn\" ::: \"memory\");" = "#if defined(__HGGCCC__)\n  __pipeline_commit();\n  __pipeline_wait_prior(0);\n#else\n  asm volatile(\"cp.async.wait_all;\u005Cn\" ::: \"memory\");\n#endif"
 
 # ---------------------------------------------------------------------------
 # Tier a -- core inference.
@@ -344,11 +364,74 @@ ops = ["grouped_topk"]
 notes = "Heaviest tier-a file: cooperative groups plus PTX in moeTopKFuncs.cuh. Required because PPU MoE models route through grouped_topk."
 
 [[entry]]
-path = "csrc/moe/topk_softplus_sqrt_kernels.cu"
+path = "csrc/moe/topk_softplus_sqrt.cu"
 tier = "a"
 hazards = ["cub"]
 ops = ["topk_softplus_sqrt"]
-notes = "Promoted from tier b for DeepSeek V4 biased and hash routing, including the FP32 top-6 fast path."
+notes = "DeepSeek V4 路由的 host dispatcher；九个实例 TU 提供 launcher 定义，公共 header 保留 FP32 hash top-6 快路径。HGGC 使用普通 launch；编译和设备验证待完成。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_int32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "FP32/int32 launcher 的两个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_uint32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "FP32/uint32 launcher 的三个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_int64.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "FP32/int64 launcher 的两个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_int32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "FP16/int32 launcher 的两个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_uint32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "FP16/uint32 launcher 的三个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_int64.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "FP16/int64 launcher 的两个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_int32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "BF16/int32 launcher 的两个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_uint32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "BF16/uint32 launcher 的三个不同 hash-index 类型实例。"
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_int64.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "BF16/int64 launcher 的两个不同 hash-index 类型实例。"
 
 [[entry]]
 path = "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
@@ -469,6 +552,27 @@ ops = ["moe_wna16_gemm"]
 # ---------------------------------------------------------------------------
 # Tier x -- excluded. Every op here gets a runtime stub.
 # ---------------------------------------------------------------------------
+
+[[entry]]
+path = "csrc/moe/lut_b_moe_sm107.cu"
+tier = "x"
+hazards = ["tcgen05", "cp_async", "ptx"]
+ops = ["lut_b_moe_gemm"]
+notes = "CUDA 13.4 与 SM107 专用 LUT-B tensor-core 解码、TMEM 和 cp.async；PPU 80/89 不满足真实准入，保留上游 auto/emulation 选择及 Triton QDQ 路径，数值与模型能力待实机验证。"
+
+[[entry]]
+path = "csrc/qwen4_exp/hc_up_gate_mix.cu"
+tier = "x"
+hazards = ["tcgen05", "cp_async", "ptx"]
+ops = ["qwen4_exp_hc_up_gate_mix"]
+notes = "SM100 专用 TMA/TMEM、tcgen05 和 cluster launch；PPU 80/89 不满足真实设备门控，保留 ReplicatedLinear 与 hc_gate_mix fallback。"
+
+[[entry]]
+path = "csrc/fused_mqa_topk/fused_mqa_topk.cu"
+tier = "x"
+hazards = ["tcgen05", "mma", "ptx"]
+ops = ["fused_mqa_topk_prefill"]
+notes = "SM100 专用 fused MQA 与 top-k；PPU 80/89 不满足真实设备门控，保留 SAIL logits 和独立 top-k 路径。"
 
 [[entry]]
 path = "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"

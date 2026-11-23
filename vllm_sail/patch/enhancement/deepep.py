@@ -199,7 +199,31 @@ def _maybe_make_prepare_finalize_body(
             num_global_experts=moe.num_experts,
         )
 
-    elif moe.use_mori_kernels:
+    elif moe.use_mori_epv2_kernels:
+        num_local_experts = moe.num_experts // all2all_manager.world_size
+        # MORI EPv2 routes expert e to rank e // num_local_experts, so every rank
+        # must hold the same number of experts.
+        if num_local_experts * all2all_manager.world_size != moe.num_experts:
+            raise ValueError(
+                f"MORI EPv2 needs the {moe.num_experts} experts to split evenly "
+                f"over {all2all_manager.world_size} expert-parallel ranks"
+            )
+        all_to_all_args = dict(
+            hidden_dim=moe.hidden_dim,
+            max_num_inp_token_per_rank=moe.max_num_tokens,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=moe.experts_per_token,
+        )
+        handle = all2all_manager.get_handle(all_to_all_args)
+        prepare_finalize = MoriEPv2PrepareAndFinalize(
+            handle,
+            max_tokens_per_rank=moe.max_num_tokens,
+            num_dispatchers=all2all_manager.world_size,
+            num_local_experts=num_local_experts,
+            rank_expert_offset=all2all_manager.rank * num_local_experts,
+        )
+
+    elif moe.use_mori_epv1_kernels:
         assert quant_config is not None
 
         # MXFP4 activations are dispatched as packed FP4 with their e8m0
@@ -261,6 +285,12 @@ def _maybe_make_prepare_finalize_body(
     elif moe.use_fi_nvl_two_sided_kernels:
         assert quant_config is not None
         prepare_finalize = FlashInferNVLinkTwoSidedPrepareAndFinalize(
+            max_num_tokens=(
+                get_current_vllm_config().scheduler_config.max_num_batched_tokens
+            ),
+            top_k=moe.experts_per_token,
+            num_experts=moe.num_experts,
+            hidden_size=moe.hidden_dim,
             num_dispatchers=all2all_manager.world_size,
         )
 
@@ -350,13 +380,7 @@ def maybe_roundup_layer_hidden_size(hidden_size, act_dtype, moe_parallel_config)
 _CONSUMERS = {
     "maybe_make_prepare_finalize": [
         "vllm.model_executor.layers.fused_moe.eep_reconfigure",
-        "vllm.model_executor.layers.fused_moe.oracle.fp8",
-        "vllm.model_executor.layers.fused_moe.oracle.w4a8_int8",
-        "vllm.model_executor.layers.fused_moe.oracle.unquantized",
-        "vllm.model_executor.layers.fused_moe.oracle.nvfp4",
-        "vllm.model_executor.layers.fused_moe.oracle.w4a8",
-        "vllm.model_executor.layers.fused_moe.oracle.mxfp4",
-        "vllm.model_executor.layers.fused_moe.oracle.int8",
+        "vllm.model_executor.layers.fused_moe.oracle.base",
         "vllm.model_executor.layers.quantization.utils.humming.moe",
         "vllm.model_executor.layers.quantization.modelopt_block_quant",
     ],

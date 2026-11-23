@@ -45,7 +45,7 @@ class DSparkDeepseekV41ForCausalLM(UpstreamDSparkV41, SupportsQuant):
 
 
 # Preserve V4.1 draft expert counts, name mapping and TP slicing without the V4 loader.
-# Based on vLLM 8b10bda57ceab3a741d2fb3718af48cef691023e:
+# Based on vLLM 047f6bfbb22cf4815162125f107e6dd90c72478a:
 # vllm/models/deepseek_v41/nvidia/dspark.py. Retain its body and globals.
 # ruff: noqa: F821
 def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -184,7 +184,11 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-    if self.model.confidence_head is not None and not loaded_confidence_head:
+    if (
+        self.model.confidence_head is not None
+        and not loaded_confidence_head
+        and is_mtp_completeness_check_enabled()
+    ):
         self.model.confidence_head = None
     logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
     return loaded_params

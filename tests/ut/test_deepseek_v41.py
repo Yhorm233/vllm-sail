@@ -45,6 +45,228 @@ def test_cache_gather_dispatch_after_preload(
     assert calls == ["triton" if ppu else "cute"]
 
 
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("early_trigger", [False, True])
+@pytest.mark.parametrize("tokens", [0, 3])
+def test_real_query_quant_uses_platform_pdl_gate_before_early_trigger(
+    upstream_source_root, ppu, early_trigger, tokens
+):
+    ns = SimpleNamespace
+    launches, allocations = [], []
+
+    def empty(shape, **kwargs):
+        value = ns(shape=shape, **kwargs)
+        allocations.append(value)
+        return value
+
+    torch = ns(
+        empty=empty,
+        float8_e4m3fn="fp8",
+        uint8="uint8",
+        cuda=ns(current_device=lambda: 0, get_device_capability=lambda _: (9, 0)),
+    )
+    hook_path = (
+        ROOT / "vllm_sail/platform.py"
+        if ppu
+        else upstream_source_root / "vllm/platforms/cuda.py"
+    )
+    hook = function(
+        hook_path,
+        "PPUPlatform.is_arch_support_pdl"
+        if ppu
+        else "CudaPlatformBase.is_arch_support_pdl",
+        {"torch": torch},
+    )
+    triton = ns(
+        cdiv=lambda a, b: (a + b - 1) // b,
+        next_power_of_2=lambda x: 1 << (x - 1).bit_length(),
+    )
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((grid, args, kwargs))
+
+    key = object()
+    namespace = dict(
+        torch=torch,
+        triton=triton,
+        _q_kv_norm_quant_kernel=Kernel(),
+        current_platform=ns(
+            is_cuda=lambda: True, is_arch_support_pdl=lambda: hook(None)
+        ),
+        kMxfp8Dynamic=key,
+        QuantizedActivation=lambda data, scale, dtype, shape, quant_key: ns(
+            data=data,
+            scale=scale,
+            orig_dtype=dtype,
+            orig_shape=shape,
+            quant_key=quant_key,
+        ),
+    )
+    path = upstream_source_root / "vllm/models/deepseek_v41/common/ops/query_quant.py"
+    namespace["mxfp8_scale_bytes"] = function(path, "mxfp8_scale_bytes", namespace)
+    quant = function(path, "fused_q_kv_rmsnorm_quant", namespace)
+    q = ns(
+        ndim=2,
+        shape=(tokens, 64),
+        stride=lambda dim: 1 if dim == -1 else 64,
+        dtype="bf16",
+        device="cuda",
+    )
+    kv = ns(
+        ndim=2,
+        shape=(tokens, 32),
+        stride=lambda dim: 1 if dim == -1 else 32,
+        dtype="bf16",
+        device="cuda",
+    )
+    qw, kvw = ns(is_contiguous=lambda: True), ns(is_contiguous=lambda: True)
+    qa, output = quant(q, kv, qw, kvw, 1e-6, early_trigger=early_trigger)
+    assert qa.data is allocations[0] and output is allocations[1]
+    assert qa.scale is allocations[2] and qa.orig_shape == q.shape
+    assert qa.orig_dtype == q.dtype and qa.quant_key is key
+    if not tokens:
+        assert launches == []
+    else:
+        grid, args, kwargs = launches[0]
+        assert grid == (128, 2) and args[:4] == (q, kv, qw, kvw)
+        assert args[-2:] == (not ppu, not ppu and early_trigger)
+        assert kwargs == dict(num_warps=4, launch_pdl=not ppu)
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "consumer", ["cutlass", "cutedsl", "torch", "other", "subclass"]
+)
+@pytest.mark.parametrize("unquantized", [False, True])
+@pytest.mark.parametrize("same_key", [False, True])
+def test_real_query_quant_requires_effective_key_and_exact_scale_layout_consumer(
+    modules, upstream_source_root, consumer, unquantized, same_key
+):
+    ns = SimpleNamespace
+    cutlass, cutedsl, torch_kernel = [
+        type(name, (), {})
+        for name in (
+            "FlashInferCutlassMxfp8LinearKernel",
+            "FlashInferCutedslMxfp8LinearKernel",
+            "TorchMxFp8LinearKernel",
+        )
+    ]
+    modules(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer",
+        FlashInferCutlassMxfp8LinearKernel=cutlass,
+        FlashInferCutedslMxfp8LinearKernel=cutedsl,
+    )
+    modules(
+        "vllm.model_executor.kernels.linear.mxfp8.pytorch",
+        TorchMxFp8LinearKernel=torch_kernel,
+    )
+    cls = {
+        "cutlass": cutlass,
+        "cutedsl": cutedsl,
+        "torch": torch_kernel,
+        "other": type("OtherKernel", (), {}),
+        "subclass": type("DerivedKernel", (cutlass,), {}),
+    }[consumer]
+    key = object()
+    namespace = dict(current_platform=ns(is_cuda=lambda: True), kMxfp8Dynamic=key)
+    namespace["get_input_quant_key"] = function(
+        upstream_source_root / "vllm/model_executor/layers/fusion/quant_activation.py",
+        "get_input_quant_key",
+        {},
+    )
+    resolve = function(
+        upstream_source_root / "vllm/models/deepseek_v41/common/ops/query_quant.py",
+        "can_fuse_query_quant",
+        namespace,
+    )
+    first = ns(quant_method=ns(kernel=cutlass()), _input_quant_key=key)
+    second = ns(
+        quant_method=ns(kernel=cls()),
+        _input_quant_key=key if same_key else object(),
+        requires_unquantized_input=unquantized,
+    )
+    assert resolve([first, second]) is (
+        same_key and not unquantized and consumer in ("cutlass", "cutedsl", "torch")
+    )
+    assert resolve([first, ns()]) is False
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("capability", [80, 89, 103])
+@pytest.mark.parametrize("backend", ["auto", "latency_specialized"])
+def test_real_specialized_decode_config_rejects_ppu_capability(
+    upstream_source_root, capability, backend
+):
+    ns = SimpleNamespace
+    full, normal, sparse = object(), object(), object()
+    config = ns(
+        additional_config={"decode_backend": backend},
+        use_v2_model_runner=True,
+        parallel_config=ns(
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            use_ubatching=False,
+        ),
+        attention_config=ns(
+            backend=sparse, indexer_kv_dtype="mxfp4", indexer_sparse_logits=True
+        ),
+        speculative_config=ns(method="dspark", enable_adaptive_verification=False),
+        compilation_config=ns(
+            cudagraph_mode=ns(decode_mode=lambda: full, mixed_mode=lambda: normal),
+            mode=normal,
+        ),
+        model_config=ns(enable_sleep_mode=False),
+        cache_config=ns(cache_dtype="fp8"),
+        weight_transfer_config=None,
+        lora_config=None,
+        kv_transfer_config=None,
+        kernel_config=ns(enable_flashinfer_autotune=False, enable_jit_warmup=True),
+    )
+    collectives = []
+    group, op = object(), object()
+    namespace = dict(
+        current_platform=ns(
+            is_cuda=lambda: True, is_device_capability=lambda value: capability == value
+        ),
+        CUDAGraphMode=ns(FULL=full),
+        CompilationMode=ns(STOCK_TORCH_COMPILE=object()),
+        AttentionBackendEnum=ns(FLASHINFER_MLA_SPARSE_DSV41=sparse),
+        envs=ns(VLLM_BATCH_INVARIANT=False),
+        supports_mhc_overlap=lambda _: True,
+        supports_mhc_all_reduce=lambda _: True,
+        torch=ns(int32="int32", tensor=lambda values, **kw: ns(item=lambda: values[0])),
+        dist=ns(
+            ReduceOp=ns(MIN=op), all_reduce=lambda value, **kw: collectives.append(kw)
+        ),
+        get_tp_group=lambda: ns(cpu_group=group),
+        DecodeConfig=ns,
+        logger=ns(info_once=lambda *args: None),
+        FUSED_MHC_MAX_ROWS=384,
+    )
+    path = (
+        upstream_source_root
+        / "vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py"
+    )
+    namespace["unsupported"] = function(path, "unsupported", namespace)
+    resolve = function(path, "specialized_decode_config", namespace)
+    if backend == "auto":
+        assert resolve(config) is None and collectives == []
+    elif capability != 103:
+        with pytest.raises(ValueError, match="GB300"):
+            resolve(config)
+        assert collectives == [dict(op=op, group=group)]
+    else:
+        result = resolve(config)
+        assert not result.autotune and result.jit_warmup
+        assert collectives == [dict(op=op, group=group)]
+
+
 @pytest.fixture
 def quant_module(modules):
     calls = []
@@ -570,8 +792,9 @@ def test_v41_draft_preserves_its_own_execution(v41_draft):
 @pytest.mark.parametrize("dense_scale", ["weight_scale", "weight_scale_inv"])
 @pytest.mark.parametrize("mega", [False, True])
 @pytest.mark.parametrize("draft_experts", [0, 2])
+@pytest.mark.parametrize("completeness_check", [False, True])
 def test_v41_draft_loads_scales_from_actual_destinations(
-    v41_draft, expert_dtype, dense_scale, mega, draft_experts
+    v41_draft, expert_dtype, dense_scale, mega, draft_experts, completeness_check
 ):
     """Reproduce the fused attention KeyError and cover experts, shared layers and heads."""
     cls, provider = v41_draft
@@ -595,6 +818,7 @@ def test_v41_draft_loads_scales_from_actual_destinations(
     provider.get_tensor_model_parallel_rank = lambda: 1
     provider.default_weight_loader = lambda p, w: calls.append((p.name, w, (), {}))
     provider.logger = SimpleNamespace(info_once=lambda *args: None)
+    provider.is_mtp_completeness_check_enabled = lambda: completeness_check
     provider._duplicate_context_wkv_weights = lambda weights, count: weights
     provider.extract_layer_index = lambda name: int(name.split(".")[2])
 
@@ -664,6 +888,7 @@ def test_v41_draft_loads_scales_from_actual_destinations(
         expert_dtype=expert_dtype,
         num_attention_heads=64,
     )
+    confidence_head = object()
     model.model = SimpleNamespace(
         layers=[
             SimpleNamespace(
@@ -673,7 +898,7 @@ def test_v41_draft_loads_scales_from_actual_destinations(
                 )
             )
         ],
-        confidence_head=object(),
+        confidence_head=confidence_head,
     )
     model.linear_scale_name = "weight_scale_inv"
     model.pad_shared_expert = False
@@ -703,7 +928,9 @@ def test_v41_draft_loads_scales_from_actual_destinations(
     assert model.load_weights(iter(stream)) == set(params)
     assert counts == [draft_experts or 384]
     assert processed == []  # The main loader defers processing to the model runner.
-    assert model.model.confidence_head is None
+    assert model.model.confidence_head is (
+        None if completeness_check else confidence_head
+    )
     assert len(calls) == len(pairs)
     for call, (_, target, shard), weight in zip(calls, pairs, weights, strict=False):
         assert call[:2] == (target, weight)

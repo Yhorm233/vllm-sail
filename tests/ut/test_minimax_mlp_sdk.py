@@ -9,8 +9,11 @@ import pytest
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.requires_runtime
-def test_installed_mlp_keeps_unfused_cpu_tensor_identity(monkeypatch, dtype_name):
+def test_installed_mlp_keeps_unfused_cpu_tensor_identity(
+    monkeypatch, dtype_name, sequence_parallel
+):
     torch = pytest.importorskip("torch")
     pytest.importorskip("vllm")
     import vllm_sail.patch
@@ -44,9 +47,30 @@ def test_installed_mlp_keeps_unfused_cpu_tensor_identity(monkeypatch, dtype_name
         swiglu_alpha=1.702,
         swiglu_beta=1,
     )
-    instance = provider.MiniMaxM3MLP(config, 16, prefix="model.layers.0.mlp")
+
+    def collective(name):
+        def run(x):
+            calls.append(name)
+            return x
+
+        return run
+
+    monkeypatch.setattr(provider, "sp_all_gather", collective("all-gather"))
+    monkeypatch.setattr(provider, "sp_reduce_scatter", collective("reduce-scatter"))
+    instance = provider.MiniMaxM3MLP(
+        config,
+        16,
+        use_sequence_parallel=sequence_parallel,
+        run_gemm_rs=True,
+        prefix="model.layers.0.mlp",
+    )
+    assert instance.use_sequence_parallel is sequence_parallel
+    assert instance.gemm_rs is None
     assert instance.fused_gemm1_min_tokens is None
     x = torch.ones(3, 8, dtype=getattr(torch, dtype_name), device="cpu")
     assert instance(x) is x
-    assert calls == ["model.layers.0.mlp.gate_up_proj", "model.layers.0.mlp.down_proj"]
+    expected = ["model.layers.0.mlp.gate_up_proj", "model.layers.0.mlp.down_proj"]
+    if sequence_parallel:
+        expected = ["all-gather", *expected, "reduce-scatter"]
+    assert calls == expected
     assert "vllm.models.minimax_m3.nvidia.ops.dense_gemm1_mxfp8" not in sys.modules

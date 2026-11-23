@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
         RowParallelLinear,
         SiluAndMulWithClamp,
+        _bind_gemm_rs,
         current_platform,
         envs,
     )
@@ -26,9 +27,12 @@ def init_mlp(
     quant_config: QuantizationConfig | None = None,
     reduce_results: bool = True,
     disable_tp: bool = False,
+    use_sequence_parallel: bool = False,
+    run_gemm_rs: bool = False,
     prefix: str = "",
 ) -> None:
     super(MiniMaxM3MLP, self).__init__()
+    self.use_sequence_parallel = use_sequence_parallel
     self.gate_up_proj = MergedColumnParallelLinear(
         config.hidden_size,
         [intermediate_size] * 2,
@@ -42,9 +46,13 @@ def init_mlp(
         config.hidden_size,
         bias=False,
         quant_config=quant_config,
-        reduce_results=reduce_results,
+        # Under SP the forward reduce-scatters the output itself.
+        reduce_results=reduce_results and not use_sequence_parallel,
         disable_tp=disable_tp,
         prefix=f"{prefix}.down_proj",
+    )
+    self.gemm_rs = (
+        _bind_gemm_rs(self.down_proj) if use_sequence_parallel and run_gemm_rs else None
     )
     if config.hidden_act != "swigluoai":
         raise ValueError(
@@ -56,16 +64,20 @@ def init_mlp(
         alpha=config.swiglu_alpha,
         beta=config.swiglu_beta,
     )
+    # PPU MODIFICATION: begin
+    if not current_platform.is_ppu():
+        from vllm.models.minimax_m3.nvidia.ops import dense_gemm1_mxfp8
+    # PPU MODIFICATION: end
+
     # At or below the shared-experts stream threshold the persistent kernel
     # would contend with the routed experts on the aux stream.
     self.fused_gemm1_min_tokens: int | None = None
-    if not current_platform.is_ppu():
-        from vllm.models.minimax_m3.nvidia.ops import dense_gemm1_mxfp8
-
-        if dense_gemm1_mxfp8.can_fuse_gemm1(
-            self.gate_up_proj, self.down_proj, self.act_fn
-        ):
-            self.fused_gemm1_min_tokens = max(
-                dense_gemm1_mxfp8.MIN_TOKENS,
-                envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
-            )
+    # PPU MODIFICATION: begin
+    if not current_platform.is_ppu() and dense_gemm1_mxfp8.can_fuse_gemm1(
+        self.gate_up_proj, self.down_proj, self.act_fn
+    ):
+        # PPU MODIFICATION: end
+        self.fused_gemm1_min_tokens = max(
+            dense_gemm1_mxfp8.MIN_TOKENS,
+            envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+        )

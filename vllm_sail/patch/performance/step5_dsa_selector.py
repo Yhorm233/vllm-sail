@@ -13,7 +13,7 @@ from vllm.platforms import current_platform
 from vllm_sail import envs
 from vllm_sail.patch.utils import patch
 
-_TARGET = "vllm.models.step5.nvidia.ops.sparse_indexer"
+_TARGET = "vllm.models.step5.common.ops.sparse_indexer"
 _REASON = "Step5 selector_v2 exact FP32 radix candidate reusing stabilization; off by default, chosen by UT performance."
 _REMOVE = "Upstream per_row provides an equivalent or faster streaming radix selector."
 _installed = False

@@ -9,6 +9,65 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
+from tests.support.source import ROOT, definition, function
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("enabled", [False, True])
+def test_real_hisparse_admission_rejects_ppu_before_other_config_probes(
+    upstream_source_root, enabled
+):
+    """只执行真实配置中的完整 HiSparse 准入区段，不模拟整个配置初始化。"""
+    import ast
+
+    node = definition(
+        upstream_source_root / "vllm/config/vllm.py", "VllmConfig.__post_init__"
+    )
+    admission = [
+        child
+        for child in node.body
+        if isinstance(child, ast.If)
+        and ast.unparse(child.test)
+        == "self.attention_config.hisparse_config is not None"
+    ]
+    assert len(admission) == 1
+    node.name = "admit_hisparse"
+    node.body = admission
+    node.decorator_list = []
+    probes = []
+    hook = function(
+        ROOT / "vllm_sail/platform.py", "PPUPlatform.get_hisparse_backend_cls", {}
+    )
+
+    def backend():
+        probes.append("platform")
+        return hook(None)
+
+    namespace = {
+        "current_platform": types.SimpleNamespace(get_hisparse_backend_cls=backend)
+    }
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), "hisparse-admission", "exec"),
+        namespace,
+    )
+    config = types.SimpleNamespace(
+        attention_config=types.SimpleNamespace(
+            hisparse_config=object() if enabled else None
+        )
+    )
+    # 其他配置字段故意缺失：PPU 拒绝必须先于并行/缓存与原生算子检查。
+    if enabled:
+        with pytest.raises(
+            ValueError, match="The current platform does not support HiSparse"
+        ):
+            namespace["admit_hisparse"](config)
+        assert probes == ["platform"]
+    else:
+        assert namespace["admit_hisparse"](config) is None
+        assert probes == []
+
 
 def test_ppu_identity_exists_before_general_patches(monkeypatch):
     cuda_enum = object()

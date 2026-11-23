@@ -20,10 +20,22 @@ def test_registered_finalize_retains_ordinary_ppu_path(modules, ppu):
             calls.append((self, config))
             return result
 
+    def unavailable(*args, **kwargs):
+        raise AssertionError("本 finalize 用例不应进入 MLP、GEMM-RS 或 norm")
+
     modules(
         "vllm.models.minimax_m3.nvidia.model",
         MiniMaxM3Model=Model,
         MiniMaxM3MLP=type("MLP", (), {}),
+        MiniMAXGemmaRMSNorm=type("Norm", (), {"forward": unavailable}),
+        _maybe_init_gemm_rs=unavailable,
+        _bind_gemm_rs=unavailable,
+    )
+    modules(
+        "vllm.model_executor.layers.linear",
+        MinimaxM3QKVParallelLinearWithIndexer=type(
+            "IndexedQKV", (), {"__init__": unavailable}
+        ),
     )
     modules(
         "vllm.platforms", current_platform=NS(is_ppu=lambda: ppu, is_cuda=lambda: True)

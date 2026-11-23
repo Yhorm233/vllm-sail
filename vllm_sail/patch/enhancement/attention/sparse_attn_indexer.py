@@ -120,12 +120,30 @@ def sparse_attn_indexer_init(
     # PPU MODIFICATION: end
     parallel_config = vllm_config.parallel_config
     self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
+    self.logits_dtype = STR_DTYPE_TO_TORCH_DTYPE[
+        vllm_config.attention_config.resolve_indexer_logits_dtype("float32")
+    ]
+    # PPU MODIFICATION: begin
+    if current_platform.is_ppu():
+        # SAIL 默认保留 MXFP4 的 BF16 与 FP8/INT8 的 FP32 原生归约。
+        default = "bfloat16" if use_fp4_cache else "float32"
+        self.logits_dtype = STR_DTYPE_TO_TORCH_DTYPE[
+            vllm_config.attention_config.resolve_indexer_logits_dtype(default)
+        ]
+        if self.logits_dtype != self.weights_dtype:
+            raise ValueError(
+                f"SAIL dense indexer requires indexer_logits_dtype={default!r} "
+                "for its native score reduction; output casting is not equivalent"
+            )
+    # PPU MODIFICATION: end
     self._parallel_config = parallel_config
     self.dcp_world_size = parallel_config.decode_context_parallel_size
     self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
     self.use_pcp = parallel_config.prefill_context_parallel_size > 1
     self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+    # PPU MODIFICATION: begin
     self._cp_kv_cache_interleave_size: int | None = None
+    # PPU MODIFICATION: end
     # PPU MODIFICATION: begin
     from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 

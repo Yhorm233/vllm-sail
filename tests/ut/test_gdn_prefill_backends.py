@@ -9,7 +9,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tests.support.source import definition, function
+from tests.support.source import ROOT, definition, function
 
 PATCH = "vllm_sail/patch/enhancement/attention/gdn.py"
 
@@ -63,7 +63,11 @@ def resolve(monkeypatch):
         xpu_available=True,
         pla=True,
         capability=89,
+        cuda_runtime=13,
         mi3xx=False,
+        gfx1151=False,
+        hip_available=False,
+        hip_helper=None,
         unsupported_reasons=(),
         helper=None,
         body=PATCH,
@@ -77,7 +81,7 @@ def resolve(monkeypatch):
             is_xpu=lambda: device == "xpu",
             is_device_capability=lambda value: capability == value,
             is_device_capability_family=lambda value: capability // 10 == value // 10,
-            get_cuda_runtime_major=lambda: 13,
+            get_cuda_runtime_major=lambda: cuda_runtime,
         )
 
         def aiter_available():
@@ -93,13 +97,19 @@ def resolve(monkeypatch):
                 dtype=dtype,
             ),
         )
+
+        def hip_kernel_available():
+            assert device == "rocm"
+            return hip_available
+
         namespace = {
             "current_platform": platform,
             "rocm_aiter_ops": NS(is_gdn_flydsl_prefill_available=aiter_available),
-            "torch": NS(bfloat16="bfloat16"),
+            "torch": NS(bfloat16="bfloat16", float16="float16"),
             "logger": NS(warning_once=lambda *args: warnings.append(args)),
             "_pla_prefill_supported": lambda _: pla,
             "xpu_gdn_kernel_available": lambda: xpu_available,
+            "is_hip_gdn_available": hip_kernel_available,
         }
 
         def reasons(candidate, key_dim, value_dim):
@@ -110,8 +120,12 @@ def resolve(monkeypatch):
             return list(unsupported_reasons)
 
         namespace["_aiter_flydsl_unsupported_reasons"] = reasons
+        namespace["_hip_gdn_unsupported_reasons"] = hip_helper or (
+            lambda *_: list(unsupported_reasons)
+        )
         rocm = ModuleType("vllm.platforms.rocm")
         rocm.on_mi3xx = lambda: mi3xx
+        rocm.on_gfx1151 = lambda: gfx1151
         monkeypatch.setitem(sys.modules, rocm.__name__, rocm)
         result = function(body, "_resolve_gdn_prefill_backend", namespace)(config)
         return result, warnings
@@ -149,7 +163,7 @@ def test_rocm_unsupported_aiter_shapes_warn_and_fall_back(resolve, shape):
     "device", ["ppu", "cuda", "cpu"], ids=["fake-ppu", "fake-cuda", "fake-cpu"]
 )
 def test_explicit_aiter_prefill_rejects_non_rocm_devices(resolve, device):
-    with pytest.raises(RuntimeError, match="ROCm AITER backend"):
+    with pytest.raises(RuntimeError, match="ROCm backend"):
         resolve(device, "aiter_flydsl")
 
 
@@ -228,6 +242,74 @@ def test_real_flydsl_reasons_drive_upstream_and_copied_auto_routing(
     assert not warnings
 
 
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("device", ["cuda", "ppu"])
+@pytest.mark.parametrize("capability", [80, 89, 90, 100, 110, 120])
+@pytest.mark.parametrize("head_k", [64, 128])
+@pytest.mark.parametrize("cuda_runtime", [12, 13])
+@pytest.mark.parametrize("backend", ["auto", "flashinfer", "cutedsl"])
+def test_cuda_eligibility_and_ppu_short_circuit(
+    upstream_source_root, resolve, device, capability, head_k, cuda_runtime, backend
+):
+    path = (
+        upstream_source_root
+        / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
+    )
+    options = dict(capability=capability, head_k=head_k, cuda_runtime=cuda_runtime)
+    upstream, _ = resolve("cuda", backend, body=path, **options)
+    copied, warnings = resolve(device, backend, **options)
+    if device == "cuda":
+        assert copied == upstream
+    else:
+        assert copied == (backend, "pla" if backend == "auto" else "triton")
+    if capability == 110:
+        expected = (
+            "cutedsl"
+            if backend == "cutedsl" and head_k == 128 and cuda_runtime >= 13
+            else "triton"
+        )
+        assert upstream == (backend, expected)
+    assert not warnings
+
+
+@pytest.mark.upstream_source
+def test_complete_resolver_retains_only_documented_ppu_differences(
+    upstream_source_root,
+):
+    path = (
+        upstream_source_root
+        / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
+    )
+    copied = definition(ROOT / PATCH, "_resolve_gdn_prefill_backend")
+    upstream = definition(path, "_resolve_gdn_prefill_backend")
+    assert "pla" in {
+        node.value
+        for node in ast.walk(copied.returns)
+        if isinstance(node, ast.Constant)
+    }
+    copied.returns = upstream.returns
+    copied_doc = ast.get_docstring(copied, clean=False)
+    upstream_doc = ast.get_docstring(upstream, clean=False)
+    assert (
+        copied_doc.split("    # PPU MODIFICATION: begin")[0].rstrip()
+        == upstream_doc.rstrip()
+    )
+    copied.body[0] = upstream.body[0]
+    ppu_branches = [
+        node
+        for node in copied.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "current_platform.is_ppu()"
+    ]
+    assert len(ppu_branches) == 1
+    assert ast.unparse(ppu_branches[0].body[0].test) == (
+        "backend in ('pla', 'auto') and _pla_prefill_supported(vllm_config)"
+    )
+    assert ast.unparse(ppu_branches[0].body[-1]) == "return (backend, 'triton')"
+    copied.body.remove(ppu_branches[0])
+    assert ast.dump(copied) == ast.dump(upstream)
+
+
 def test_aiter_backend_has_a_log_name():
     messages = []
     config = NS(model_config=NS(hf_text_config=NS(linear_key_head_dim=128)))
@@ -241,7 +323,7 @@ def test_aiter_backend_has_a_log_name():
     assert messages[0][1:] == ("AITER FlyDSL", "aiter_flydsl", 128)
 
 
-@pytest.mark.parametrize("active", ["aiter_flydsl", "pla"])
+@pytest.mark.parametrize("active", ["aiter_flydsl", "hip", "pla"])
 def test_constructor_selects_the_resolved_forward_method(active):
     class Parent:
         def __init__(self):
@@ -256,6 +338,9 @@ def test_constructor_selects_the_resolved_forward_method(active):
 
         def forward_aiter_flydsl(self):
             return "aiter_flydsl"
+
+        def forward_hip(self):
+            return "hip"
 
         def forward_pla(self):
             return "pla"
@@ -353,6 +438,200 @@ def test_actual_sycl_provider_contract(
         result, warnings = resolve(device, backend, xpu_available=available, body=body)
         assert result == (backend, expected)
         assert not warnings
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("backend", ["hip", "auto"])
+@pytest.mark.parametrize(
+    "options,active,error",
+    [
+        ({}, "hip", None),
+        ({"dtype": "float16"}, "hip", None),
+        ({"dtype": "float32"}, "triton", None),
+        ({"head_k": 64}, "triton", None),
+        ({"head_v": 64}, "triton", None),
+        ({"hip_available": False}, "triton", "unavailable"),
+        ({"gfx1151": False}, "triton", None),
+    ],
+)
+def test_real_hip_reasons_drive_copied_and_upstream_routing(
+    upstream_source_root, resolve, copied, backend, options, active, error
+):
+    path = (
+        upstream_source_root
+        / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
+    )
+    helper = function(
+        path,
+        "_hip_gdn_unsupported_reasons",
+        {"torch": NS(bfloat16="bfloat16", float16="float16")},
+    )
+    kwargs = dict(gfx1151=True, hip_available=True) | options
+    if error and backend == "hip":
+        with pytest.raises(RuntimeError, match=error):
+            resolve(
+                "rocm",
+                backend,
+                hip_helper=helper,
+                body=PATCH if copied else path,
+                **kwargs,
+            )
+        return
+    if backend == "hip" and options.get("gfx1151") is False:
+        active = "hip"
+    result, warnings = resolve(
+        "rocm",
+        backend,
+        hip_helper=helper,
+        body=PATCH if copied else path,
+        **kwargs,
+    )
+    assert result == (backend, active)
+    assert bool(warnings) == (backend == "hip" and active == "triton")
+    if warnings:
+        assert "Falling back to Triton/FLA" in warnings[0][0]
+
+
+@pytest.mark.parametrize("device", ["ppu", "cuda", "cpu"])
+def test_explicit_hip_rejects_non_rocm_before_backend_probes(resolve, device):
+    with pytest.raises(RuntimeError, match="ROCm backend"):
+        resolve(device, "hip", hip_available=True)
+
+
+def test_hip_backend_has_a_log_name():
+    messages = []
+    config = NS(model_config=NS(hf_text_config=NS(linear_key_head_dim=128)))
+    namespace = {
+        "current_platform": NS(is_cpu=lambda: False, is_xpu=lambda: False),
+        "logger": NS(info_once=lambda *args: messages.append(args)),
+    }
+    function(PATCH, "_log_gdn_backend_decision", namespace)(config, "hip", "hip")
+    assert messages[0][1:] == ("HIP", "hip", 128)
+
+
+@pytest.mark.upstream_source
+def test_complete_constructor_and_logger_keep_only_ppu_extensions(upstream_source_root):
+    path = (
+        upstream_source_root
+        / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
+    )
+    copied = definition(ROOT / PATCH, "__init__")
+    original = definition(path, "ChunkGatedDeltaRule.__init__")
+    assert ast.unparse(copied.body[0]) == "super(ChunkGatedDeltaRule, self).__init__()"
+    copied.body[0] = original.body[0]
+    warning = next(node for node in copied.body if isinstance(node, ast.If))
+    assert "pla" in ast.unparse(warning.test)
+    warning.test = next(node for node in original.body if isinstance(node, ast.If)).test
+    dispatch = next(
+        node for node in copied.body if isinstance(node, ast.If) and node is not warning
+    )
+    tail = dispatch
+    while tail.orelse and isinstance(tail.orelse[0], ast.If):
+        previous, tail = tail, tail.orelse[0]
+    assert ast.unparse(tail.test) == "active_backend == 'pla'"
+    previous.orelse = tail.orelse
+    assert ast.dump(copied) == ast.dump(original)
+    copied_log = definition(ROOT / PATCH, "_log_gdn_backend_decision")
+    upstream_log = definition(path, "_log_gdn_backend_decision")
+    mapping = next(node for node in ast.walk(copied_log) if isinstance(node, ast.Dict))
+    position = next(i for i, key in enumerate(mapping.keys) if key.value == "pla")
+    assert mapping.values[position].value == "PLA FlashQLA"
+    del mapping.keys[position]
+    del mapping.values[position]
+    assert ast.dump(copied_log) == ast.dump(upstream_log)
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("registered", [False, True])
+@pytest.mark.parametrize("family", [False, True])
+def test_real_hip_availability_requires_both_op_and_rdna35(
+    modules, upstream_source_root, registered, family
+):
+    probes = []
+    modules("vllm.platforms.rocm", on_gfx115x=lambda: probes.append("rdna35") or family)
+    op_namespace = NS(rdna35_gdn_chunked=object()) if registered else NS()
+    available = function(
+        upstream_source_root / "vllm/model_executor/layers/mamba/ops/hip_gdn_chunk.py",
+        "is_hip_gdn_available",
+        {"torch": NS(ops=NS(_rocm_C=op_namespace))},
+    )
+    assert available() is (registered and family)
+    assert probes == (["rdna35"] if registered else [])
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "case",
+    [
+        "batch",
+        "dtype",
+        "value_dtype",
+        "key_dim",
+        "value_dim",
+        "heads",
+        "bounds",
+        "unavailable",
+    ],
+)
+def test_real_hip_support_rejects_and_forward_preserves_fallback_arguments(
+    upstream_source_root, case
+):
+    helper_path = (
+        upstream_source_root / "vllm/model_executor/layers/mamba/ops/hip_gdn_chunk.py"
+    )
+    q, v = (
+        NS(shape=(1, 8, 2, 128), dtype="bf16"),
+        NS(shape=(1, 8, 4, 128), dtype="bf16"),
+    )
+    bounds = object()
+    if case == "batch":
+        q.shape = (2, 8, 2, 128)
+    elif case == "dtype":
+        q.dtype = v.dtype = "fp32"
+    elif case == "value_dtype":
+        v.dtype = "fp16"
+    elif case == "key_dim":
+        q.shape = (1, 8, 2, 64)
+    elif case == "value_dim":
+        v.shape = (1, 8, 4, 64)
+    elif case == "heads":
+        v.shape = (1, 8, 3, 128)
+    elif case == "bounds":
+        bounds = None
+    supported = function(
+        helper_path,
+        "is_hip_gdn_supported",
+        {
+            "torch": NS(bfloat16="bf16", float16="fp16"),
+            "is_hip_gdn_available": lambda: case != "unavailable",
+        },
+    )
+    assert supported(q, v, bounds) is False
+    calls, result = [], object()
+    layer = NS(forward_native=lambda **kwargs: calls.append(kwargs) or result)
+    forward = function(
+        upstream_source_root
+        / "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+        "ChunkGatedDeltaRule.forward_hip",
+        {"is_hip_gdn_supported": supported},
+    )
+    kwargs = dict(
+        q=q,
+        k=object(),
+        v=v,
+        g=object(),
+        beta=object(),
+        initial_state=object(),
+        output_final_state=True,
+        cu_seqlens=bounds,
+        chunk_indices=object(),
+        chunk_offsets=object(),
+        use_qk_l2norm_in_kernel=False,
+        core_attn_out=object(),
+    )
+    assert forward(layer, **kwargs) is result
+    assert calls == [kwargs]
 
 
 def test_sycl_backend_has_a_log_name():

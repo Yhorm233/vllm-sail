@@ -78,7 +78,7 @@ def select_regions(
     Includes all allocation and stabilization cost.
     """
     import torch
-    from vllm.models.step5.nvidia.ops.sparse_indexer import (
+    from vllm.models.step5.common.ops.sparse_indexer import (
         _stable_topk_regions,
         select_all_regions,
     )

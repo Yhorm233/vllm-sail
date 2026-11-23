@@ -8,14 +8,15 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tests.support.source import function
+from tests.support.source import ROOT, definition, function
 from tests.support.spec_decode import Kernel, Tensor
 
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("mask_layout", [None, "contiguous", "strided"])
+@pytest.mark.parametrize("skip_masked", [None, False, True])
 def test_resample_dispatch_binds_the_upstream_mask_argument(
-    upstream_source_root, mask_layout
+    upstream_source_root, mask_layout, skip_masked
 ):
     upstream = function(
         upstream_source_root
@@ -68,10 +69,14 @@ def test_resample_dispatch_binds_the_upstream_mask_argument(
         if masked
         else None,
         watermark_key=123 if masked else None,
+        **({} if skip_masked is None else {"skip_masked_vocab_blocks": skip_masked}),
     )
     assert len(calls) == 1
     bound = calls[0]
     assert bound["DEDUPLICATE_CONTEXTS"] is masked
+    assert bound["SKIP_MASKED_BLOCKS"] is (
+        False if skip_masked is None else skip_masked
+    )
     pointer = bound["watermarking_skip_mask_ptr"]
     if masked:
         assert pointer.shape == (2,)
@@ -82,11 +87,12 @@ def test_resample_dispatch_binds_the_upstream_mask_argument(
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("shards", [None, 1, 4])
+@pytest.mark.parametrize("skip_masked", [False, True])
 @pytest.mark.parametrize(
     "mode", ["ordinary", "block", "watermark", "fly", "synthetic", "no-draft"]
 )
 def test_all_sampler_kernel_calls_bind_the_upstream_draft_shard_contract(
-    upstream_source_root, shards, mode
+    upstream_source_root, shards, mode, skip_masked
 ):
     upstream = (
         upstream_source_root
@@ -142,7 +148,7 @@ def test_all_sampler_kernel_calls_bind_the_upstream_draft_shard_contract(
     mapping = None if shards is None else Tensor(32, dtype="int32")
     draft = Tensor(8, 7, 129)
     cache = None if mode == "no-draft" else NS(values=draft, row_mapping=mapping)
-    kwargs = {}
+    kwargs = {"skip_masked_vocab_blocks": skip_masked}
     if mode == "block":
         kwargs["use_block_verification"] = True
     elif mode == "watermark":
@@ -179,3 +185,34 @@ def test_all_sampler_kernel_calls_bind_the_upstream_draft_shard_contract(
             )
     assert calls["_insert_resampled_kernel"][1]["num_warps"] == 1
     assert sample.shape == (3, 8) and count.shape == (3,)
+    assert calls["_resample_kernel"][0]["SKIP_MASKED_BLOCKS"] is skip_masked
+
+
+@pytest.mark.upstream_source
+def test_complete_sampler_body_keeps_only_ppu_insert_launch(upstream_source_root):
+    """完整签名、默认值和函数体对齐；不将每日 diff 当作完整漂移检查。"""
+    import ast
+
+    copied = definition(
+        ROOT / "vllm_sail/patch/_upstream/runtime.py", "rejection_sample"
+    )
+    original = definition(
+        upstream_source_root
+        / "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py",
+        "rejection_sample",
+    )
+    launches = [
+        node
+        for node in ast.walk(copied)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Subscript)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_insert_resampled_kernel"
+    ]
+    assert len(launches) == 1
+    ppu_options = [kw for kw in launches[0].keywords if kw.arg == "num_warps"]
+    assert len(ppu_options) == 1 and ast.literal_eval(ppu_options[0].value) == 1
+    launches[0].keywords.remove(ppu_options[0])
+    assert ast.dump(copied, include_attributes=False) == ast.dump(
+        original, include_attributes=False
+    )

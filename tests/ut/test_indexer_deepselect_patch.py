@@ -84,7 +84,7 @@ def installed(modules):
         "vllm.v1.attention.backends.mla.sparse_indexer", has_deep_select=original
     )
     step5 = modules(
-        "vllm.models.step5.nvidia.ops.sparse_indexer", is_deep_select_supported=original
+        "vllm.models.step5.common.ops.sparse_indexer", is_deep_select_supported=original
     )
     modules("vllm_sail.utils.deep_select", **vars(sail))
     patch = load_patch(PATCH)

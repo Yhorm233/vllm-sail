@@ -25,7 +25,7 @@ from vllm.platforms import current_platform
 from vllm_sail import envs
 from vllm_sail.patch.utils import patch
 
-_MODULE = "vllm.models.step5.nvidia.ops.sparse_indexer_scores"
+_MODULE = "vllm.models.step5.common.ops.sparse_indexer_scores"
 _CONSUMERS = ("vllm.models.step5.nvidia.flashinfer_sparse",)
 _NAME = "paged_mqa_logits_sm90"
 _REASON = (

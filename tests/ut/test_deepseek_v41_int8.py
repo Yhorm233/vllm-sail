@@ -897,6 +897,13 @@ def sparse_indexer(installed):
     state.config.kernel_config = types.SimpleNamespace(
         sparse_indexer_topk_backend="auto", enable_jit_warmup=False
     )
+    attention = types.SimpleNamespace(indexer_logits_dtype="auto")
+    attention.resolve_indexer_logits_dtype = lambda default: (
+        default
+        if attention.indexer_logits_dtype == "auto"
+        else attention.indexer_logits_dtype
+    )
+    state.config.attention_config = attention
     state.platform.is_cuda = lambda: True
     state.platform.fp8_dtype = lambda: "float8_e4m3fn"
     state.module("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: True)
@@ -921,6 +928,7 @@ def sparse_indexer(installed):
     path = "vllm_sail/patch/enhancement/attention/sparse_attn_indexer.py"
     namespace = dict(
         SparseAttnIndexer=Indexer,
+        STR_DTYPE_TO_TORCH_DTYPE={"float32": "fp32", "bfloat16": "bf16"},
         torch=state.modules["torch"],
         current_platform=state.platform,
         get_current_vllm_config=lambda: state.config,
@@ -1001,6 +1009,108 @@ def test_dense_indexer_owns_the_ppu_weights_dtype(
         assert indexer.weights_dtype == ("bf16" if fp4_cache else "fp32")
     else:
         assert not hasattr(indexer, "weights_dtype")
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("fp4_cache", [False, True])
+@pytest.mark.parametrize("requested", ["auto", "float32", "bfloat16"])
+def test_dense_indexer_resolves_real_logits_policy(
+    installed, sparse_indexer, upstream_source_root, ppu, fp4_cache, requested
+):
+    from tests.support.source import function
+
+    config = installed.config.attention_config
+    config.indexer_logits_dtype = requested
+    resolver = function(
+        upstream_source_root / "vllm/config/attention.py",
+        "AttentionConfig.resolve_indexer_logits_dtype",
+        {},
+    )
+    config.resolve_indexer_logits_dtype = types.MethodType(resolver, config)
+    installed.platform.ppu = ppu
+    default = "bfloat16" if ppu and fp4_cache else "float32"
+    resolved = default if requested == "auto" else requested
+    if ppu and resolved != default:
+        with pytest.raises(ValueError, match="native score reduction"):
+            sparse_indexer.construct(use_fp4_cache=fp4_cache)
+        assert sparse_indexer.calls == []
+    else:
+        layer = sparse_indexer.construct(use_fp4_cache=fp4_cache)
+        assert layer.logits_dtype == {"float32": "fp32", "bfloat16": "bf16"}[resolved]
+        assert layer.parent_initialized
+        if ppu:
+            assert layer.weights_dtype == layer.logits_dtype
+
+
+@pytest.mark.upstream_source
+def test_complete_dense_constructor_preserves_upstream_outside_ppu_regions(
+    upstream_source_root,
+):
+    from tests.support.source import definition
+
+    path = ROOT / "vllm_sail/patch/enhancement/attention/sparse_attn_indexer.py"
+    copied = definition(path, "sparse_attn_indexer_init")
+    original = definition(
+        upstream_source_root / "vllm/model_executor/layers/sparse_attn_indexer.py",
+        "SparseAttnIndexer.__init__",
+    )
+    copied.name = original.name
+    copied.decorator_list = original.decorator_list
+    assert ast.unparse(copied.body[0]) == "super(SparseAttnIndexer, self).__init__()"
+    copied.body[0] = original.body[0]
+    kept = []
+    ppu_conditions = []
+    for node in copied.body:
+        if (
+            isinstance(node, ast.If)
+            and ast.unparse(node.test) == "current_platform.is_ppu()"
+        ):
+            ppu_conditions.append(node)
+            continue
+        if (
+            isinstance(node, ast.AnnAssign)
+            and ast.unparse(node.target) == "self._cp_kv_cache_interleave_size"
+        ):
+            assert ast.unparse(node.value) == "None"
+            continue
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "vllm_sail.utils.deep_gemm"
+        ):
+            continue
+        if isinstance(node, ast.If) and "is_deep_gemm_supported" in ast.unparse(
+            node.test
+        ):
+            assert len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If)
+            node = node.orelse[0]
+            assert (
+                ast.unparse(node.test)
+                == "not current_platform.is_ppu() and current_platform.is_cuda() and (not has_deep_gemm())"
+            )
+            node.test = next(
+                n.test
+                for n in original.body
+                if isinstance(n, ast.If) and "has_deep_gemm" in ast.unparse(n.test)
+            )
+        if (
+            isinstance(node, ast.If)
+            and ast.unparse(node.test) == "vllm_config.kernel_config.enable_jit_warmup"
+        ):
+            warmup = node.body[-1]
+            assert isinstance(warmup, ast.If)
+            assert (
+                ast.unparse(warmup.test)
+                == "self.dcp_world_size > 1 and (not current_platform.is_ppu()) and current_platform.is_cuda() and has_cutedsl()"
+            )
+            warmup.test = original.body[-1].body[-1].test
+        kept.append(node)
+    assert len(ppu_conditions) == 2
+    assert "self.weights_dtype" in ast.unparse(ppu_conditions[0])
+    assert "self.max_model_len" in ast.unparse(ppu_conditions[0])
+    assert "self.logits_dtype != self.weights_dtype" in ast.unparse(ppu_conditions[1])
+    copied.body = kept
+    assert ast.dump(copied) == ast.dump(original)
 
 
 @pytest.mark.parametrize(

@@ -68,6 +68,8 @@
     "args": [
       "--tensor-parallel-size",
       "8",
+      "--block-size",
+      "256",
       "--kv-cache-dtype",
       "auto",
       "--tool-call-parser",

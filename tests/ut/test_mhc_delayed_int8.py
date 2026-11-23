@@ -227,7 +227,6 @@ def test_delayed_consumer_inventory_matches_fixed_source(upstream_source_root):
     fixed = {
         "mhc_pre_delayed_tilelang": {
             "vllm.models.deepseek_v41.nvidia.model",
-            "vllm.models.deepseek_v41.nvidia.specialized_decode.boundary.boundary",
         },
         "mhc_fused_post_pre_delayed_tilelang": {
             "vllm.models.deepseek_v41.nvidia.ops.mhc"

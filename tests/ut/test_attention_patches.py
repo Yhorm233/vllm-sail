@@ -412,7 +412,10 @@ def test_mla_attention_spec_indexer_geometry_defaults_none(installed) -> None:
 
 
 @pytest.mark.requires_runtime
-def test_mla_attention_spec_merge_forwards_indexer_geometry(installed) -> None:
+@pytest.mark.parametrize("head_major", [False, True])
+def test_mla_attention_spec_merge_forwards_indexer_geometry(
+    installed, head_major
+) -> None:
     """merge() must carry the geometry from specs[0] onto the merged spec.
 
     DeepseekV32IndexerMetadataBuilder reads indexer_n_head off the merged
@@ -420,19 +423,25 @@ def test_mla_attention_spec_merge_forwards_indexer_geometry(installed) -> None:
     """
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
-    spec = _make_mla_spec(indexer_n_head=64, indexer_q_head_dim=128)
+    spec = _make_mla_spec(
+        indexer_n_head=64, indexer_q_head_dim=128, kv_head_major_slots=head_major
+    )
     merged = MLAAttentionSpec.merge([spec, spec])
     assert merged.indexer_n_head == 64
     assert merged.indexer_q_head_dim == 128
+    assert merged.kv_head_major_slots is head_major
 
 
 @pytest.mark.requires_runtime
-def test_mla_spec_dataclass_operations_preserve_indexer_geometry(installed):
+@pytest.mark.parametrize("head_major", [False, True])
+def test_mla_spec_dataclass_operations_preserve_indexer_geometry(installed, head_major):
     from dataclasses import fields, replace
 
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
-    spec = _make_mla_spec(indexer_n_head=64, indexer_q_head_dim=128)
+    spec = _make_mla_spec(
+        indexer_n_head=64, indexer_q_head_dim=128, kv_head_major_slots=head_major
+    )
     same = replace(spec)
     resized = replace(spec, block_size=256)
     other_geometry = replace(spec, indexer_n_head=32)
@@ -446,6 +455,9 @@ def test_mla_spec_dataclass_operations_preserve_indexer_geometry(installed):
     merged = MLAAttentionSpec.merge([resized, resized])
     assert type(merged) is MLAAttentionSpec
     assert (merged.indexer_n_head, merged.indexer_q_head_dim) == (64, 128)
+    assert all(
+        item.kv_head_major_slots is head_major for item in (same, resized, merged)
+    )
 
 
 # ---------------------------------------------------------------------------

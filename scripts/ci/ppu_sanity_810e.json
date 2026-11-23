@@ -5,7 +5,7 @@
     "cards": 8,
     "served_model_name": "DeepSeek-V4.1-Flash-1017",
     "env": {"VLLM_USE_RUST_FRONTEND": "1"},
-    "args": ["--gpu-memory-utilization=0.9", "--tokenizer-mode", "deepseek_v41", "--tensor-parallel-size", "8", "--reasoning-parser", "deepseek_v41", "--tool-call-parser", "deepseek_v41", "--enable-auto-tool-choice", "--engram-config", "{\"cpu_offload\":true,\"dp_shared_memory\":false}", "--mm-encoder-tp-mode", "data", "--limit-mm-per-prompt", "{\"image\":0,\"video\":0}", "--max-model-len", "524288", "--enable-prefix-caching", "--distributed-timeout-seconds", "60000", "--cpu-distributed-timeout-seconds", "60000", "--kv-cache-dtype", "auto", "--enable-chunked-prefill", "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}"]
+    "args": ["--gpu-memory-utilization=0.9", "--block-size", "128", "--tokenizer-mode", "deepseek_v41", "--tensor-parallel-size", "8", "--reasoning-parser", "deepseek_v41", "--tool-call-parser", "deepseek_v41", "--enable-auto-tool-choice", "--engram-config", "{\"cpu_offload\":true,\"dp_shared_memory\":false}", "--mm-encoder-tp-mode", "data", "--limit-mm-per-prompt", "{\"image\":0,\"video\":0}", "--max-model-len", "524288", "--enable-prefix-caching", "--distributed-timeout-seconds", "60000", "--cpu-distributed-timeout-seconds", "60000", "--kv-cache-dtype", "auto", "--enable-chunked-prefill", "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}"]
   },
   {
     "key": "deepseek-v4-flash_0731_w4a8_tp4",
@@ -61,6 +61,7 @@
     "key": "qwen3.5-397b_int8_tp8_ep8",
     "checkpoint": "LLM/qwen/v3.5/Qwen3.5-397B-A17B-W8A8-INT8",
     "cards": 8,
+    "temperature": 0.6,
     "args": ["--tensor-parallel-size", "8", "--no-enable-prefix-caching", "--enable-expert-parallel", "--max-model-len", "auto"]
   }
 ]

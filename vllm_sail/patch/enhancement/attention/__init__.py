@@ -35,6 +35,7 @@ from vllm_sail.patch.enhancement.attention import (
     mhc_delayed,  # noqa: F401
     mla_attention,  # noqa: F401
     mla_indexer,  # noqa: F401
+    indexer_logits_config,  # noqa: F401 (uses the selected PPU cache format)
     indexer_topk,  # noqa: F401
     minimax_dspark,  # noqa: F401
     musespark_routing,  # noqa: F401

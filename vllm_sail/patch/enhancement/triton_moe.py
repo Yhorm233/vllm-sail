@@ -45,10 +45,16 @@ def invoke_fused_moe_triton_kernel(
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
     # PPU MODIFICATION: begin
+    A_is_sorted: bool = False,
+    C_is_sorted: bool = False,
+    *,
     use_valu: bool = False,
     # PPU MODIFICATION: end
 ):
     # PPU MODIFICATION: begin
+    # PPU uses the pointer kernel; sorted activation buffers require NVIDIA TMA.
+    if A_is_sorted or C_is_sorted:
+        raise ValueError("PPU Triton MoE requires unsorted activation buffers")
     from vllm_sail.model_executor.layers.fused_moe.triton_kernels import (
         fused_moe_kernel,
     )
@@ -438,6 +444,8 @@ def get_moe_configs(
     block_n: int | None = None,
     block_k: int | None = None,
     # PPU MODIFICATION: begin
+    down_moe: bool = False,
+    *,
     use_moe_wna16_cuda: bool = False,
     # PPU MODIFICATION: end
 ) -> dict[int, Any] | None:
@@ -449,6 +457,12 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
+    # PPU MODIFICATION: begin
+    # Separate upstream down-projection configs can enable sorted-A TMA. PPU
+    # keeps its pointer path and the UP/DOWN configs selected by its own apply.
+    if down_moe:
+        return None
+    # PPU MODIFICATION: end
 
     # Avoid optimizing for the batch invariant case. Use default config
     if envs.VLLM_BATCH_INVARIANT:

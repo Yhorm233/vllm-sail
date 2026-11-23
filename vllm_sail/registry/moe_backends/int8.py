@@ -192,7 +192,7 @@ def select_int8_moe_backend(
     weight_key: QuantKey | None = oracle.kInt8StaticChannelSym,
     activation_key: QuantKey | None = oracle.kInt8DynamicTokenSym,
 ) -> tuple[Int8MoeBackend, type[mk.FusedMoEExperts]]:
-    is_batched = config.moe_parallel_config.use_batched_activation_format
+    is_batched = config.activation_format.is_batched
     if not is_batched or config.moe_backend == "auto":
         return _upstream_select_int8_moe_backend(config, weight_key, activation_key)
 

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ast
 import copy
+from abc import ABC
 from pathlib import Path
+from typing import Generic, TypeVar
 
 import pytest
 
@@ -63,6 +65,21 @@ def function(relative, name, namespace):
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[node.name]
+
+
+def load_moe_oracle(upstream, name, namespace):
+    """加载真实共享及具体 oracle 类；不证明模块导入、安装或设备行为。"""
+    base_namespace = {
+        "ABC": ABC,
+        "Generic": Generic,
+        "BackendT": TypeVar("BackendT"),
+        "_UNSET": object(),
+        "logger": namespace["logger"],
+    }
+    namespace["MoEKernelOracle"] = function(
+        upstream.parent / "base.py", "MoEKernelOracle", base_namespace
+    )
+    return function(upstream, name, namespace)
 
 
 def assert_accepts_upstream_keywords(
