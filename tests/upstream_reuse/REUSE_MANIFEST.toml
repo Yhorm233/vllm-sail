@@ -28,6 +28,8 @@
 #   reason      why this entry is direct|adapted (audited on every bump)
 #   min_tests   minimum number of upstream test cases that must be collected;
 #               guards against a silently-empty run after an upstream refactor
+#   hub_repos   optional list of Hub repo IDs required by the selected tests;
+#               only declared repos are checked before offline execution
 #   # --- optional adaptation knobs (mode = "adapted" only) ---
 #   markers     pytest -m expression narrowing the run
 #   keywords    pytest -k expression narrowing the run
@@ -206,9 +208,13 @@ path = "tests/test_pooling_params.py"
 mode = "adapted"
 chips = ["cpu", "810e", "890p"]
 category = "params"
-reason = "PoolingParams validation excluding the Snowflake embedding-dimension case; its offline model configuration is not provisioned."
-deselect = ["tests/test_pooling_params.py::test_embed_dimensions[model_info1]"]
-min_tests = 40
+reason = "PoolingParams validation excluding the two embedding-dimension cases that require Hugging Face model configuration."
+deselect = [
+    "tests/test_pooling_params.py::test_embed_dimensions[model_info0]",
+    "tests/test_pooling_params.py::test_embed_dimensions[model_info1]",
+]
+hub_repos = []
+min_tests = 39
 
 [[entry]]
 id = "prefix_caching"

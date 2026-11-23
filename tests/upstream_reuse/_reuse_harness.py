@@ -48,6 +48,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
+from urllib.request import getproxies, proxy_bypass
 
 import pytest
 
@@ -63,6 +64,7 @@ MANIFEST_PATH = HERE / "REUSE_MANIFEST.toml"
 MANIFEST_SCHEMA = 1
 VALID_MODES = ("direct", "adapted")
 VALID_CHIPS = ("cpu", "810e", "890p")
+_HUB_REPO_ID_PATTERN = r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*"
 #: Subprocess wall-clock ceiling for one upstream test file.
 RUN_TIMEOUT_SECONDS = 1800
 
@@ -84,6 +86,7 @@ class ReuseEntry(NamedTuple):
     xfail: tuple[str, ...]
     skip_reason: str
     allowed_skips: tuple[dict[str, Any], ...] = ()
+    hub_repos: tuple[str, ...] | None = None
 
     @property
     def cpu_runnable(self) -> bool:
@@ -211,6 +214,16 @@ def load_manifest(path: Path = MANIFEST_PATH) -> list[ReuseEntry]:
             raise AssertionError(f"{entry_id}: invalid upstream test path")
         if int(raw.get("min_tests", 1)) < 1:
             raise AssertionError(f"{entry_id}: min_tests must be positive")
+        hub_repos = raw.get("hub_repos")
+        if hub_repos is not None and (
+            not isinstance(hub_repos, list)
+            or any(
+                not isinstance(repo, str)
+                or not re.fullmatch(_HUB_REPO_ID_PATTERN, repo)
+                for repo in hub_repos
+            )
+        ):
+            raise AssertionError(f"{entry_id}: hub_repos must be a list of repo IDs")
         allowed_skips = raw.get("allowed_skips", [])
         for rule in allowed_skips:
             if set(rule) != {"nodeid", "reason", "max_count"}:
@@ -238,6 +251,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> list[ReuseEntry]:
                 xfail=_as_str_tuple(raw.get("xfail")),
                 skip_reason=raw.get("skip_reason", ""),
                 allowed_skips=tuple(allowed_skips),
+                hub_repos=tuple(hub_repos) if hub_repos is not None else None,
             )
         )
     return entries
@@ -322,48 +336,6 @@ HUB_PROBE_TIMEOUT_SECONDS = 5.0
 #: Variables that disable outgoing hub traffic outright, no probe needed.
 HUB_OFFLINE_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
 
-#: A ``"org/name"`` literal -- how an upstream test names a checkpoint.
-_HUB_REPO_ID = re.compile(r"""["']([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)["']""")
-
-#: First path segments that are repository directories, not hub organisations.
-_NON_REPO_ORGS = frozenset(
-    {
-        ".",
-        "..",
-        "assets",
-        "benchmarks",
-        "docs",
-        "examples",
-        "requirements",
-        "tests",
-        "tools",
-        "vllm",
-    }
-)
-
-#: Second path segments that are file names, not checkpoint revisions.
-_NON_REPO_SUFFIXES = (
-    ".bin",
-    ".cfg",
-    ".csv",
-    ".gguf",
-    ".in",
-    ".jinja",
-    ".json",
-    ".md",
-    ".png",
-    ".pt",
-    ".py",
-    ".safetensors",
-    ".sh",
-    ".so",
-    ".toml",
-    ".txt",
-    ".xml",
-    ".yaml",
-    ".yml",
-)
-
 #: One probe per (host, port, timeout); twenty entries share the answer.
 _HUB_PROBE_CACHE: dict[tuple[str, int, float], tuple[bool, str]] = {}
 
@@ -384,7 +356,7 @@ def hub_endpoint() -> tuple[str, int]:
 
 
 def hub_reachable(timeout: float = HUB_PROBE_TIMEOUT_SECONDS) -> tuple[bool, str]:
-    """Whether this runtime can dial the hub, plus the verbatim reason it cannot.
+    """Whether the runtime can attempt Hub access, and why it cannot if offline.
 
     Probed once per session and cached, so an air-gapped runner pays the connect
     timeout once instead of once per entry.  An explicit offline switch
@@ -394,6 +366,11 @@ def hub_reachable(timeout: float = HUB_PROBE_TIMEOUT_SECONDS) -> tuple[bool, str
         if _env_flag(name):
             return False, f"{name} is set, so outgoing hub traffic is disabled"
     host, port = hub_endpoint()
+    proxies = getproxies()
+    endpoint = os.environ.get("HF_ENDPOINT") or DEFAULT_HUB_ENDPOINT
+    scheme = urlparse(endpoint).scheme if "://" in endpoint else "https"
+    if (proxies.get(scheme) or proxies.get("all")) and not proxy_bypass(host):
+        return True, ""
     key = (host, port, timeout)
     cached = _HUB_PROBE_CACHE.get(key)
     if cached is not None:
@@ -409,27 +386,6 @@ def hub_reachable(timeout: float = HUB_PROBE_TIMEOUT_SECONDS) -> tuple[bool, str
         )
     _HUB_PROBE_CACHE[key] = outcome
     return outcome
-
-
-def hub_repo_ids(source: str) -> tuple[str, ...]:
-    """Checkpoint ids an upstream module names, in first-seen order.
-
-    A heuristic on purpose.  The question is only "could this file make the hub
-    resolve something", and the two ways to be wrong cost very differently: a
-    false positive skips one entry on a runner that is air-gapped anyway, while
-    a false negative burns ``RUN_TIMEOUT_SECONDS`` and still ends in a visible
-    failure.  Repository directories (``tests/models``) and file names
-    (``config.json``) are dropped so ordinary import strings do not count.
-    """
-    found: list[str] = []
-    for match in _HUB_REPO_ID.finditer(source):
-        repo_id = match.group(1)
-        org, name = repo_id.split("/", 1)
-        if org in _NON_REPO_ORGS or name.lower().endswith(_NON_REPO_SUFFIXES):
-            continue
-        if repo_id not in found:
-            found.append(repo_id)
-    return tuple(found)
 
 
 def hub_cache_dir() -> Path:
@@ -459,53 +415,17 @@ def cached_repo_ids(cache: Path | None = None) -> frozenset[str]:
     return frozenset(found)
 
 
-def offline_hub_gap(entry: ReuseEntry, root: Path) -> str | None:
-    """Reason when an entry needs hub access this runtime does not have.
-
-    ``None`` whenever the entry has a chance of running -- which is always the
-    case in CI, where the probe succeeds and this guard is inert, so no coverage
-    is given up on a runner that has a network.
-
-    On an air-gapped runner the alternative to skipping is not a clean failure
-    but a hang.  Upstream resolves a checkpoint through
-    ``vllm/transformers_utils/repo_utils.py::file_or_path_exists``, which retries
-    ``list_repo_files`` from inside ``socket.create_connection``; with no route to
-    the hub that blocks long past the entry's budget, and ``RUN_TIMEOUT_SECONDS``
-    eventually reports a timeout that says nothing about the cause.  A real
-    ZW-890P run of ``tests/config/test_multimodal_config.py`` was aborted at
-    100 s (``kill -ABRT`` under ``-X faulthandler``) with this stack::
-
-        socket.py:837                        create_connection
-        huggingface_hub/hf_api.py:3851       list_repo_tree
-        vllm/transformers_utils/repo_utils.py:162  lookup_files
-        vllm/transformers_utils/config.py:869      get_config
-        vllm/config/model.py:635             ModelConfig.__post_init__
-        tests/models/utils.py:308            build_model_context
-        tests/config/test_multimodal_config.py:35  test_supports_multimodal_inputs
-
-    What this must never absorb: an entry whose checkpoints *are* cached (it runs
-    offline and must be executed), an entry that names no checkpoint (its
-    failures are real), and a missing upstream file (that is pin drift, which
-    :meth:`UpstreamRunner.run` reports as an error rather than an excuse).
-    """
-    reachable, probe = hub_reachable()
-    if reachable:
-        return None
-    target = root / entry.path
-    if not target.is_file():
-        return None
-    wanted = hub_repo_ids(target.read_text(encoding="utf-8"))
-    if not wanted:
+def offline_hub_gap(entry: ReuseEntry, probe: str) -> str | None:
+    """Report only missing Hub dependencies declared for the selected tests."""
+    if not entry.hub_repos:
         return None
     have = cached_repo_ids()
-    missing = tuple(repo for repo in wanted if repo not in have)
+    missing = tuple(repo for repo in entry.hub_repos if repo not in have)
     if not missing:
         return None
     return (
         f"upstream resolves {', '.join(missing)} from the Hugging Face hub and "
-        f"{probe}; the local cache ({hub_cache_dir()}) has none of them, so this "
-        "entry cannot execute here. It runs for real wherever the hub is "
-        "reachable, which is what CI does."
+        f"{probe}; these repositories are not in the local cache ({hub_cache_dir()})."
     )
 
 
@@ -778,11 +698,6 @@ class UpstreamRunner:
             return self.complete(
                 entry, RunResult(0, 0, 0, 0, 0, 0, (), entry.skip_reason, True)
             )
-        gap = offline_hub_gap(entry, self.root)
-        if gap is not None:
-            return self.complete(
-                entry, RunResult(0, 0, 0, 0, 0, 0, (), gap, environment_gap=gap)
-            )
         if not self.target(entry).is_file():
             return self.complete(
                 entry,
@@ -797,6 +712,16 @@ class UpstreamRunner:
                     f"upstream test file not found at pinned commit: {entry.path}",
                 ),
             )
+        reachable, probe = hub_reachable()
+        if not reachable:
+            gap = offline_hub_gap(entry, probe)
+            if gap is not None:
+                return self.complete(
+                    entry, RunResult(0, 0, 0, 0, 0, 0, (), gap, environment_gap=gap)
+                )
+        env = self.build_env(entry)
+        if not reachable:
+            env.update(dict.fromkeys(HUB_OFFLINE_VARS, "1"))
         with tempfile.TemporaryDirectory(prefix="vllm_sail_reuse_") as workdir:
             junit_path = Path(workdir) / "report.xml"
             command = self.build_command(entry, junit_path)
@@ -804,7 +729,7 @@ class UpstreamRunner:
                 completed = subprocess.run(
                     command,
                     cwd=str(self.runtime_root()),
-                    env=self.build_env(entry),
+                    env=env,
                     capture_output=True,
                     text=True,
                     timeout=RUN_TIMEOUT_SECONDS,

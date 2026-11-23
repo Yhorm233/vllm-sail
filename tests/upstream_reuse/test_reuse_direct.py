@@ -21,9 +21,8 @@ actually executes the whitelist.  Two further skips are properties of the runtim
 rather than of the manifest, so they leave "direct" meaning zero edits: one for
 an installed runtime that cannot import upstream's own ``tests/conftest.py`` (a
 missing upstream test-only dependency; see ``conftest_import_error``), and one
-for a runtime with no route to the Hugging Face hub when the entry resolves a
-checkpoint through it (see ``offline_hub_gap``).  Both are inert on a runner that
-has the dependency and the network, which is what CI provides.
+for an offline runtime missing a repository explicitly declared in ``hub_repos``.
+Without such a declaration, the tests run and report their actual results.
 """
 
 from __future__ import annotations

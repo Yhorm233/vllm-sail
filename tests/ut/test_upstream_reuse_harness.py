@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import socket
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -38,7 +37,6 @@ from tests.upstream_reuse._reuse_harness import (
     cached_repo_ids,
     conftest_import_error,
     hub_endpoint,
-    hub_repo_ids,
     offline_hub_gap,
     resolve_source_root,
 )
@@ -276,6 +274,7 @@ def make_entry(path: str, **overrides: object) -> ReuseEntry:
 def no_probe_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the session-scoped hub probe from leaking between tests."""
     monkeypatch.setattr(harness, "_HUB_PROBE_CACHE", {})
+    monkeypatch.setattr(harness, "getproxies", dict)
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
     monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
     monkeypatch.delenv("HF_ENDPOINT", raising=False)
@@ -297,36 +296,6 @@ def upstream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
     return root
-
-
-def test_hub_repo_ids_finds_checkpoint_literals() -> None:
-    """The ids upstream passes to ``build_model_context`` / ``ModelConfig``."""
-    assert hub_repo_ids(MULTIMODAL_SOURCE) == (
-        "Qwen/Qwen2-0.5B-Instruct",
-        "Qwen/Qwen2.5-VL-3B-Instruct",
-        "llava-hf/llava-1.5-7b-hf",
-    )
-
-
-def test_hub_repo_ids_ignores_paths_and_filenames() -> None:
-    """``tests/config/...`` and ``config.json`` are not checkpoints.
-
-    Without that filter every import string in upstream would look like a repo
-    id and the guard would skip the whole whitelist.
-    """
-    assert "tests/config" not in hub_repo_ids(MULTIMODAL_SOURCE)
-    assert "vllm/v1" not in hub_repo_ids(MULTIMODAL_SOURCE)
-    assert hub_repo_ids('open("config.json")') == ()
-    assert hub_repo_ids('from "tests/models/utils.py" import x') == ()
-
-
-def test_hub_repo_ids_dedupes_preserving_order() -> None:
-    source = 'a = "facebook/opt-125m"\nb = "facebook/opt-125m"\nc = "Qwen/Qwen3-0.6B"'
-    assert hub_repo_ids(source) == ("facebook/opt-125m", "Qwen/Qwen3-0.6B")
-
-
-def test_hub_repo_ids_of_a_module_that_resolves_nothing() -> None:
-    assert hub_repo_ids(OFFLINE_SAFE_SOURCE) == ()
 
 
 def test_cached_repo_ids_reads_the_models_layout(tmp_path: Path) -> None:
@@ -388,29 +357,24 @@ def test_the_probe_runs_once_per_session(
     assert len(calls) == 1
 
 
-def test_the_guard_is_inert_when_the_hub_answers(
-    upstream: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """CI has a network, so CI runs every entry -- no coverage is given up."""
-    monkeypatch.setattr(harness, "hub_reachable", lambda *a, **k: (True, ""))
-    entry = make_entry("tests/config/test_multimodal_config.py")
-    assert offline_hub_gap(entry, upstream) is None
+def test_explicit_proxy_does_not_force_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a proxy-configured endpoint must not be probed directly")
+
+    monkeypatch.setattr(harness.socket, "create_connection", refuse)
+    monkeypatch.setattr(harness, "getproxies", lambda: {"https": "http://proxy:8080"})
+    monkeypatch.setattr(harness, "proxy_bypass", lambda host: False)
+    assert harness.hub_reachable() == (True, "")
 
 
-def test_the_guard_names_the_checkpoint_and_the_probe(
-    upstream: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The skip reason must carry the evidence, not just the verdict."""
-    monkeypatch.setattr(
-        harness,
-        "hub_reachable",
-        lambda *a, **k: (False, "cannot reach huggingface.co:443 (OSError: no route)"),
+def test_the_guard_names_the_declared_checkpoint_and_the_probe(upstream: Path) -> None:
+    entry = make_entry(
+        "tests/config/test_multimodal_config.py", hub_repos=("example/selected-model",)
     )
-    entry = make_entry("tests/config/test_multimodal_config.py")
-    reason = offline_hub_gap(entry, upstream)
+    reason = offline_hub_gap(entry, "cannot reach huggingface.co:443 (no route)")
     assert reason is not None
-    assert "Qwen/Qwen2-0.5B-Instruct" in reason
-    assert "llava-hf/llava-1.5-7b-hf" in reason
+    assert "example/selected-model" in reason
+    assert "Qwen/Qwen2-0.5B-Instruct" not in reason
     assert "no route" in reason
 
 
@@ -418,29 +382,11 @@ def test_the_guard_lets_a_cached_checkpoint_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Offline and warm is a runnable combination, so it must not be skipped."""
-    root = tmp_path / "upstream"
-    (root / "tests" / "config").mkdir(parents=True)
-    (root / "tests" / "config" / "test_multimodal_config.py").write_text(
-        'model = "facebook/opt-125m"\n', encoding="utf-8"
-    )
     cache = tmp_path / "hub"
     (cache / "models--facebook--opt-125m").mkdir(parents=True)
     monkeypatch.setenv("HF_HUB_CACHE", str(cache))
-    monkeypatch.setattr(harness, "hub_reachable", lambda *a, **k: (False, "offline"))
-    entry = make_entry("tests/config/test_multimodal_config.py")
-    assert offline_hub_gap(entry, root) is None
-
-
-def test_the_guard_lets_an_entry_without_checkpoints_run(
-    upstream: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A module that resolves nothing cannot be blamed on the network.
-
-    If it fails offline, that failure is real and must stay a failure.
-    """
-    monkeypatch.setattr(harness, "hub_reachable", lambda *a, **k: (False, "offline"))
-    entry = make_entry("tests/v1/sample/test_sampler.py")
-    assert offline_hub_gap(entry, upstream) is None
+    entry = make_entry("tests/test_example.py", hub_repos=("facebook/opt-125m",))
+    assert offline_hub_gap(entry, "offline") is None
 
 
 def test_the_guard_does_not_excuse_a_missing_upstream_file(
@@ -448,8 +394,10 @@ def test_the_guard_does_not_excuse_a_missing_upstream_file(
 ) -> None:
     """Pin drift is reported as an error by ``run``, never softened to a skip."""
     monkeypatch.setattr(harness, "hub_reachable", lambda *a, **k: (False, "offline"))
-    entry = make_entry("tests/config/test_deleted_upstream.py")
-    assert offline_hub_gap(entry, upstream) is None
+    entry = make_entry("tests/test_deleted.py", hub_repos=("example/required-model",))
+    result = UpstreamRunner(upstream).run(entry)
+    assert result.failed_names == (f"MISSING::{entry.path}",)
+    assert not result.environment_gap
 
 
 def test_the_runner_decides_before_spawning_a_subprocess(
@@ -463,7 +411,10 @@ def test_the_runner_decides_before_spawning_a_subprocess(
     monkeypatch.setattr(harness.subprocess, "run", refuse)
     monkeypatch.setattr(harness, "hub_reachable", lambda *a, **k: (False, "offline"))
     result = UpstreamRunner(upstream).run(
-        make_entry("tests/config/test_multimodal_config.py")
+        make_entry(
+            "tests/config/test_multimodal_config.py",
+            hub_repos=("Qwen/Qwen2-0.5B-Instruct",),
+        )
     )
     assert result.environment_gap
     assert result.collected == 0
@@ -516,37 +467,54 @@ def test_strict_collection_minimum_is_retained():
     assert error is not None and "expected at least 3" in error
 
 
-def test_pooling_reuse_excludes_only_the_snowflake_parameter(tmp_path):
-    entry = next(e for e in harness.load_manifest() if e.id == "pooling_params")
-    target = tmp_path / entry.path
-    target.parent.mkdir(parents=True)
+@pytest.mark.parametrize("declare_no_hub_repos", [True, False])
+def test_deselected_hub_cases_do_not_block_offline_reuse(
+    upstream: Path, monkeypatch: pytest.MonkeyPatch, declare_no_hub_repos: bool
+) -> None:
+    entry = next(
+        entry for entry in harness.load_manifest() if entry.id == "pooling_params"
+    )
+    if declare_no_hub_repos:
+        assert entry.hub_repos == ()
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    else:
+        entry = entry._replace(
+            id="another_adapted_entry",
+            path="tests/test_example.py",
+            deselect=(),
+            keywords="test_other_pooling_parameters",
+            hub_repos=None,
+        )
+        monkeypatch.setattr(harness, "hub_reachable", lambda: (False, "no route"))
+    monkeypatch.setattr(
+        harness,
+        "RUNTIME_BOOTSTRAP",
+        "import sys, pytest; raise SystemExit(pytest.main(sys.argv[1:]))",
+    )
+    target = upstream / entry.path
     target.write_text(
+        "import os\n"
         "import pytest\n"
         '@pytest.mark.parametrize("model_info", [\n'
         '    {"name": "intfloat/multilingual-e5-small"},\n'
         '    {"name": "Snowflake/snowflake-arctic-embed-m-v1.5"},\n'
         "])\n"
         "def test_embed_dimensions(model_info):\n"
-        '    assert model_info["name"] == "intfloat/multilingual-e5-small"\n'
+        '    raise AssertionError("Hub-dependent case must be deselected")\n'
         '@pytest.mark.parametrize("case", range(39))\n'
         "def test_other_pooling_parameters(case):\n"
         "    assert case >= 0\n"
+        '    assert os.environ["HF_HUB_OFFLINE"] == "1"\n'
+        '    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"\n'
     )
-    runner = UpstreamRunner(tmp_path)
-    report = tmp_path / "report.xml"
-    result = subprocess.run(
-        runner.build_command(entry, report),
-        cwd=tmp_path,
-        env=runner.build_env(entry),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert harness._parse_junit(report)[:4] == (40, 0, 0, 0)
+    runner = UpstreamRunner(upstream, strict=True, execution_target="890p")
+    try:
+        result = runner.run(entry)
+    finally:
+        runner.close()
+    assert result.collected == result.passed == 39
     assert entry.mode == "adapted"
-    assert entry.min_tests == 40
+    assert entry.min_tests == 39
     assert not entry.skip_reason
 
 
@@ -684,7 +652,10 @@ def test_strict_environment_gap_is_recorded_before_failing(
 ):
     monkeypatch.setattr(harness, "hub_reachable", lambda *a, **k: (False, "offline"))
     runner = UpstreamRunner(upstream, strict=True, report_dir=tmp_path / "reports")
-    entry = make_entry("tests/config/test_multimodal_config.py")
+    entry = make_entry(
+        "tests/config/test_multimodal_config.py",
+        hub_repos=("Qwen/Qwen2-0.5B-Instruct",),
+    )
     with pytest.raises(AssertionError, match="Hugging Face"):
         runner.run(entry)
     report = runner.write_report([entry])
@@ -762,7 +733,7 @@ def test_reviewed_apc_skip_retains_source_location_and_count_limit(tmp_path):
 
 
 def test_strict_runner_retains_xml_and_logs(upstream, tmp_path, monkeypatch):
-    entry = make_entry("tests/v1/sample/test_sampler.py")
+    entry = make_entry("tests/v1/sample/test_sampler.py", hub_repos=("example/model",))
 
     def execute(command, **kwargs):
         xml = Path(

@@ -15,11 +15,9 @@ cases. The adaptation is data-driven and **never edits upstream source**:
   (e.g. a warm offline tokenizer cache) without deleting it, keeping the intent
   auditable.
 
-A fourth path is conditional on the runtime instead of declared in the manifest:
-``offline_hub_gap`` skips an entry that would have to resolve a checkpoint from
-the Hugging Face hub when this runtime has no route to it and no local copy,
-which is a hang rather than a failure otherwise. Unlike ``skip_reason`` it costs
-nothing when resources are available; strict CI fails on any such gap.
+Offline runners execute the selected tests in Hugging Face offline mode. A
+missing cached repository declared in ``hub_repos`` skips an optional local
+run and fails strict CI; model IDs in unselected tests are not checked.
 
 All of that reconciliation logic lives in this module, so following an upstream
 bump only the manifest data changes -- never the upstream files.
