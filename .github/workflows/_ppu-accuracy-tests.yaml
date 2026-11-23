@@ -9,6 +9,9 @@ on:
       pr_mode:
         type: boolean
         default: false
+      publish_nightly_summary:
+        type: boolean
+        default: false
       pr_head_sha:
         type: string
         default: ""
@@ -298,6 +301,7 @@ jobs:
           github-token: ${{ !inputs.pr_mode && github.token || '' }}
 
       - name: Run GSM8K accuracy in the preloaded CUDA-compatible runtime
+        id: accuracy
         if: '!inputs.pr_mode'
         env:
           TRUSTED_CI_DIR: ${{ steps.runtime.outputs.trusted }}
@@ -307,6 +311,7 @@ jobs:
           PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
           PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
           PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
+          PPU_CI_RECORD_LEGACY_ACCURACY: ${{ inputs.publish_nightly_summary }}
           PPU_CI_WHEEL_SOURCE_SHA: ${{ !inputs.skip_wheel_build && (inputs.wheel_source_sha || inputs.pr_head_sha || github.sha) || '' }}
           PPU_CI_SKIP_WHEEL_INSTALL: ${{ inputs.skip_wheel_build == true }}
           PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag }}
@@ -389,13 +394,15 @@ jobs:
                               "model-accuracy"], child)
           PY
 
-      - name: Generate public PR Nightly legacy summary
+      - name: Generate public legacy accuracy summary
         id: pr_summary
-        if: always() && inputs.pr_mode && steps.runtime.outcome == 'success'
+        if: always() && (inputs.pr_mode || inputs.publish_nightly_summary) && steps.runtime.outcome == 'success'
+        continue-on-error: ${{ !inputs.pr_mode }}
         env:
           PRIVATE_DIR: ${{ steps.runtime.outputs.artifacts }}
           WHEELS_OUTCOME: ${{ steps.wheels.outcome }}
-          ACCURACY_OUTCOME: ${{ steps.pr_accuracy.outcome }}
+          ACCURACY_OUTCOME: ${{ inputs.pr_mode && steps.pr_accuracy.outcome || steps.accuracy.outcome }}
+          INCLUDE_GOLDEN: ${{ inputs.publish_nightly_summary }}
         run: |
           PUBLIC_DIR="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-summary.XXXXXX")"
           printf '::add-mask::%s\n' "$PUBLIC_DIR"
@@ -458,6 +465,10 @@ jobs:
           summary = {"status": case_status, "failure_reason": reason, "gsm8k": {
               "score": score, "evaluated_samples": samples, "gate": gate,
           }}
+          if gate != "not_available" and os.environ.get("INCLUDE_GOLDEN") == "true":
+              golden = record.get("golden_score")
+              if type(golden) in (int, float) and 0 <= golden <= 1:
+                  summary["gsm8k"]["golden_score"] = golden
           output = Path(os.environ["PUBLIC_DIR"]) / "summary.json"
           with output.open("x", encoding="utf-8") as target:
               json.dump(summary, target, allow_nan=False)
@@ -469,6 +480,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ppu-pr-nightly-legacy-${{ matrix.model.case_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.pr_summary.outputs.summary }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Nightly legacy accuracy summary
+        if: always() && inputs.publish_nightly_summary && steps.pr_summary.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-legacy-${{ matrix.model.case_id }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.pr_summary.outputs.summary }}
           if-no-files-found: error
           retention-days: 14

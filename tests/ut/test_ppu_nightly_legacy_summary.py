@@ -44,7 +44,7 @@ def run_step(job, name, env):
 def summarize(tmp_path, outcome, *, wheels="success"):
     step = run_step(
         "accuracy",
-        "Generate public PR Nightly legacy summary",
+        "Generate public legacy accuracy summary",
         {
             "PRIVATE_DIR": str(tmp_path),
             "RUNNER_TEMP": str(tmp_path),

@@ -36,7 +36,13 @@ ROOT_DIR="${PPU_CI_SOURCE_ROOT:-$(cd -- "${CI_SCRIPT_DIR}/../.." && pwd)}"
 
 RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
 ci_result_file="${RESULTS_DIR}/legacy-accuracy-result.json"
-if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+record_legacy_accuracy="${REQUIRE_PR_ARTIFACT:-false}"
+# The trusted launcher can also be used against older evaluator revisions.
+if [[ "${RECORD_LEGACY_ACCURACY:-false}" == true ]] &&
+    grep -q -- '--ci-result-file' "${ROOT_DIR}/scripts/eval/ppu_gsm8k_eval.py"; then
+    record_legacy_accuracy=true
+fi
+if [[ "$record_legacy_accuracy" == true ]]; then
     umask 077
     mkdir -p "${RESULTS_DIR}"
     record_setup_failure() {
@@ -363,7 +369,7 @@ fi
 if [[ "${UPDATE_GOLDEN}" == "1" ]]; then
     eval_args+=(--update-golden)
 fi
-if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+if [[ "$record_legacy_accuracy" == true ]]; then
     eval_args+=(--ci-result-file "${ci_result_file}")
     trap - EXIT
 fi

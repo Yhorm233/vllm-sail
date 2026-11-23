@@ -629,9 +629,11 @@ def extract_score(result: Any) -> tuple[float, int]:
 
 def _write_ci_result(path: Path, result: dict[str, Any]) -> None:
     payload = {"status": result["status"]}
-    score, num = result.get("score"), result.get("num")
-    if type(score) in (int, float) and 0 <= score <= 1:
-        payload["score"] = score
+    num = result.get("num")
+    for key in ("score", "golden_score"):
+        score = result.get(key)
+        if type(score) in (int, float) and 0 <= score <= 1:
+            payload[key] = score
     if type(num) is int and num >= 0:
         payload["num"] = num
     path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
@@ -878,6 +880,7 @@ def _golden_compare(
             "record": record,
         }
 
+    golden_score = None
     # --- Threshold, used only where no golden can arbitrate --------------
     ok_thr, thr_err = check_score_threshold(score, threshold)
 
@@ -910,6 +913,7 @@ def _golden_compare(
             else:
                 # The band replaces the threshold gate entirely here.
                 ok_g, acc_err = check_accuracy_golden(score, num, golden)
+                golden_score = golden["score"]
                 status = "pass" if ok_g else "fail_accuracy"
                 error_msg = acc_err
     elif not ok_thr:
@@ -934,6 +938,7 @@ def _golden_compare(
         "score": score,
         "num": num,
         "golden_path": str(gf),
+        "golden_score": golden_score,
         "error": error_msg,
         "record": record,
     }

@@ -356,6 +356,7 @@ case "${mode}" in
             --env RESULTS_DIR=/artifacts
             --env UPDATE_GOLDEN="${UPDATE_GOLDEN:-0}"
             --env THRESHOLD="${THRESHOLD:-0.9}"
+            --env RECORD_LEGACY_ACCURACY="${PPU_CI_RECORD_LEGACY_ACCURACY:-false}"
             --env VLLM_PORT="${VLLM_PORT:-9985}"
             --env VLLM_USE_RUST_FRONTEND=0
             --env VLLM_USE_RUST_BENCH=0

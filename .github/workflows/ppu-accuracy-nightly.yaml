@@ -117,6 +117,7 @@ jobs:
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       recipe_models: ${{ steps.select.outputs.recipe_models }}
+      recipe_matrix: ${{ steps.select.outputs.recipe_matrix }}
       run_recipe: ${{ steps.select.outputs.run_recipe }}
       target_sha: ${{ steps.select.outputs.target_sha }}
     steps:
@@ -277,13 +278,14 @@ jobs:
               if os.environ["RECIPE_PUBLIC_ENABLED"] != "true":
                   sys.exit("Recipe accuracy is disabled: PPU_RECIPE_PUBLIC_ENABLED must be true")
               try:
-                  select.build_recipe_matrix("", "model_sanity")
+                  recipe_matrix = select.build_recipe_matrix("", "model_sanity")
               except ValueError as error:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
                   handle.write("matrix=\n")
                   handle.write("recipe_models=\n")
+                  handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
                   handle.write("run_recipe=true\n")
               sys.exit(0)
 
@@ -295,13 +297,14 @@ jobs:
                   sys.exit("Specify one or more distinct, nonempty Recipe policy slugs")
               models = ",".join(slugs)
               try:
-                  select.build_recipe_matrix(models, "model_sanity")
+                  recipe_matrix = select.build_recipe_matrix(models, "model_sanity")
               except ValueError as error:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
                   handle.write("matrix=\n")
                   handle.write(f"recipe_models={models}\n")
+                  handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
                   handle.write("run_recipe=true\n")
               sys.exit(0)
 
@@ -315,6 +318,9 @@ jobs:
                   # Recipe model_sanity only. Manual workflow_dispatch retains
                   # legacy access.
                   select.scheduled_legacy_accuracy_cases(selected)
+                  recipe_matrix = select.build_recipe_matrix("", "model_sanity")
+                  with output.open("a", encoding="utf-8") as handle:
+                      handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
                   legacy_cases = []
               else:
                   # Use catalog case IDs as keys to distinguish serving variants.
@@ -421,6 +427,7 @@ jobs:
       # which for a workflow_call is this nightly run.
       build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ matrix.model }}
+      publish_nightly_summary: true
       image_tag: ${{ inputs.image_tag }}
       image_digest: ${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}
       skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
@@ -450,3 +457,65 @@ jobs:
       image_tag: ${{ inputs.image_tag }}
       image_digest: ${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}
       skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
+
+  notify-summary:
+    name: Notify Nightly summary
+    needs: [select, build, resolve-image, accuracy, recipe-model-sanity]
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - id: configured
+        name: Check notification configuration
+        env:
+          PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+        run: |
+          if [[ -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.configured.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Fetch public Recipe summaries
+        if: steps.configured.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-recipe-model_sanity-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/ppu-notify-artifacts
+
+      - name: Fetch public legacy summaries
+        if: steps.configured.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-nightly-legacy-*-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/ppu-notify-artifacts
+
+      - name: Send one Markdown notification
+        if: steps.configured.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTIFY_SELECT_RESULT: ${{ needs.select.result }}
+          NOTIFY_REF: ${{ inputs.target_ref || github.ref_name }}
+          NOTIFY_BUILD_RESULT: ${{ needs.build.result }}
+          NOTIFY_SKIP_BUILD: ${{ inputs.skip_wheel_build == true }}
+          NOTIFY_IMAGE_RESULT: ${{ needs.resolve-image.result }}
+          NOTIFY_LEGACY_RESULT: ${{ needs.accuracy.result }}
+          NOTIFY_RECIPE_RESULT: ${{ needs.recipe-model-sanity.result }}
+          NOTIFY_LEGACY_MATRIX: ${{ needs.select.outputs.matrix }}
+          NOTIFY_RECIPE_MATRIX: ${{ needs.select.outputs.recipe_matrix }}
+          PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
+          PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
+          PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
+        run: python3 -B scripts/ci/ppu_notify_summary.py --nightly "$RUNNER_TEMP/ppu-notify-artifacts"
