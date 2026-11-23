@@ -17,13 +17,26 @@ on:
         type: string
         default: ""
       build_run_id:
-        description: Run supplying the ppu-wheels artifact
-        required: true
+        description: Run supplying the ppu-wheels artifact (blank when skip_wheel_build is true)
+        required: false
+        default: ""
         type: string
       models:
         description: Comma-separated accuracy model catalog keys
         type: string
         default: deepseek-v4-mxfp4
+      image_tag:
+        description: Allowed runtime image tag (tag only, no registry or repository prefix)
+        type: string
+        default: ""
+      image_digest:
+        description: Optional immutable runtime image digest (sha256:<64-hex>)
+        type: string
+        default: ""
+      skip_wheel_build:
+        description: Skip wheel download/install and run directly inside the prebuilt runtime image
+        type: boolean
+        default: false
       hf_home:
         description: Host Hugging Face cache root
         type: string
@@ -57,7 +70,7 @@ concurrency:
   # of the same build, and those lanes must not cancel each other. Lanes that
   # ask for the same set still queue, which keeps a runner's exclusive lock
   # from being taken by a duplicate dispatch.
-  group: accuracy-ppu-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id }}-${{ inputs.models }}
+  group: accuracy-ppu-${{ github.ref }}-${{ inputs.pr_mode && github.run_id || inputs.build_run_id || github.run_id }}-${{ inputs.models }}
   cancel-in-progress: false
 
 jobs:
@@ -75,6 +88,40 @@ jobs:
             if (process.env.ACTIONS_CACHE_MODE !== 'none') {
               core.setFailed('PPU CI requires cache-mode: none');
             }
+
+      - name: Validate runtime image and build inputs
+        env:
+          PR_MODE: ${{ inputs.pr_mode }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SKIP_WHEEL_BUILD: ${{ inputs.skip_wheel_build }}
+        run: |
+          if [[ "$PR_MODE" == true ]]; then
+            if [[ "$SKIP_WHEEL_BUILD" == true || -n "$IMAGE_TAG" || -n "$IMAGE_DIGEST" ]]; then
+              echo 'PR Nightly cannot override the runtime image or skip wheel installation.' >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "$IMAGE_TAG" ]]; then
+            if [[ "$IMAGE_TAG" == *".."* || ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo 'Invalid image_tag input: tag only, no registry or repository prefix.' >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "$IMAGE_DIGEST" && ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo 'Invalid image_digest input: expected sha256:<64-hex>.' >&2
+            exit 1
+          fi
+          if [[ "$SKIP_WHEEL_BUILD" == true ]]; then
+            if [[ -n "$BUILD_RUN_ID" || ( -z "$IMAGE_TAG" && -z "$IMAGE_DIGEST" ) ]]; then
+              echo 'skip_wheel_build=true requires empty build_run_id and image_tag or image_digest.' >&2
+              exit 1
+            fi
+          elif [[ -z "$BUILD_RUN_ID" ]]; then
+            echo 'build_run_id is required when skip_wheel_build is false.' >&2
+            exit 1
+          fi
 
       - name: Validate PR Nightly inputs
         if: inputs.pr_mode
@@ -184,8 +231,10 @@ jobs:
           artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-accuracy-artifacts.XXXXXX")"
           source_rel=".ppu-accuracy-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source="${GITHUB_WORKSPACE}/${source_rel}"
+          trusted_rel=".ppu-accuracy-trusted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trusted="${GITHUB_WORKSPACE}/${trusted_rel}"
           if [[ "$PR_MODE" == true ]]; then
-            printf '::add-mask::%s\n' "$config" "$wheels" "$artifacts" "$source"
+            printf '::add-mask::%s\n' "$config" "$wheels" "$artifacts" "$source" "$trusted"
           fi
           {
             printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
@@ -193,6 +242,8 @@ jobs:
             printf 'artifacts=%s\n' "$artifacts"
             printf 'source_rel=%s\n' "$source_rel"
             printf 'source=%s\n' "$source"
+            printf 'trusted_rel=%s\n' "$trusted_rel"
+            printf 'trusted=%s\n' "$trusted"
           } >> "$GITHUB_OUTPUT"
           printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
 
@@ -218,8 +269,26 @@ jobs:
           SOURCE_DIR: ${{ steps.runtime.outputs.source }}
         run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
 
+      - name: Check out trusted CI scripts
+        if: '!inputs.pr_mode'
+        uses: actions/checkout@v4
+        with:
+          github-server-url: https://github.com
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          path: ${{ steps.runtime.outputs.trusted_rel }}
+          persist-credentials: false
+
+      - name: Verify trusted CI revision
+        if: '!inputs.pr_mode'
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          TRUSTED_DIR: ${{ steps.runtime.outputs.trusted }}
+        run: test "$(git -c safe.directory="$TRUSTED_DIR" -C "$TRUSTED_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
       - name: Download CI-built wheels
         id: wheels
+        if: '!inputs.skip_wheel_build'
         uses: actions/download-artifact@v4
         with:
           name: ppu-wheels-${{ inputs.build_run_id }}
@@ -231,13 +300,17 @@ jobs:
       - name: Run GSM8K accuracy in the preloaded CUDA-compatible runtime
         if: '!inputs.pr_mode'
         env:
+          TRUSTED_CI_DIR: ${{ steps.runtime.outputs.trusted }}
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
-          PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
+          PPU_CI_WHEELS_DIR: ${{ !inputs.skip_wheel_build && steps.runtime.outputs.wheels || '' }}
           PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
           PPU_CI_DEVICE_COUNT: ${{ matrix.model.ppu_count }}
           PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
-          PPU_CI_WHEEL_SOURCE_SHA: ${{ inputs.wheel_source_sha || inputs.pr_head_sha || github.sha }}
+          PPU_CI_WHEEL_SOURCE_SHA: ${{ !inputs.skip_wheel_build && (inputs.wheel_source_sha || inputs.pr_head_sha || github.sha) || '' }}
+          PPU_CI_SKIP_WHEEL_INSTALL: ${{ inputs.skip_wheel_build == true }}
+          PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag }}
+          PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest }}
           PPU_CI_HF_HOME: ${{ inputs.hf_home }}
           PPU_CI_DG_CACHE_DIR: ${{ inputs.dg_cache_dir }}
           HF_HUB_OFFLINE: "1"
@@ -250,7 +323,7 @@ jobs:
           # Extra env for the server process only, or {} when unused.
           SERVER_ENV: ${{ toJSON(matrix.model.server_env) }}
           MODEL_ID: ${{ matrix.model.model_id }}
-        run: bash "${PPU_CI_SOURCE_DIR}/scripts/ci/ppu_runtime_container.sh" model-accuracy
+        run: bash "${TRUSTED_CI_DIR}/scripts/ci/ppu_runtime_container.sh" model-accuracy
 
       - name: Run PR Nightly accuracy with private logging
         id: pr_accuracy

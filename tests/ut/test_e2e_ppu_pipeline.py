@@ -849,7 +849,8 @@ def test_accuracy_script_seeds_reviewed_goldens_into_the_writable_tree() -> None
 def test_runtime_wrapper_exposes_accuracy_mode_and_environment() -> None:
     text = RUNTIME.read_text()
     assert "pin-ut|model-test|model-accuracy|kernel-perf" in text
-    assert "/source/scripts/ci/ppu_e2e_accuracy.sh" in text
+    assert 'container_ci_dir="/source/scripts/ci"' in text
+    assert '"${container_ci_dir}/ppu_e2e_accuracy.sh"' in text
     for marker in (
         "HF_HOME",
         "HF_HUB_OFFLINE=1",
@@ -985,14 +986,18 @@ def test_accuracy_nightly_is_serial_and_wheel_sourced_from_the_build_commit() ->
         "./.github/workflows/ppu-build-and-test.yaml"
     )
     assert nightly["jobs"]["build"]["with"] == {
-        "pr_head_sha": "${{ github.sha }}",
+        "pr_head_sha": "${{ needs.select.outputs.target_sha }}",
         "skip_device_tests": True,
     }
-    assert accuracy["needs"] == ["build", "select"]
-    # Checkout and wheels must describe the same SAIL tree.
-    assert accuracy["with"]["pr_head_sha"] == "${{ github.sha }}"
-    assert accuracy["with"]["wheel_source_sha"] == "${{ github.sha }}"
-    assert accuracy["with"]["build_run_id"] == "${{ github.run_id }}"
+    assert accuracy["needs"] == ["build", "select", "resolve-image"]
+    # Checkout and wheels must describe the same SAIL tree when building wheels.
+    assert accuracy["with"]["pr_head_sha"] == "${{ needs.select.outputs.target_sha }}"
+    assert accuracy["with"]["wheel_source_sha"] == (
+        "${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}"
+    )
+    assert accuracy["with"]["build_run_id"] == (
+        "${{ !inputs.skip_wheel_build && github.run_id || '' }}"
+    )
     assert accuracy["with"]["pr_mode"] is False
     # The accuracy work runs inside the reusable call, not on a hosted shell.
     assert "runs-on" not in accuracy

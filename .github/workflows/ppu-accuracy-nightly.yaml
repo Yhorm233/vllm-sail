@@ -49,10 +49,30 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: "Comma-separated legacy catalog keys (blank = all legacy), or recipe:<comma-separated policy slugs> for Recipe-only"
+        description: "Comma-separated legacy catalog keys (blank = all legacy when building wheels, or all Recipe model_sanity when skip_wheel_build=true), or recipe:<slug1,slug2> / recipe:all"
         required: false
         default: ""
         type: string
+      target_ref:
+        description: "Target repository branch, tag, or 40-char commit SHA (blank = default branch HEAD)"
+        required: false
+        default: ""
+        type: string
+      image_tag:
+        description: "Allowed runtime image tag (tag only, no registry or repository prefix)"
+        required: false
+        default: ""
+        type: string
+      image_digest:
+        description: "Optional immutable runtime image digest (sha256:<64-hex>)"
+        required: false
+        default: ""
+        type: string
+      skip_wheel_build:
+        description: "Skip wheel build and run directly inside the prebuilt runtime image"
+        required: false
+        default: false
+        type: boolean
 
   schedule:
     - cron: "0 12 * * *"
@@ -66,34 +86,149 @@ cache-mode: none
 concurrency:
   # Cancelling would throw away a finished build and the serial model runs
   # behind it, so a second nightly waits instead of replacing the first.
-  group: accuracy-nightly-${{ github.ref }}
+  # Route disabled scheduled triggers to a per-run group so a no-op cron
+  # cannot evict a queued DevOps dispatch in the active group.
+  group: >-
+    ${{ (github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED == 'true') &&
+    format('accuracy-nightly-disabled-schedule-{0}', github.run_id) ||
+    format('accuracy-nightly-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: Build nightly wheels
     needs: select
+    if: ${{ needs.select.result == 'success' && !inputs.skip_wheel_build }}
     uses: ./.github/workflows/ppu-build-and-test.yaml
     with:
-      # github.sha is the main commit this run was triggered on, and the same
+      # target_sha is the exact commit selected for this run, and the same
       # value goes to the accuracy calls below, so the checkout and the wheel
       # manifest describe one tree.
-      pr_head_sha: ${{ github.sha }}
+      pr_head_sha: ${{ needs.select.outputs.target_sha }}
       skip_device_tests: true
 
   select:
     name: Select accuracy models
+    if: ${{ github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      SELECT_RECIPES: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && (github.event_name == 'schedule' || startsWith(inputs.models, 'recipe:')) }}
+      SELECT_RECIPES: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && (github.event_name == 'schedule' || startsWith(inputs.models, 'recipe:') || (inputs.skip_wheel_build == true && inputs.models == '')) }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       recipe_models: ${{ steps.select.outputs.recipe_models }}
+      run_recipe: ${{ steps.select.outputs.run_recipe }}
+      target_sha: ${{ steps.select.outputs.target_sha }}
     steps:
+      - name: Validate dispatch inputs
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SKIP_WHEEL_BUILD: ${{ inputs.skip_wheel_build }}
+        run: |
+          if [[ -n "$TARGET_REF" ]]; then
+            if [[ "$TARGET_REF" == -* || "$TARGET_REF" == *".."* || "$TARGET_REF" == refs/pull/* || ! "$TARGET_REF" =~ ^[A-Za-z0-9._/@-]+$ ]]; then
+              echo "Invalid target_ref input." >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "$IMAGE_TAG" ]]; then
+            if [[ "$IMAGE_TAG" == *".."* || ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "Invalid image_tag input: tag only, no registry or repository prefix." >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "$IMAGE_DIGEST" && ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image_digest input: expected sha256:<64-hex>." >&2
+            exit 1
+          fi
+          if [[ "$SKIP_WHEEL_BUILD" == "true" && -z "$IMAGE_TAG" && -z "$IMAGE_DIGEST" ]]; then
+            echo "skip_wheel_build=true requires image_tag or image_digest." >&2
+            exit 1
+          fi
+
+      - name: Verify target revision belongs to trusted history
+        id: verify_target
+        uses: actions/github-script@v7
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const targetRef = (process.env.TARGET_REF || '').trim();
+            if (!targetRef) {
+              if (!/^[0-9a-f]{40}$/.test(context.sha)) {
+                core.setFailed('Expected 40-char workflow commit SHA');
+                return;
+              }
+              core.setOutput('target_sha', context.sha);
+              return;
+            }
+            const commit = await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: targetRef,
+            });
+            const targetSha = commit.data.sha;
+            if (!/^[0-9a-f]{40}$/.test(targetSha)) {
+              core.setFailed('Resolved target_ref did not return a 40-char commit SHA');
+              return;
+            }
+            if (targetSha === context.sha) {
+              core.setOutput('target_sha', targetSha);
+              return;
+            }
+            const repoInfo = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.data.default_branch;
+            const branches = await github.paginate(github.rest.repos.listBranches, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const trustedBranches = branches.filter(
+              (branch) => branch.name === defaultBranch || branch.name.startsWith('releases/')
+            );
+            for (const branch of trustedBranches) {
+              if (branch.commit?.sha === targetSha) {
+                core.setOutput('target_sha', targetSha);
+                return;
+              }
+            }
+            const tags = await github.paginate(github.rest.repos.listTags, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            if (tags.some((tag) => tag.commit?.sha === targetSha)) {
+              core.setOutput('target_sha', targetSha);
+              return;
+            }
+            for (const branch of trustedBranches) {
+              try {
+                const cmp = await github.rest.repos.compareCommitsWithBasehead({
+                  owner,
+                  repo,
+                  basehead: `${targetSha}...${branch.name}`,
+                });
+                if (cmp.data.status === 'identical' || cmp.data.status === 'ahead') {
+                  core.setOutput('target_sha', targetSha);
+                  return;
+                }
+              } catch (err) {
+                if (err.status !== 404) {
+                  throw err;
+                }
+              }
+            }
+            core.setFailed(
+              `target_ref resolved to ${targetSha}, which is not in ${defaultBranch}, releases/*, or repository tag history.`
+            );
+
       - name: Check out vLLM SAIL
         uses: actions/checkout@v4
         with:
+          ref: ${{ steps.verify_target.outputs.target_sha }}
           persist-credentials: false
 
       - uses: actions/setup-python@v5
@@ -111,7 +246,16 @@ jobs:
           MODELS: ${{ inputs.models }}
           RECIPE_PUBLIC_ENABLED: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED }}
           SCHEDULED_RECIPE_ENABLED: ${{ github.event_name == 'schedule' && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' }}
+          SKIP_WHEEL_BUILD: ${{ inputs.skip_wheel_build }}
+          VERIFIED_TARGET_SHA: ${{ steps.verify_target.outputs.target_sha }}
         run: |
+          target_sha="$(git -c safe.directory="$PWD" rev-parse HEAD)"
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "${VERIFIED_TARGET_SHA:-}" && "$target_sha" != "$VERIFIED_TARGET_SHA" ]]; then
+            echo "Checked-out commit does not match verified target_sha." >&2
+            exit 1
+          fi
+          export TARGET_SHA="$target_sha"
           python3 - <<'PY'
           import importlib.util
           import json
@@ -125,8 +269,24 @@ jobs:
           select = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(select)
 
-          requested = os.environ.get("MODELS", "")
+          requested = os.environ.get("MODELS", "").strip()
+          skip_wheel_build = os.environ.get("SKIP_WHEEL_BUILD", "false") == "true"
+          target_sha = os.environ["TARGET_SHA"]
           output = Path(os.environ["GITHUB_OUTPUT"])
+          if requested == "recipe:all" or (skip_wheel_build and requested == ""):
+              if os.environ["RECIPE_PUBLIC_ENABLED"] != "true":
+                  sys.exit("Recipe accuracy is disabled: PPU_RECIPE_PUBLIC_ENABLED must be true")
+              try:
+                  select.build_recipe_matrix("", "model_sanity")
+              except ValueError as error:
+                  sys.exit(str(error))
+              with output.open("a", encoding="utf-8") as handle:
+                  handle.write(f"target_sha={target_sha}\n")
+                  handle.write("matrix=\n")
+                  handle.write("recipe_models=\n")
+                  handle.write("run_recipe=true\n")
+              sys.exit(0)
+
           if requested.startswith("recipe:"):
               if os.environ["RECIPE_PUBLIC_ENABLED"] != "true":
                   sys.exit("Recipe accuracy is disabled: PPU_RECIPE_PUBLIC_ENABLED must be true")
@@ -139,7 +299,10 @@ jobs:
               except ValueError as error:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
+                  handle.write(f"target_sha={target_sha}\n")
+                  handle.write("matrix=\n")
                   handle.write(f"recipe_models={models}\n")
+                  handle.write("run_recipe=true\n")
               sys.exit(0)
 
           catalog = json.loads(select.CATALOG.read_text())
@@ -166,17 +329,78 @@ jobs:
               matrix = json.dumps({"include": include}, separators=(",", ":"))
               print(f"accuracy matrix: {matrix}")
               with output.open("a", encoding="utf-8") as handle:
+                  handle.write(f"target_sha={target_sha}\n")
                   handle.write(f"matrix={matrix}\n")
+                  handle.write("run_recipe=false\n")
           else:
               print("accuracy matrix: skipped (scheduled legacy nightly disabled)")
               with output.open("a", encoding="utf-8") as handle:
+                  handle.write(f"target_sha={target_sha}\n")
                   handle.write("matrix=\n")
+                  handle.write("run_recipe=true\n")
           PY
+
+  resolve-image:
+    name: Pin runtime image digest
+    needs: select
+    if: >-
+      ${{ !cancelled() && needs.select.result == 'success' &&
+      inputs.image_tag != '' && inputs.image_digest == '' }}
+    runs-on: 8-ppu-m890p
+    timeout-minutes: 10
+    env:
+      GIT_CONFIG_NOSYSTEM: "1"
+    outputs:
+      image_digest: ${{ steps.resolve.outputs.image_digest }}
+    steps:
+      - name: Prepare isolated trusted CI checkout
+        id: workspace
+        run: |
+          config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
+          trusted_rel=".ppu-nightly-resolve-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trusted="${GITHUB_WORKSPACE}/${trusted_rel}"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
+            printf 'trusted_rel=%s\n' "$trusted_rel"
+            printf 'trusted=%s\n' "$trusted"
+          } >> "$GITHUB_OUTPUT"
+          printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Check out trusted CI scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          path: ${{ steps.workspace.outputs.trusted_rel }}
+          persist-credentials: false
+
+      - name: Resolve tag to immutable digest once
+        id: resolve
+        env:
+          TRUSTED_DIR: ${{ steps.workspace.outputs.trusted }}
+          PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          digest_file="$(mktemp "${RUNNER_TEMP}/ppu-runtime-digest.XXXXXX")"
+          image_id="$(PPU_CI_RUNTIME_DIGEST_OUT="$digest_file" bash "${TRUSTED_DIR}/scripts/ci/ppu_runtime_image.sh")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          raw_digest="$(<"$digest_file")"
+          rm -f -- "$digest_file"
+          digest="${raw_digest#@}"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Failed to resolve immutable runtime image digest." >&2
+            exit 1
+          fi
+          printf 'image_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
   accuracy:
     name: Accuracy ${{ matrix.model }}
-    needs: [build, select]
-    if: needs.select.outputs.matrix != ''
+    needs: [build, select, resolve-image]
+    if: >-
+      ${{ !cancelled() && needs.select.result == 'success' &&
+      needs.select.outputs.matrix != '' &&
+      (needs.resolve-image.result == 'success' || needs.resolve-image.result == 'skipped') &&
+      (needs.build.result == 'success' ||
+      (inputs.skip_wheel_build == true && needs.build.result == 'skipped')) }}
     permissions:
       contents: read
       actions: read
@@ -191,27 +415,38 @@ jobs:
       pr_mode: false
       # Reuse the exact SAIL commit the wheels were built from; the wrapper
       # refuses a checkout that disagrees with the wheel manifest.
-      pr_head_sha: ${{ github.sha }}
-      wheel_source_sha: ${{ github.sha }}
+      pr_head_sha: ${{ needs.select.outputs.target_sha }}
+      wheel_source_sha: ${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}
       # _ppu-build.yaml names the artifact after the run that uploaded it,
       # which for a workflow_call is this nightly run.
-      build_run_id: ${{ github.run_id }}
+      build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ matrix.model }}
+      image_tag: ${{ inputs.image_tag }}
+      image_digest: ${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}
+      skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
 
   recipe-model-sanity:
     name: Recipe model sanity & micro-E2E
-    needs: [build, select, accuracy]
+    needs: [build, select, resolve-image, accuracy]
     if: >-
       ${{ !cancelled() && vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' &&
-      needs.build.result == 'success' && needs.select.result == 'success' &&
-      (github.event_name == 'schedule' || needs.select.outputs.recipe_models != '') }}
+      needs.select.result == 'success' &&
+      (needs.resolve-image.result == 'success' || needs.resolve-image.result == 'skipped') &&
+      (needs.build.result == 'success' ||
+      (inputs.skip_wheel_build == true && needs.build.result == 'skipped')) &&
+      (github.event_name == 'schedule' ||
+      needs.select.outputs.recipe_models != '' ||
+      needs.select.outputs.run_recipe == 'true') }}
     permissions:
       contents: read
       actions: read
     uses: ./.github/workflows/_ppu-recipe-model-sanity.yaml
     with:
       pr_mode: false
-      pr_head_sha: ${{ github.sha }}
-      wheel_source_sha: ${{ github.sha }}
-      build_run_id: ${{ github.run_id }}
+      pr_head_sha: ${{ needs.select.outputs.target_sha }}
+      wheel_source_sha: ${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}
+      build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ needs.select.outputs.recipe_models }}
+      image_tag: ${{ inputs.image_tag }}
+      image_digest: ${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}
+      skip_wheel_build: ${{ inputs.skip_wheel_build == true }}

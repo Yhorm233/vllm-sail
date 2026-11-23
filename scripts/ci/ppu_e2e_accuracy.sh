@@ -31,7 +31,8 @@
 #                      (default: /source/tests/e2e/models/_golden)
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+CI_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${PPU_CI_SOURCE_ROOT:-$(cd -- "${CI_SCRIPT_DIR}/../.." && pwd)}"
 
 RESULTS_DIR="${RESULTS_DIR:?RESULTS_DIR is required}"
 ci_result_file="${RESULTS_DIR}/legacy-accuracy-result.json"
@@ -64,7 +65,24 @@ CASE_ID="${CASE_ID:-${MODEL_KEY}}"
 SERVER_CMD="${SERVER_CMD:-}"
 SERVER_ENV="${SERVER_ENV:-}"
 MODEL_ID="${MODEL_ID:?MODEL_ID is required}"
-WHEELS_DIR="${WHEELS_DIR:?WHEELS_DIR is required}"
+SKIP_WHEEL_INSTALL="${PPU_CI_SKIP_WHEEL_INSTALL:-false}"
+[[ "${SKIP_WHEEL_INSTALL}" =~ ^(true|false)$ ]] || {
+    echo "PPU_CI_SKIP_WHEEL_INSTALL must be true or false" >&2
+    exit 2
+}
+if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
+    WHEELS_DIR="${WHEELS_DIR:?WHEELS_DIR is required}"
+else
+    [[ "${REQUIRE_PR_ARTIFACT:-false}" != true ]] || {
+        echo "PPU_CI_SKIP_WHEEL_INSTALL is not allowed in PR mode" >&2
+        exit 2
+    }
+    [[ "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}" =~ ^@sha256:[0-9a-f]{64}$ ]] || {
+        echo "Prebuilt image mode requires a verified runtime image digest" >&2
+        exit 2
+    }
+    WHEELS_DIR="${WHEELS_DIR:-}"
+fi
 UPDATE_GOLDEN="${UPDATE_GOLDEN:-0}"
 THRESHOLD="${THRESHOLD:-0.9}"
 VLLM_PORT="${VLLM_PORT:-9985}"
@@ -97,64 +115,195 @@ python -c 'import sys; print("python", sys.version)'
 # answers 401 from the runners and the image torch is what the smoke lane
 # serves models with, so there is nothing to replace.
 log "capture SAIL PyTorch stack"
-WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
-verify_args=(verify "${WHEELS_DIR}")
-if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
-    verify_args+=(
-        --vllm-commit "${EXPECTED_VLLM_COMMIT:?EXPECTED_VLLM_COMMIT is required}"
-        --sail-commit "${EXPECTED_SAIL_COMMIT:?EXPECTED_SAIL_COMMIT is required}"
-    )
+if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
+    WHEELS_DIR="$(cd -- "${WHEELS_DIR}" && pwd)"
+    verify_args=(verify "${WHEELS_DIR}")
+    if [[ "${REQUIRE_PR_ARTIFACT:-false}" == true ]]; then
+        verify_args+=(
+            --vllm-commit "${EXPECTED_VLLM_COMMIT:?EXPECTED_VLLM_COMMIT is required}"
+            --sail-commit "${EXPECTED_SAIL_COMMIT:?EXPECTED_SAIL_COMMIT is required}"
+        )
+    fi
+    python "${CI_SCRIPT_DIR}/ppu_wheel_manifest.py" "${verify_args[@]}"
 fi
-python "${ROOT_DIR}/scripts/ci/ppu_wheel_manifest.py" "${verify_args[@]}"
 
-export PIP_CONSTRAINT="${RESULTS_DIR}/image-constraints.txt"
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
-    --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json" \
-    --constraints "${PIP_CONSTRAINT}"
+RAW_IMAGE_STACK="/tmp/ppu-accuracy-image-stack.json"
+export PIP_CONSTRAINT="/tmp/ppu-accuracy-image-constraints.txt"
+if ! python "${CI_SCRIPT_DIR}/ppu_image_stack.py" capture \
+    --sdk /usr/local/PPU_SDK --output "${RAW_IMAGE_STACK}" \
+    --constraints "${PIP_CONSTRAINT}" >/tmp/ppu-accuracy-image-stack-capture.log 2>&1; then
+    echo "ERROR: SAIL PyTorch image stack capture failed" >&2
+    exit 1
+fi
+python - "${RAW_IMAGE_STACK}" "${RESULTS_DIR}/image-stack.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+raw_path, public_path = Path(sys.argv[1]), Path(sys.argv[2])
+raw = json.loads(raw_path.read_text(encoding="utf-8"))
+SAFE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
+BASE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}"
+)
+
+
+def sanitize_version(value):
+    if not isinstance(value, str):
+        return None
+    if SAFE_VERSION_RE.fullmatch(value):
+        return value
+    if "+" in value:
+        base = value.split("+", 1)[0]
+        if BASE_VERSION_RE.fullmatch(base):
+            return base
+    return None
+
+
+packages = {}
+raw_packages = raw.get("packages")
+if isinstance(raw_packages, dict):
+    for name, version in raw_packages.items():
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            cleaned = sanitize_version(version)
+            if cleaned is not None:
+                packages[name] = cleaned
+
+sanitized = {
+    "stack_source": raw.get("stack_source") if raw.get("stack_source") in {"image", "image+torch"} else "image",
+    "fingerprint_kind": raw.get("fingerprint_kind") if raw.get("fingerprint_kind") == "installed-tree-sha256" else "installed-tree-sha256",
+    "sdk_sha256": raw.get("sdk_sha256") if isinstance(raw.get("sdk_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", raw["sdk_sha256"]) else None,
+    "torch_sha256": raw.get("torch_sha256") if isinstance(raw.get("torch_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", raw["torch_sha256"]) else None,
+    "torch_version": sanitize_version(raw.get("torch_version")),
+    "packages": packages,
+}
+public_path.write_text(json.dumps(sanitized, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+for key in ("stack_source", "fingerprint_kind", "sdk_sha256", "torch_sha256", "torch_version"):
+    if sanitized[key] is not None:
+        print(f"{key}={sanitized[key]}")
+PY
 
 # ------------------------------------------------------------------
-log "install wheels"
-mapfile -t vllm_wheels < <(
-    find "${WHEELS_DIR}" -type f -name 'vllm-*.whl' -print | sort
-)
-mapfile -t sail_wheels < <(
-    find "${WHEELS_DIR}" -type f -name 'vllm_sail-*.whl' -print | sort
-)
-((${#vllm_wheels[@]} == 1)) || { echo "expected one vLLM wheel under ${WHEELS_DIR}, got ${#vllm_wheels[@]}"; exit 1; }
-((${#sail_wheels[@]} == 1)) || { echo "expected one vLLM SAIL wheel under ${WHEELS_DIR}, got ${#sail_wheels[@]}"; exit 1; }
-python -m pip install --no-deps --force-reinstall "${vllm_wheels[0]}"
-python -m pip install --no-deps --force-reinstall "${sail_wheels[0]}"
+if [[ "${SKIP_WHEEL_INSTALL}" == "false" ]]; then
+    log "install wheels"
+    mapfile -t vllm_wheels < <(
+        find "${WHEELS_DIR}" -type f -name 'vllm-*.whl' -print | sort
+    )
+    mapfile -t sail_wheels < <(
+        find "${WHEELS_DIR}" -type f -name 'vllm_sail-*.whl' -print | sort
+    )
+    ((${#vllm_wheels[@]} == 1)) || { echo "expected one vLLM wheel under ${WHEELS_DIR}, got ${#vllm_wheels[@]}"; exit 1; }
+    ((${#sail_wheels[@]} == 1)) || { echo "expected one vLLM SAIL wheel under ${WHEELS_DIR}, got ${#sail_wheels[@]}"; exit 1; }
+    python -m pip install --no-deps --force-reinstall "${vllm_wheels[0]}"
+    python -m pip install --no-deps --force-reinstall "${sail_wheels[0]}"
 
-# Install test dependencies (pytest, etc.)
-PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    python -m pip install -r "${ROOT_DIR}/requirements/dev.txt"
+    # Install test dependencies (pytest, etc.)
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+        python -m pip install -r "${ROOT_DIR}/requirements/dev.txt"
 
-# Install accuracy evaluation dependencies (not in dev.txt, needs a real device)
-PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    python -m pip install "evalscope==1.14.1"
+    # Install accuracy evaluation dependencies (not in dev.txt, needs a real device)
+    if ! PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+        python -m pip install "evalscope==1.14.1" >/tmp/ppu-accuracy-evalscope-pip.log 2>&1; then
+        echo "ERROR: failed to install evalscope==1.14.1" >&2
+        exit 1
+    fi
+else
+    log "prebuilt image mode (skip wheel install)"
+    if ! python -c "from evalscope import TaskConfig, run_task" >/dev/null 2>&1; then
+        if ! PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+            python -m pip install "evalscope==1.14.1" >/tmp/ppu-accuracy-evalscope-pip.log 2>&1; then
+            echo "ERROR: failed to install evalscope==1.14.1" >&2
+            exit 1
+        fi
+    fi
+fi
 
 # Verify evalscope is importable
 python -c "from evalscope import TaskConfig, run_task; print('evalscope OK')"
 
-python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
-    --sdk /usr/local/PPU_SDK --output "${RESULTS_DIR}/image-stack.json"
+if ! python "${CI_SCRIPT_DIR}/ppu_image_stack.py" verify \
+    --sdk /usr/local/PPU_SDK --output "${RAW_IMAGE_STACK}" >/tmp/ppu-accuracy-image-stack-verify.log 2>&1; then
+    echo "ERROR: SAIL PyTorch image stack verification failed" >&2
+    exit 1
+fi
+echo "stack_unchanged=true"
 
 # ------------------------------------------------------------------
 log "platform self-check"
 cd /tmp
 unset PYTHONPATH
-python - <<'PY'
-import torch, vllm, vllm_sail
+python - "${RESULTS_DIR}" "${SKIP_WHEEL_INSTALL}" "${PPU_CI_RUNTIME_IMAGE_DIGEST:-}" "${PPU_CI_RUNTIME_IMAGE_ID:-}" <<'PY'
+import json
+import re
+import sys
+from importlib import metadata
+from pathlib import Path
+
+import torch
+import vllm
+import vllm_sail
 from vllm.platforms import current_platform
 from vllm_sail.compat import check_vllm_compatibility
 
-check_vllm_compatibility(force=True)
+results_dir, skip_wheel_install, image_digest, image_id = sys.argv[1:5]
+SAFE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}(?:\+[A-Za-z0-9_-]{1,24})?"
+)
+BASE_VERSION_RE = re.compile(
+    r"\d+(?:\.\d+){1,3}(?:(?:a|b|rc|\.post|\.dev)\d+){0,2}"
+)
+
+
+def safe_version(dist_name: str, fallback: str | None = None) -> str | None:
+    try:
+        value = metadata.version(dist_name)
+    except metadata.PackageNotFoundError:
+        value = fallback
+    if not isinstance(value, str):
+        return None
+    if SAFE_VERSION_RE.fullmatch(value):
+        return value
+    if "+" in value:
+        base = value.split("+", 1)[0]
+        if BASE_VERSION_RE.fullmatch(base):
+            return base
+    return None
+
+
+versions = {
+    "vllm": safe_version("vllm", getattr(vllm, "__version__", None)),
+    "vllm_sail": safe_version("vllm-sail", getattr(vllm_sail, "__version__", None)),
+    "torch": safe_version("torch", getattr(torch, "__version__", None)),
+}
+try:
+    check_vllm_compatibility(force=True)
+except Exception as exc:
+    raise SystemExit(
+        f"vLLM compatibility check failed ({type(exc).__name__}): "
+        f"vllm={versions['vllm'] or 'unknown'}, "
+        f"vllm_sail={versions['vllm_sail'] or 'unknown'}"
+    ) from None
 assert current_platform.is_ppu(), f"expected PPU platform, got {current_platform}"
 assert torch.cuda.is_available(), "accuracy E2E pod requires a PPU device"
+if not versions["vllm"] or not versions["vllm_sail"]:
+    raise SystemExit("Unable to determine installed vllm/vllm_sail versions")
 print("Device:", current_platform.get_device_name(0))
 print("Capability:", current_platform.get_device_capability())
-print("vLLM:", vllm.__version__)
-print("vLLM SAIL:", vllm_sail.__version__)
+print("vLLM:", versions["vllm"])
+print("vLLM SAIL:", versions["vllm_sail"])
+fingerprint = {
+    "schema": 1,
+    "install_mode": "prebuilt_image" if skip_wheel_install == "true" else "wheel_overlay",
+    "runtime_image_digest": image_digest if re.fullmatch(r"@sha256:[0-9a-f]{64}", image_digest) else None,
+    "runtime_image_id": image_id if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) else None,
+    "versions": {k: v for k, v in versions.items() if v is not None},
+}
+(Path(results_dir) / "runtime-fingerprint.json").write_text(
+    json.dumps(fingerprint, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
 PY
 
 # ------------------------------------------------------------------

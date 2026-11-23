@@ -91,10 +91,14 @@ jobs:
           config="$(mktemp "${RUNNER_TEMP}/git-config.XXXXXX")"
           source_rel=".ppu-runtime-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source="${GITHUB_WORKSPACE}/${source_rel}"
+          trusted_rel=".ppu-runtime-trusted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trusted="${GITHUB_WORKSPACE}/${trusted_rel}"
           {
             printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
             printf 'source_rel=%s\n' "$source_rel"
             printf 'source=%s\n' "$source"
+            printf 'trusted_rel=%s\n' "$trusted_rel"
+            printf 'trusted=%s\n' "$trusted"
           } >> "$GITHUB_OUTPUT"
           printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
 
@@ -105,12 +109,20 @@ jobs:
           path: ${{ steps.workspace.outputs.source_rel }}
           persist-credentials: false
 
+      - name: Check out trusted CI scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
+          path: ${{ steps.workspace.outputs.trusted_rel }}
+          persist-credentials: false
+
       - name: Resolve the runner-configured CUDA-compatible runtime
         id: image
         env:
-          SOURCE_DIR: ${{ steps.workspace.outputs.source }}
+          TRUSTED_DIR: ${{ steps.workspace.outputs.trusted }}
         run: |
-          image_id="$(bash "${SOURCE_DIR}/scripts/ci/ppu_runtime_image.sh")"
+          image_id="$(bash "${TRUSTED_DIR}/scripts/ci/ppu_runtime_image.sh")"
           [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf 'image_id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
 

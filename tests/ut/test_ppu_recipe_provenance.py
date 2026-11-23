@@ -249,3 +249,140 @@ def test_recipes_tree_digest_is_stable_and_covers_unselected_recipes(run_recipe)
     other_recipe = source / RECIPES / "deepseek-ai/DeepSeek-V4-Flash.yaml"
     other_recipe.write_bytes(other_recipe.read_bytes() + b"\n")
     assert digest() != original
+
+
+def test_prebuilt_image_mode_skips_wheel_install_and_records_digest(run_recipe):
+    run, _, _, results = run_recipe
+    image_digest = "@sha256:" + "d" * 64
+    image_id = "sha256:" + "e" * 64
+    proc, calls, _ = run(
+        TIER="model_sanity",
+        WHEELS_DIR="",
+        PPU_CI_SKIP_WHEEL_INSTALL="true",
+        PPU_CI_RUNTIME_IMAGE_DIGEST=image_digest,
+        PPU_CI_RUNTIME_IMAGE_ID=image_id,
+    )
+    assert proc.returncode == 0, proc.stderr
+    evidence = json.loads((results / "provenance.json").read_text())
+    assert evidence["install_mode"] == "prebuilt_image"
+    assert evidence["runtime_image_digest"] == image_digest
+    assert evidence["runtime_image_id"] == image_id
+    assert "wheels" not in evidence
+    assert not any("--force-reinstall" in call for call in calls)
+
+
+def test_trusted_entrypoint_runs_prebuilt_mode_against_older_source_tree(
+    tmp_path, run_recipe
+):
+    _, source, _, results = run_recipe
+    # Simulate an older target_ref checkout whose own scripts/ci entrypoint
+    # cannot handle prebuilt-image mode; the trusted /trusted-ci entrypoint
+    # runs with PPU_CI_SOURCE_ROOT pointing at the target checkout.
+    (source / "scripts/ci/ppu_e2e_recipe_sanity.sh").write_text(
+        "#!/usr/bin/env bash\necho 'legacy entrypoint should not run' >&2\nexit 99\n",
+        encoding="utf-8",
+    )
+    trusted_ci = tmp_path / "trusted-ci"
+    trusted_ci.mkdir()
+    for name in (
+        "ppu_e2e_recipe_sanity.sh",
+        "ppu_wheel_manifest.py",
+        "ppu_image_stack.py",
+    ):
+        shutil.copyfile(ROOT / "scripts/ci" / name, trusted_ci / name)
+    bin_dir = tmp_path / "bin"
+    trace = tmp_path / "trusted-calls.jsonl"
+    image_digest = "@sha256:" + "d" * 64
+    proc = subprocess.run(
+        ["bash", str(trusted_ci / "ppu_e2e_recipe_sanity.sh")],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CALL_TRACE": str(trace),
+            "PPU_CI_SOURCE_ROOT": str(source),
+            "HF_HOME": str(tmp_path / "hf cache"),
+            "WHEELS_DIR": "",
+            "RESULTS_DIR": str(results),
+            "MODEL_ID": "zai-org/GLM-5.3",
+            "RECIPE_PATH": RECIPE,
+            "POLICY_PATH": POLICY,
+            "PPU_RECIPE_SOURCE_SHA": CHECKOUT_SHA,
+            "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+            "PPU_CI_RUNTIME_IMAGE_DIGEST": image_digest,
+            "REQUIRE_PR_ARTIFACT": "false",
+            "TIER": "model_sanity",
+            "RUNNER_EXIT": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    evidence = json.loads((results / "provenance.json").read_text())
+    assert evidence["install_mode"] == "prebuilt_image"
+    assert evidence["runtime_image_digest"] == image_digest
+    recorded = {entry["path"]: entry["sha256"] for entry in evidence["runner_sources"]}
+    trusted_sha = hashlib.sha256(
+        (trusted_ci / "ppu_e2e_recipe_sanity.sh").read_bytes()
+    ).hexdigest()
+    stub_sha = hashlib.sha256(
+        (source / "scripts/ci/ppu_e2e_recipe_sanity.sh").read_bytes()
+    ).hexdigest()
+    assert trusted_sha != stub_sha
+    assert recorded["scripts/ci/ppu_e2e_recipe_sanity.sh"] == trusted_sha
+    for rel in (
+        "scripts/ci/ppu_recipe.py",
+        "scripts/ci/ppu_recipe_runner.py",
+        "scripts/eval/ppu_gsm8k_eval.py",
+    ):
+        assert recorded[rel] == hashlib.sha256((source / rel).read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "bad_overrides,expected_msg",
+    [
+        (
+            {
+                "WHEELS_DIR": "",
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "",
+            },
+            "verified runtime image digest",
+        ),
+        (
+            {
+                "WHEELS_DIR": "",
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "private.internal/repo@sha256:"
+                + "d" * 64,
+            },
+            "Invalid runtime image digest",
+        ),
+        (
+            {
+                "WHEELS_DIR": "",
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "REQUIRE_PR_ARTIFACT": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "@sha256:" + "d" * 64,
+            },
+            "not allowed in PR mode",
+        ),
+        (
+            {
+                "PPU_CI_SKIP_WHEEL_INSTALL": "true",
+                "PPU_CI_RUNTIME_IMAGE_DIGEST": "@sha256:" + "d" * 64,
+            },
+            "WHEELS_DIR must be empty",
+        ),
+    ],
+)
+def test_prebuilt_image_mode_rejects_unsafe_inputs(
+    run_recipe, bad_overrides, expected_msg
+):
+    run, _, _, results = run_recipe
+    proc, calls, _ = run(TIER="model_sanity", **bad_overrides)
+    assert proc.returncode != 0
+    assert expected_msg in proc.stderr
+    assert calls == []
+    assert not (results / "provenance.json").exists()

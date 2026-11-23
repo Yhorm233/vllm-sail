@@ -11,6 +11,9 @@ RESULT_FILES = ("results/summary.json", "provenance.json")
 OPTIONAL_FILES = (
     "runtime.log",
     "recipe-phase.txt",
+    "runtime-image-id.txt",
+    "runtime-image-digest.txt",
+    "runtime-fingerprint.json",
     "results/gsm8k_per_question.jsonl",
     "results/vllm_serve_fast_2l.log",
     "results/vllm_serve_fast_full.log",

@@ -1368,7 +1368,7 @@ def test_recipe_evalscope_install_preserves_runtime_numpy(
     python.chmod(0o755)
     start = script.index('--constraints "${PIP_CONSTRAINT}"')
     start = script.index("\n", start) + 1
-    end = script.index('python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify')
+    end = script.index('python "${CI_SCRIPT_DIR}/ppu_image_stack.py" verify')
     result = subprocess.run(
         ["bash", "-euc", script[start:end]],
         env={
@@ -1376,6 +1376,7 @@ def test_recipe_evalscope_install_preserves_runtime_numpy(
             "PIP_CONSTRAINT": str(constraints),
             "TIER": tier,
             "ROOT_DIR": str(ROOT),
+            "SKIP_WHEEL_INSTALL": "false",
             "vllm_wheel": "vllm.whl",
             "sail_wheel": "sail.whl",
         },
