@@ -1,0 +1,65 @@
+schema_version: ppu-serving/v1
+ppu:
+  framework: vllm
+  visibility: public
+  upstream_schema: vllm-project/recipes@b08ad738
+  assets:
+    model: step-5-preview-fp8
+    tokenizer: step-5-preview-fp8
+  hf_model_id: T-HEAD/Step-5-Preview-MoE-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  golden_model_key: step-5-preview-fp8
+  served_name: Step-5-Preview-MoE-Quant-W-FP8-PerChannel-A-FP8-PerToken
+  topology:
+    kind: single_node
+    nodes: 1
+    devices_per_node: 8
+  default_features:
+    - tool_calling
+    - reasoning
+  external_env: []
+model:
+  model_id: stepfun-ai/Step-5-Preview
+  base_args:
+    - --trust-remote-code
+    - --tensor-parallel-size
+    - "8"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --max-model-len
+    - "16384"
+    - --distributed-timeout-seconds
+    - "3600"
+    - --cpu-distributed-timeout-seconds
+    - "3600"
+  base_env:
+    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+features:
+  tool_calling:
+    args:
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - step5
+  reasoning:
+    args:
+      - --reasoning-parser
+      - step5
+variants:
+  default:
+    precision: fp8
+    extra_args: []
+    extra_env: {}
+hardware_overrides:
+  zhenwu_m890:
+    extra_args: []
+    extra_env: {}
+presets:
+  prefill_long:
+    hardware: zhenwu_m890
+    args: []
+  eval_longctx:
+    hardware: zhenwu_m890
+    args: []
+notes: >-
+  Default serving configuration aligns with the single-node 8-card Zhenwu M890
+  FP8 baseline (TP8, 16K context window, and Step-5 tool-call/reasoning
+  parsers). Prefix caching is controlled by the test policy.

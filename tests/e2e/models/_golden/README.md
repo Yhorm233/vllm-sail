@@ -290,10 +290,12 @@ first run cannot silently become the baseline. Promote it by either:
 | `deepseek_v4_1_flash_mxfp4` | 890p | 8 | `DeepSeek-V4.1-Flash-1017-MXFP4-FP8-Engram-MXFP8` | 0.9712 measured |
 | `minimax-m3-fp8` | 890p | 8 | `MiniMax-M3-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9735 seeded |
 | `minimax-m3-mxfp4-fp8` | 890p | 8 | `MiniMax-M3-MXFP4-FP8` | 0.9735 measured |
+| `minimax-m3.1-flash-fp8` | 890p | 8 | `MiniMax-M3.1-Flash-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9735 seeded |
 | `glm_5_3_mxfp4` | 890p | 4 | `GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9689 seeded |
 | `glm_5_3_flash_mxfp4` | 890p | 2 | `GLM-5.3-Flash-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9697 measured |
 | `kimi_k2_6_mxfp4` | 890p | 8 | `Kimi-K2.6-MXFP4-FP8` | 0.9788 seeded |
 | `qwen3.8-flash-next` | 890p | 4 | `Qwen3.8-Flash-Next-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9742 seeded |
+| `step-5-preview-fp8` | 890p | 8 | `Step-5-Preview-MoE-Quant-W-FP8-PerChannel-A-FP8-PerToken` | 0.9727 seeded |
 
 `Cards` is the PPU count each catalog case asks the container for, not a
 property of the weight or of the golden: a case may switch to DP+EP or
@@ -327,7 +329,9 @@ Sampling parameters per weight (`max_tokens` 10240 for every one of them):
 | `deepseek_v4_1_flash_mxfp4` | 1.0 | 1.0 | — | `deepseek_v4_1_flash` |
 | `minimax-m3-fp8` | 1.0 | 0.95 | — | `minimax_m3` |
 | `minimax-m3-mxfp4-fp8` | 1.0 | 0.95 | — | `minimax_m3` |
+| `minimax-m3.1-flash-fp8` | 1.0 | 0.95 | — | `minimax_m3` |
 | `glm_5_3_mxfp4` | 1.0 | 1.0 | — | `glm_5_3` |
 | `glm_5_3_flash_mxfp4` | 1.0 | 1.0 | — | `glm_5_3` |
 | `kimi_k2_6_mxfp4` | 1.0 | 0.95 | — | `kimi_k2_6` |
 | `qwen3.8-flash-next` | 1.0 | 0.95 | `top_k` 20, `min_p` 0, `presence_penalty` 0, `repetition_penalty` 1.0 | every `qwen3_8` weight |
+| `step-5-preview-fp8` | 1.0 | 0.95 | — | `step_5_preview` |

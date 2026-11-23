@@ -279,6 +279,106 @@ def test_resolve_minimax_reproduces_the_retired_catalog_case() -> None:
     assert "--hf-overrides" not in resolved_fs["flags"]
 
 
+@pytest.mark.parametrize(
+    (
+        "slug",
+        "recipe_rel",
+        "hf_model_id",
+        "golden_key",
+        "tool_parser",
+        "reasoning_parser",
+        "extra_flags",
+        "expected_env",
+    ),
+    [
+        (
+            "minimax-m3.1-flash",
+            "MiniMaxAI/MiniMax-M3.1-Flash.yaml",
+            "T-HEAD/MiniMax-M3.1-Flash-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+            "minimax-m3.1-flash-fp8",
+            "minimax_m3",
+            "minimax_m3",
+            {"--block-size": "128", "--kv-cache-dtype": "fp8"},
+            {},
+        ),
+        (
+            "step-5-preview",
+            "stepfun-ai/Step-5-Preview.yaml",
+            "T-HEAD/Step-5-Preview-MoE-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+            "step-5-preview-fp8",
+            "step5",
+            "step5",
+            {},
+            {"VLLM_ENGINE_READY_TIMEOUT_S": "3600"},
+        ),
+    ],
+)
+def test_resolve_new_tp8_fp8_recipes_and_golden_contracts(
+    slug: str,
+    recipe_rel: str,
+    hf_model_id: str,
+    golden_key: str,
+    tool_parser: str,
+    reasoning_parser: str,
+    extra_flags: dict[str, str],
+    expected_env: dict[str, str],
+) -> None:
+    recipe = RECIPES_DIR / recipe_rel
+    policy = POLICY_DIR / "models" / f"{slug}.yaml"
+    policy_doc = ppu_recipe._load_yaml(policy)
+
+    resolved_ms = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="model_sanity"
+    )
+    assert resolved_ms["ppu_count"] == 8
+    assert resolved_ms["hf_model_id"] == hf_model_id
+    assert resolved_ms["golden_model_key"] == golden_key
+    assert resolved_ms["server_env"] == expected_env
+    assert resolved_ms["runtime_env"] == {"VLLM_SERVER_DEV_MODE": "1"}
+
+    flags = resolved_ms["flags"]
+    assert flags[flags.index("--tensor-parallel-size") + 1] == "8"
+    assert flags[flags.index("--gpu-memory-utilization") + 1] == "0.9"
+    assert flags[flags.index("--max-model-len") + 1] == "16384"
+    assert flags[flags.index("--tool-call-parser") + 1] == tool_parser
+    assert flags[flags.index("--reasoning-parser") + 1] == reasoning_parser
+    for flag, value in extra_flags.items():
+        assert flags[flags.index(flag) + 1] == value
+    assert "--enable-auto-tool-choice" in flags
+    assert "--enable-prefix-caching" in flags
+    assert "--no-enable-prefix-caching" not in flags
+
+    golden_path = (
+        ROOT
+        / "tests"
+        / "e2e"
+        / "models"
+        / "_golden"
+        / f"accuracy_{golden_key}_890p.json"
+    )
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert golden["model"] == golden_key
+    assert golden["checkpoint"] == hf_model_id
+    assert golden["checkpoint_tail"] == hf_model_id
+    stages = {
+        stage["id"]: stage for stage in policy_doc["tiers"]["model_sanity"]["stages"]
+    }
+    assert stages["eval-gsm8k"]["generation"] == golden["generation"]
+
+    resolved_fs = ppu_recipe.resolve_recipe(
+        recipe, policy_path=policy, tier="fast_sanity"
+    )
+    assert resolved_fs["ppu_count"] == 8
+    assert resolved_fs["dummy_weights"] is True
+    assert resolved_fs["layer_override"] == "auto"
+    assert "--load-format" in resolved_fs["flags"]
+    assert "dummy" in resolved_fs["flags"]
+
+    for tier in ("fast_sanity", "model_sanity"):
+        matrix = ppu_e2e_select.build_recipe_matrix("", tier)["include"]
+        assert any(item["key"] == slug and item["ppu_count"] == 8 for item in matrix)
+
+
 def test_model_sanity_policy_selects_eight_card_dp_ep_preset() -> None:
     base_slug = "deepseek-v4-flash"
     slug = f"{base_slug}-dp-ep"
