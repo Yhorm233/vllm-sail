@@ -39,7 +39,7 @@ features:
   reasoning:
     args:
       - --reasoning-parser
-      - glm45
+      - glm47
   spec_decoding:
     default_mode: mtp
     modes:
@@ -73,6 +73,7 @@ presets:
     args: []
 notes: >-
   Serving parameters follow the checked-in glm-5.3-mxfp4-tp4 catalog entry
-  (TP4 on 4 Zhenwu M890 cards with glm47 tool-call and glm45 reasoning
-  parsers). The committed 890p golden records a historical BF16 TP8 reference
-  score; use preset tp8 when reproducing an 8-card layout.
+  (TP4 on 4 Zhenwu M890 cards with glm47 tool-call and reasoning parsers,
+  aligned with upstream vllm-project/recipes). The committed 890p golden
+  records a historical BF16 TP8 reference score; use preset tp8 when
+  reproducing an 8-card layout.

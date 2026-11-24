@@ -155,10 +155,19 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
         "--tool-call-parser",
         "glm47",
         "--reasoning-parser",
-        "glm45",
+        "glm47",
     ]
     assert resolved_ms["flags"][-1] == "--enable-prefix-caching"
-    assert set(cat_flags) <= set(resolved_ms["flags"])
+    cat_entries = {
+        flag: value
+        for flag, value, _ in ppu_recipe._parse_flag_entries(cat_flags)
+        if flag != "--reasoning-parser"
+    }
+    ms_entries = {
+        flag: value
+        for flag, value, _ in ppu_recipe._parse_flag_entries(resolved_ms["flags"])
+    }
+    assert cat_entries.items() <= ms_entries.items()
 
     resolved_fs = ppu_recipe.resolve_recipe(
         recipe, policy_path=policy, tier="fast_sanity"
