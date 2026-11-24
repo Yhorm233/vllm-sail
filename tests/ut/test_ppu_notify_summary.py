@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/ci"))
 import ppu_notify_summary as notify
 
@@ -34,13 +36,37 @@ class NotifySummaryTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def test_all_green_has_no_mentions(self):
-        report = {"elapsed_s": 3701, "results": [{"model": "atlas", "status": "pass"}]}
-        payload = notify.make_payload(report, "{invalid", "mon")
-        self.assertNotIn("at", payload)
-        self.assertNotIn("@member", payload["markdown"]["text"])
-        self.assertIn("[✅ 全绿 1/1]", payload["markdown"]["title"])
-        self.assertIn("1h 01m 41s", payload["markdown"]["text"])
+    def test_all_green_has_aligned_columns_and_no_mentions(self):
+        report = {
+            "elapsed_s": 3701,
+            "results": [
+                {
+                    "model": "atlas",
+                    "status": "pass",
+                    "score": 0.9682,
+                    "golden_score": 0.9682,
+                    "job_elapsed_s": 3480,
+                },
+                {"model": "longer-model", "status": "pass", "job_elapsed_s": 24},
+            ],
+        }
+        for version in ("main", "v0.34.0"):
+            with self.subTest(version=version):
+                payload = notify.make_payload(
+                    report, "{invalid", "mon", version=version
+                )
+                title = f"[vllm-sail | {version}] PPU Nightly 晨报"
+                message = payload["markdown"]["text"]
+                self.assertEqual(title, payload["markdown"]["title"])
+                self.assertTrue(message.startswith(f"### {title}\n\n"))
+                self.assertIn("通过 **2/2** · 失败 **0** · 总耗时 1h 01m 41s", message)
+                self.assertNotIn("at", payload)
+                self.assertNotIn("🔴", message)
+                header, atlas, longer = message.split("```text\n")[1].splitlines()[:3]
+                self.assertEqual(header.index("GSM8K"), atlas.index("96.82% (96.82%)"))
+                self.assertEqual(header.index("GSM8K"), longer.index("—"))
+                self.assertEqual(header.index("Time"), atlas.index("58m"))
+                self.assertEqual(header.index("Time"), longer.index("24s"))
 
     def test_partial_failure_routes_only_to_duty_and_failed_model_owner(self):
         report = {
@@ -53,6 +79,8 @@ class NotifySummaryTest(unittest.TestCase):
                     "score": 0.90,
                     "golden_score": 0.95,
                     "first_failing_sha": "b" * 40,
+                    "job_id": 456,
+                    "job_elapsed_s": 3480,
                 },
             ]
         }
@@ -68,15 +96,20 @@ class NotifySummaryTest(unittest.TestCase):
             {"atMobiles": ["+10000000000"], "atUserIds": ["duty"], "isAtAll": False},
             payload["at"],
         )
-        self.assertIn("[❌ 1 项失败 · 待认领]", payload["markdown"]["title"])
         message = payload["markdown"]["text"]
+        self.assertLess(
+            message.index("🔴 失败用例 (1)"), message.index("🟢 通过用例 (1)")
+        )
+        self.assertIn("\n\n#### 🔴 失败用例 (1)\n\n- `borealis`", message)
+        self.assertIn("\n\n#### 🟢 通过用例 (1)\n\n```text", message)
         for word in (
             "@duty",
             "@+10000000000",
             "90.00% vs 95.00%",
             "b" * 40,
             "10:30",
-            "/actions/runs/123",
+            "耗时 58m",
+            "[直达 Job](https://github.com/example/framework/actions/runs/123/job/456)",
         ):
             self.assertIn(word, message)
         self.assertNotIn("green-owner", message)
@@ -92,12 +125,50 @@ class NotifySummaryTest(unittest.TestCase):
                     "score": "PRIVATE-SCORE",
                     "golden_score": 0.9,
                     "log": "PRIVATE-LOG",
+                    "job_id": "456)/PRIVATE-JOB-URL",
+                    "job_elapsed_s": "PRIVATE-TIME",
+                    "first_failing_sha": "PRIVATE-SHA",
                 }
             ]
         }
-        payload = notify.make_payload(report, "", "fri")
-        self.assertIn("unknown", payload["markdown"]["text"])
-        self.assertNotIn("PRIVATE", payload["markdown"]["text"])
+        with patch.dict(
+            "os.environ",
+            {
+                "NOTIFY_REF": "PRIVATE-REF",
+                "NOTIFY_VERSION": "PRIVATE-VERSION",
+            },
+        ):
+            payload = notify.make_payload(report, "", "fri", version="PRIVATE-VERSION")
+        self.assertIn("unknown · 耗时 —", payload["markdown"]["text"])
+        self.assertIn(
+            "[整轮 Run](https://github.com/example/framework/actions/runs/123)",
+            payload["markdown"]["text"],
+        )
+        self.assertNotIn("直达 Job", payload["markdown"]["text"])
+        self.assertNotIn("PRIVATE", str(payload))
+
+    def test_workflow_limits_manual_notifications_to_selected_full_runs(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/ppu-accuracy-nightly.yaml"
+        )
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        self.assertEqual(
+            "${{ steps.select.outputs.full_run }}",
+            jobs["select"]["outputs"]["full_run"],
+        )
+        job = jobs["notify-summary"]
+        condition = " ".join(job["if"].split())
+        self.assertTrue(condition.startswith("always() && !cancelled() &&"))
+        self.assertIn(
+            "(github.event_name == 'workflow_dispatch' && needs.select.result == 'success' && "
+            "needs.select.outputs.full_run == 'true')",
+            condition,
+        )
+        self.assertIn(
+            "(github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true') ||",
+            condition,
+        )
 
     def test_hmac_signature_encodes_query_and_replaces_stale_signature(self):
         url = "https://example.test/hooks?key=alpha%2Bbeta&timestamp=old&sign=old"
@@ -205,7 +276,13 @@ class NotifySummaryTest(unittest.TestCase):
             patch.object(notify.time, "time", return_value=1672628460),
         ):
             jobs, elapsed = notify.run_jobs({"retry", "prior"})
-        self.assertEqual({"retry": ("failure", 2), "prior": ("success", 1)}, jobs)
+        self.assertEqual(
+            {
+                "retry": notify.JobExecution("failure", 2, 202, 30),
+                "prior": notify.JobExecution("success", 1, 101, 1800),
+            },
+            jobs,
+        )
         self.assertEqual(60, elapsed)
 
         def original_evidence(attempt):
@@ -228,20 +305,26 @@ class NotifySummaryTest(unittest.TestCase):
         roster = '{"models":{"prior":[{"user_id":"prior-owner"}],"retry":[{"user_id":"retry-owner"}]}}'
         payload = notify.make_payload({"results": results}, roster, "mon")
         self.assertEqual(["retry-owner"], payload["at"]["atUserIds"])
-        self.assertIn("[❌ 1 项失败 · 待认领]", payload["markdown"]["title"])
+        self.assertIn("/actions/runs/123/job/202", payload["markdown"]["text"])
 
     def test_missing_evidence_and_conflicting_job_result_fail_closed(self):
         def missing(_attempt):
             raise FileNotFoundError
 
-        result = notify.model_result("atlas", ("success", 2), missing)
+        result = notify.model_result(
+            "atlas", notify.JobExecution("success", 2, 201, None), missing
+        )
         self.assertEqual(
             ("fail", "missing evidence"), (result["status"], result["phase"])
         )
         result = notify.model_result(
-            "atlas", ("failure", 2), lambda _: ("pass", "unknown", None, None)
+            "atlas",
+            notify.JobExecution("failure", 2, 201, 30),
+            lambda _: ("pass", "unknown", None, None),
         )
         self.assertEqual("fail", result["status"])
+        self.assertEqual(201, result["job_id"])
+        self.assertEqual(30, result["job_elapsed_s"])
 
 
 def test_nightly_joins_reusable_jobs_and_public_recipe_summaries(tmp_path, monkeypatch):
@@ -277,12 +360,25 @@ def test_nightly_joins_reusable_jobs_and_public_recipe_summaries(tmp_path, monke
         )
 
     prefix = "Recipe model sanity & micro-E2E / Model sanity & micro-E2E "
-    jobs = {prefix + "atlas": ("success", 1), prefix + "borealis": ("failure", 2)}
+    jobs = {
+        prefix + "atlas": notify.JobExecution("success", 1, 101, 1800),
+        prefix + "borealis": notify.JobExecution("failure", 2, 202, 30),
+    }
     with patch.object(nightly, "run_jobs", return_value=(jobs, 60)):
         report = nightly.collect(tmp_path)
     assert [row["status"] for row in report["results"]] == ["pass", "fail"]
     assert report["results"][1]["phase"] == "gsm8k_score vs golden"
-    assert report["results"][1]["golden_score"] == 0.96
+    for row, job in zip(report["results"], jobs.values(), strict=True):
+        assert row["score"] == 0.9
+        assert row["golden_score"] == 0.96
+        assert row["job_id"] == job.job_id
+        assert row["job_elapsed_s"] == job.elapsed_s
+
+    monkeypatch.setenv("NOTIFY_SELECT_RESULT", "failure")
+    with patch.object(nightly, "run_jobs", return_value=({}, 60)):
+        report = nightly.collect(tmp_path)
+    assert [row["phase"] for row in report["results"]] == ["selection"]
+    monkeypatch.setenv("NOTIFY_SELECT_RESULT", "success")
 
     monkeypatch.setenv("NOTIFY_BUILD_RESULT", "failure")
     with patch.object(nightly, "run_jobs", return_value=({}, 60)):
@@ -330,7 +426,9 @@ def test_nightly_legacy_matrix_uses_only_public_artifact(tmp_path, monkeypatch):
             }
         )
     )
-    jobs = {"Accuracy atlas / Accuracy atlas": ("failure", 2)}
+    jobs = {
+        "Accuracy atlas / Accuracy atlas": notify.JobExecution("failure", 2, 456, 30)
+    }
     with patch.object(nightly, "run_jobs", return_value=(jobs, 45)):
         report = nightly.collect(tmp_path)
     assert report["results"][0]["phase"] == "startup"
@@ -338,3 +436,24 @@ def test_nightly_legacy_matrix_uses_only_public_artifact(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_nightly_version_prefix_is_allowlisted(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "example/vllm-sail")
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    for version in ("main", "v0.34.0", "masked.example/private"):
+        payload = notify.make_payload(
+            {"results": [{"model": "glm-5.3", "status": "pass"}]},
+            "",
+            "Monday",
+            version=version,
+        )
+        markdown = payload["markdown"]
+        if version in ("main", "v0.34.0"):
+            prefix = f"[vllm-sail | {version}]"
+            assert markdown["title"].startswith(prefix)
+            assert markdown["text"].startswith(f"### {prefix}")
+        else:
+            assert "masked.example" not in str(markdown)

@@ -43,6 +43,8 @@ def evidence(root, model, prefix, run_id, attempt):
         raise ValueError("Recipe model mismatch")
     status, reason = report["status"], report["failure_reason"]
     gsm8k = report["gsm8k"]
+    if not isinstance(gsm8k, dict):
+        raise ValueError("Invalid public GSM8K summary")
     if status == "pass" and (
         gsm8k.get("gate") != "pass"
         or (prefix == "ppu-recipe-model_sanity" and report.get("micro_e2e") != "pass")

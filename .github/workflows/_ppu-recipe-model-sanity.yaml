@@ -26,6 +26,10 @@ on:
         description: Validated matrix for the requested PR Nightly cases
         type: string
         default: ""
+      runtime_version:
+        description: Nightly runtime version selected by the workflow ref
+        type: string
+        default: ''
       image_tag:
         description: Allowed runtime image tag (tag only, no registry or repository prefix)
         type: string
@@ -139,7 +143,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         model: ${{ fromJson(needs.prepare.outputs.matrix).include }}
     env:
@@ -236,6 +240,7 @@ jobs:
           PPU_CI_REQUIRE_PR_ARTIFACT: ${{ inputs.pr_mode }}
           PPU_CI_WHEEL_SOURCE_SHA: ${{ !inputs.skip_wheel_build && (inputs.wheel_source_sha || inputs.pr_head_sha || github.sha) || '' }}
           PPU_CI_SKIP_WHEEL_INSTALL: ${{ inputs.skip_wheel_build == true }}
+          PPU_CI_RUNTIME_VERSION: ${{ inputs.runtime_version }}
           PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag }}
           PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest }}
           MODEL_ID: ${{ matrix.model.model_id }}

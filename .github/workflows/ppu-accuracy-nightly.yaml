@@ -41,9 +41,9 @@ name: PPU accuracy nightly
 # that chip. A true 810E lane needs the ppu-scheduler-action route the kernel
 # and perf lanes use, which the local Docker wrapper cannot provide.
 #
-# Schedule: 12:00 UTC = 20:00 CST. The serial accuracy cases are long, so the
-# window is chosen only to start ahead of the 18:30 UTC upstream-reuse and
-# 20:00 UTC perf lanes; the run does not wait for them.
+# Schedule: 16:00 UTC = 00:00 CST. The accuracy cases are long, so the window
+# starts at midnight CST ahead of the 18:30 UTC upstream-reuse and 20:00 UTC
+# perf lanes; the run does not wait for them.
 
 on:
   workflow_dispatch:
@@ -54,7 +54,7 @@ on:
         default: ""
         type: string
       target_ref:
-        description: "Target repository branch, tag, or 40-char commit SHA (blank = default branch HEAD)"
+        description: "Target repository branch, tag, or 40-char commit SHA (blank = workflow commit; use --ref to select the workflow version)"
         required: false
         default: ""
         type: string
@@ -75,7 +75,7 @@ on:
         type: boolean
 
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 16 * * *"
 
 permissions:
   contents: read
@@ -83,18 +83,52 @@ permissions:
   actions: read
 cache-mode: none
 
+env:
+  # Named branch overrides retain their own runtime version. For a tag or
+  # SHA override, --ref continues to specify the workflow and runtime version.
+  NIGHTLY_VERSION: >-
+    ${{ (inputs.target_ref == 'releases/v0.34.0' ||
+    inputs.target_ref == 'refs/heads/releases/v0.34.0' ||
+    (github.ref == 'refs/heads/releases/v0.34.0' &&
+    inputs.target_ref != 'main' && inputs.target_ref != 'refs/heads/main')) &&
+    'v0.34.0' || 'main' }}
+
 concurrency:
-  # Cancelling would throw away a finished build and the serial model runs
-  # behind it, so a second nightly waits instead of replacing the first.
-  # Route disabled scheduled triggers to a per-run group so a no-op cron
-  # cannot evict a queued DevOps dispatch in the active group.
+  # Isolate concurrency queues per Nightly version (main vs v0.34.0) so both
+  # versions can run in parallel across the runner pool while still serializing
+  # re-entrant runs of the same version. Workflow-level concurrency cannot read
+  # env.*, so evaluate the same version rule directly from github/inputs.
+  # Disabled cron ticks route to a per-run group so they do not wait on a queue.
   group: >-
     ${{ (github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED == 'true') &&
     format('accuracy-nightly-disabled-schedule-{0}', github.run_id) ||
-    format('accuracy-nightly-{0}', github.ref) }}
+    ((inputs.target_ref == 'releases/v0.34.0' ||
+    inputs.target_ref == 'refs/heads/releases/v0.34.0' ||
+    (github.ref == 'refs/heads/releases/v0.34.0' &&
+    inputs.target_ref != 'main' && inputs.target_ref != 'refs/heads/main')) &&
+    'accuracy-nightly-v0.34.0' || 'accuracy-nightly-main') }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
+  dispatch-release:
+    name: Dispatch v0.34.0 Nightly
+    if: >-
+      ${{ github.event_name == 'schedule' && github.ref == 'refs/heads/main' &&
+      github.run_attempt == '1' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the release workflow without waiting for it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODELS: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && 'recipe:all' || '' }}
+        run: |
+          gh workflow run ppu-accuracy-nightly.yaml --repo "$GITHUB_REPOSITORY" \
+            --ref releases/v0.34.0 -f "models=$MODELS"
+
   build:
     name: Build nightly wheels
     needs: select
@@ -106,22 +140,30 @@ jobs:
       # manifest describe one tree.
       pr_head_sha: ${{ needs.select.outputs.target_sha }}
       skip_device_tests: true
+      runtime_version: ${{ needs.select.outputs.version }}
 
   select:
     name: Select accuracy models
     if: ${{ github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      SELECT_RECIPES: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && (github.event_name == 'schedule' || startsWith(inputs.models, 'recipe:') || (inputs.skip_wheel_build == true && inputs.models == '')) }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       recipe_models: ${{ steps.select.outputs.recipe_models }}
       recipe_matrix: ${{ steps.select.outputs.recipe_matrix }}
       run_recipe: ${{ steps.select.outputs.run_recipe }}
+      full_run: ${{ steps.select.outputs.full_run }}
       target_sha: ${{ steps.select.outputs.target_sha }}
+      version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Record Nightly version
+        id: version
+        run: |
+          printf 'version=%s\n' "$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
+          printf '## [vllm-sail | %s] Nightly\n' "$NIGHTLY_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Validate dispatch inputs
+        id: validate_inputs
         env:
           TARGET_REF: ${{ inputs.target_ref }}
           IMAGE_TAG: ${{ inputs.image_tag }}
@@ -232,13 +274,34 @@ jobs:
           ref: ${{ steps.verify_target.outputs.target_sha }}
           persist-credentials: false
 
+      - name: Check Recipe selector requirements
+        id: recipe-dependencies
+        if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+        env:
+          MODELS: ${{ inputs.models }}
+          SCHEDULED: ${{ github.event_name == 'schedule' }}
+          SKIP_WHEEL_BUILD: ${{ inputs.skip_wheel_build }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+
+          models = os.environ["MODELS"].strip()
+          if (
+              os.environ["SCHEDULED"] == "true"
+              or models.startswith("recipe:")
+              or (os.environ["SKIP_WHEEL_BUILD"] == "true" and not models)
+          ):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("required=true\n")
+          PYTHON
+
       - uses: actions/setup-python@v5
-        if: env.SELECT_RECIPES == 'true'
+        if: steps.recipe-dependencies.outputs.required == 'true'
         with:
           python-version: "3.12"
 
       - name: Install Recipe selector dependency
-        if: env.SELECT_RECIPES == 'true'
+        if: steps.recipe-dependencies.outputs.required == 'true'
         run: python -m pip install --no-cache-dir PyYAML==6.0.3
 
       - name: Select accuracy models
@@ -271,6 +334,7 @@ jobs:
           spec.loader.exec_module(select)
 
           requested = os.environ.get("MODELS", "").strip()
+          full_run = str(requested in ("", "recipe:all")).lower()
           skip_wheel_build = os.environ.get("SKIP_WHEEL_BUILD", "false") == "true"
           target_sha = os.environ["TARGET_SHA"]
           output = Path(os.environ["GITHUB_OUTPUT"])
@@ -283,6 +347,7 @@ jobs:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write("matrix=\n")
                   handle.write("recipe_models=\n")
                   handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
@@ -302,11 +367,15 @@ jobs:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write("matrix=\n")
                   handle.write(f"recipe_models={models}\n")
                   handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
                   handle.write("run_recipe=true\n")
               sys.exit(0)
+
+          if requested and not any(key.strip() for key in requested.split(",")):
+              sys.exit("Specify one or more nonempty legacy model keys")
 
           catalog = json.loads(select.CATALOG.read_text())
           scheduled_recipes = os.environ["SCHEDULED_RECIPE_ENABLED"] == "true"
@@ -336,12 +405,14 @@ jobs:
               print(f"accuracy matrix: {matrix}")
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write(f"matrix={matrix}\n")
                   handle.write("run_recipe=false\n")
           else:
               print("accuracy matrix: skipped (scheduled legacy nightly disabled)")
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write("matrix=\n")
                   handle.write("run_recipe=true\n")
           PY
@@ -384,6 +455,7 @@ jobs:
         id: resolve
         env:
           TRUSTED_DIR: ${{ steps.workspace.outputs.trusted }}
+          PPU_CI_RUNTIME_VERSION: ${{ needs.select.outputs.version }}
           PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           digest_file="$(mktemp "${RUNNER_TEMP}/ppu-runtime-digest.XXXXXX")"
@@ -427,6 +499,7 @@ jobs:
       # which for a workflow_call is this nightly run.
       build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ matrix.model }}
+      runtime_version: ${{ needs.select.outputs.version }}
       publish_nightly_summary: true
       image_tag: ${{ inputs.image_tag }}
       image_digest: ${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}
@@ -454,6 +527,7 @@ jobs:
       wheel_source_sha: ${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}
       build_run_id: ${{ !inputs.skip_wheel_build && github.run_id || '' }}
       models: ${{ needs.select.outputs.recipe_models }}
+      runtime_version: ${{ needs.select.outputs.version }}
       image_tag: ${{ inputs.image_tag }}
       image_digest: ${{ needs.resolve-image.outputs.image_digest || inputs.image_digest }}
       skip_wheel_build: ${{ inputs.skip_wheel_build == true }}
@@ -463,7 +537,9 @@ jobs:
     needs: [select, build, resolve-image, accuracy, recipe-model-sanity]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true')
+      ((github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true') ||
+       (github.event_name == 'workflow_dispatch' && needs.select.result == 'success' &&
+        needs.select.outputs.full_run == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     continue-on-error: true
@@ -508,6 +584,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NOTIFY_SELECT_RESULT: ${{ needs.select.result }}
           NOTIFY_REF: ${{ inputs.target_ref || github.ref_name }}
+          NOTIFY_NIGHTLY_VERSION: ${{ env.NIGHTLY_VERSION }}
           NOTIFY_BUILD_RESULT: ${{ needs.build.result }}
           NOTIFY_SKIP_BUILD: ${{ inputs.skip_wheel_build == true }}
           NOTIFY_IMAGE_RESULT: ${{ needs.resolve-image.result }}

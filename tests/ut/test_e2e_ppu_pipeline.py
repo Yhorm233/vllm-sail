@@ -935,7 +935,7 @@ def test_accuracy_entrypoints_are_the_manual_debug_and_the_nightly_runs() -> Non
 
     nightly = _workflow(NIGHTLY_WORKFLOW)
     assert set(nightly[True]) == {"workflow_dispatch", "schedule"}
-    assert nightly[True]["schedule"] == [{"cron": "0 12 * * *"}]
+    assert nightly[True]["schedule"] == [{"cron": "0 16 * * *"}]
     assert set(nightly["jobs"]["accuracy"]["with"]) >= {
         "build_run_id",
         "models",
@@ -988,6 +988,7 @@ def test_accuracy_nightly_is_serial_and_wheel_sourced_from_the_build_commit() ->
     assert nightly["jobs"]["build"]["with"] == {
         "pr_head_sha": "${{ needs.select.outputs.target_sha }}",
         "skip_device_tests": True,
+        "runtime_version": "${{ needs.select.outputs.version }}",
     }
     assert accuracy["needs"] == ["build", "select", "resolve-image"]
     # Checkout and wheels must describe the same SAIL tree when building wheels.

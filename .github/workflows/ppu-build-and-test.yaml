@@ -38,6 +38,10 @@ on:
         description: Select matching native wheel donors for formal PR builds
         type: boolean
         default: false
+      runtime_version:
+        description: Nightly runtime version selected by the workflow ref
+        type: string
+        default: ''
       skip_device_tests:
         description: Build wheels only, without pin-UT, model checks or upstream-reuse lanes
         type: boolean
@@ -121,6 +125,7 @@ jobs:
         id: image
         env:
           TRUSTED_DIR: ${{ steps.workspace.outputs.trusted }}
+          PPU_CI_RUNTIME_VERSION: ${{ inputs.runtime_version }}
         run: |
           image_id="$(bash "${TRUSTED_DIR}/scripts/ci/ppu_runtime_image.sh")"
           [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]

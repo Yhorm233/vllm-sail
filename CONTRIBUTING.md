@@ -195,6 +195,27 @@ Actions link on the PR, with published accuracy and failure details when
 available. It is a separate on-demand run outside the required `PPU CI` status.
 Use GitHub Actions to cancel or rerun it.
 
+### Scheduled and DevOps Nightly accuracy
+
+The default-branch cron also dispatches `releases/v0.34.0` so both versions run
+in parallel. Each version uses its own Actions concurrency group
+(`accuracy-nightly-main` / `accuracy-nightly-v0.34.0`, `cancel-in-progress: false`,
+capacity for 100 waiting runs) to serialize re-entrant runs within the same
+version. Set `PPU_NIGHTLY_SCHEDULE_DISABLED=true` to turn off cron dispatches.
+
+Use `gh workflow run ppu-accuracy-nightly.yaml --ref <branch>` to select the
+workflow and runtime version. For a prebuilt image, pass `skip_wheel_build=true`
+and an `image_tag` or `image_digest` using `-f`. Select an older source revision
+from the same version with `target_ref`.
+
+Runner configuration uses `PPU_CI_RUNTIME_IMAGE` for `main` and
+`PPU_CI_RUNTIME_IMAGE_V034` for `v0.34.0`. Overrides target the configured
+default image repository unless the runner sets the respective
+`PPU_CI_RUNTIME_IMAGE_REPO` or `PPU_CI_RUNTIME_IMAGE_REPO_V034`. Both use
+`PPU_CI_RUNTIME_IMAGE_ALLOWED_REPOS` for override authorization. Configure the
+release image on all eligible runners and merge the release workflow before
+enabling the default-branch cron fan-out.
+
 ## Reporting issues
 
 Use the bug or feature request template in the repository's Issues tab. Bug

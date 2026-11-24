@@ -28,6 +28,10 @@ on:
         description: Comma-separated accuracy model catalog keys
         type: string
         default: deepseek-v4-mxfp4
+      runtime_version:
+        description: Nightly runtime version selected by the workflow ref
+        type: string
+        default: ''
       image_tag:
         description: Allowed runtime image tag (tag only, no registry or repository prefix)
         type: string
@@ -314,6 +318,7 @@ jobs:
           PPU_CI_RECORD_LEGACY_ACCURACY: ${{ inputs.publish_nightly_summary }}
           PPU_CI_WHEEL_SOURCE_SHA: ${{ !inputs.skip_wheel_build && (inputs.wheel_source_sha || inputs.pr_head_sha || github.sha) || '' }}
           PPU_CI_SKIP_WHEEL_INSTALL: ${{ inputs.skip_wheel_build == true }}
+          PPU_CI_RUNTIME_VERSION: ${{ inputs.runtime_version }}
           PPU_CI_RUNTIME_IMAGE_TAG: ${{ inputs.image_tag }}
           PPU_CI_RUNTIME_IMAGE_DIGEST: ${{ inputs.image_digest }}
           PPU_CI_HF_HOME: ${{ inputs.hf_home }}

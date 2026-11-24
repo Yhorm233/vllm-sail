@@ -3,7 +3,25 @@
 # Resolve the runner-configured CUDA-compatible PPU runtime to an immutable ID.
 set -Eeuo pipefail
 
-: "${PPU_CI_RUNTIME_IMAGE:?Runner must configure PPU_CI_RUNTIME_IMAGE}"
+case "${PPU_CI_RUNTIME_VERSION:-}" in
+    ""|main)
+        : "${PPU_CI_RUNTIME_IMAGE:?Runner must configure PPU_CI_RUNTIME_IMAGE}"
+        runtime_image="${PPU_CI_RUNTIME_IMAGE}"
+        override_repo="${PPU_CI_RUNTIME_IMAGE_REPO:-}"
+        ;;
+    v0.34.0)
+        if [[ -z "${PPU_CI_RUNTIME_IMAGE_V034:-}" ]]; then
+            echo "Runner must configure PPU_CI_RUNTIME_IMAGE_V034" >&2
+            exit 2
+        fi
+        runtime_image="${PPU_CI_RUNTIME_IMAGE_V034}"
+        override_repo="${PPU_CI_RUNTIME_IMAGE_REPO_V034:-}"
+        ;;
+    *)
+        echo "Unsupported PPU runtime version" >&2
+        exit 2
+        ;;
+esac
 
 image_tag="${PPU_CI_RUNTIME_IMAGE_TAG:-}"
 image_digest="${PPU_CI_RUNTIME_IMAGE_DIGEST:-}"
@@ -127,7 +145,7 @@ resolve_repo_digest() {
     return 0
 }
 
-default_repo=$(strip_image_repo "${PPU_CI_RUNTIME_IMAGE}")
+default_repo=$(strip_image_repo "${runtime_image}")
 validate_repo_name "${default_repo}" || {
     echo "Runner PPU_CI_RUNTIME_IMAGE repository is invalid" >&2
     exit 2
@@ -136,20 +154,20 @@ validate_repo_name "${default_repo}" || {
 resolved_digest=""
 if [[ -z "${image_tag}" && -z "${image_digest}" ]]; then
     pull_log=""
-    if ! image_id=$(docker image inspect "${PPU_CI_RUNTIME_IMAGE}" --format '{{.Id}}' 2>/dev/null); then
+    if ! image_id=$(docker image inspect "${runtime_image}" --format '{{.Id}}' 2>/dev/null); then
         private_dir=$(mktemp -d "${HOME:?}/.vllm-sail-ppu-pull.XXXXXX")
         chmod 0700 "${private_dir}"
         pull_log="${private_dir}/pull.log"
-        if ! docker pull "${PPU_CI_RUNTIME_IMAGE}" >"${pull_log}" 2>&1; then
+        if ! docker pull "${runtime_image}" >"${pull_log}" 2>&1; then
             echo "Failed to pull the runner-configured PPU runtime image" >&2
             exit 2
         fi
-        image_id=$(docker image inspect "${PPU_CI_RUNTIME_IMAGE}" --format '{{.Id}}' 2>>"${pull_log}") || {
+        image_id=$(docker image inspect "${runtime_image}" --format '{{.Id}}' 2>>"${pull_log}") || {
             echo "Failed to inspect the runner-configured PPU runtime image" >&2
             exit 2
         }
     fi
-    resolved_digest=$(resolve_repo_digest "${PPU_CI_RUNTIME_IMAGE}" "${default_repo}" "${pull_log}" "" "false" || true)
+    resolved_digest=$(resolve_repo_digest "${runtime_image}" "${default_repo}" "${pull_log}" "" "false" || true)
 else
     if [[ -n "${image_tag}" ]]; then
         if [[ "${image_tag}" == *".."* || ! "${image_tag}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
@@ -163,7 +181,7 @@ else
             exit 2
         fi
     fi
-    target_repo="${PPU_CI_RUNTIME_IMAGE_REPO:-${default_repo}}"
+    target_repo="${override_repo:-${default_repo}}"
     validate_repo_name "${target_repo}" || {
         echo "Runner PPU runtime image repository configuration is invalid" >&2
         exit 2

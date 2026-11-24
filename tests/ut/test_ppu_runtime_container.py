@@ -18,8 +18,8 @@ def test_runtime_wrapper_uses_preloaded_image_and_explicit_ppu_devices():
     assert "${source_dir}/scripts/ci/ppu_runtime_image.sh" not in text
     resolver = (ROOT / "scripts/ci/ppu_runtime_image.sh").read_text()
     assert "Runner must configure PPU_CI_RUNTIME_IMAGE" in resolver
-    assert 'docker image inspect "${PPU_CI_RUNTIME_IMAGE}"' in resolver
-    assert 'docker pull "${PPU_CI_RUNTIME_IMAGE}" >"${pull_log}" 2>&1' in resolver
+    assert 'docker image inspect "${runtime_image}"' in resolver
+    assert 'docker pull "${runtime_image}" >"${pull_log}" 2>&1' in resolver
     assert "docker image ls" not in resolver
     assert "@sha256:" not in resolver
     assert "docker_release/llm" not in resolver
@@ -137,6 +137,7 @@ def test_runtime_wrapper_serializes_jobs_and_verifies_source_identity():
             "PPU_CI_RUNTIME_IMAGE_TAG": "nightly-20261122",
             "PPU_CI_RUNTIME_IMAGE_REPO": "registry.internal/other/vllm",
         },
+        {"PPU_CI_RUNTIME_VERSION": "v0.34.0", "PPU_CI_RUNTIME_IMAGE_V034": ""},
     ],
 )
 def test_runtime_image_rejects_illegal_tag_digest_and_cross_repo(tmp_path, bad_env):
@@ -167,13 +168,19 @@ def test_runtime_image_rejects_illegal_tag_digest_and_cross_repo(tmp_path, bad_e
     assert "registry.internal" not in proc.stdout + proc.stderr
 
 
-def test_runtime_image_forces_pull_and_verifies_digest_without_leaking_repo(tmp_path):
+@pytest.mark.parametrize("version", ["main", "v0.34.0"])
+def test_runtime_image_forces_pull_and_verifies_digest_without_leaking_repo(
+    tmp_path, version
+):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_log = tmp_path / "docker.log"
     expected_id = "sha256:" + "1" * 64
     expected_digest = "sha256:" + "2" * 64
     wrong_digest = "sha256:" + "3" * 64
+    image_name = "vllm" if version == "main" else "vllm-v034"
+    default_ref = f"registry.internal/team/{image_name}-base:base"
+    override_repo = f"registry.internal/team/{image_name}-nightly"
     docker = bin_dir / "docker"
     docker.write_text(
         f"""#!/usr/bin/env bash
@@ -188,7 +195,7 @@ if [[ "$1" == "image" && "$2" == "inspect" ]]; then
         exit 0
     fi
     if [[ "$*" == *"RepoDigests"* ]]; then
-        echo "${{FAKE_REPO_DIGEST:-registry.internal/team/vllm-nightly@{expected_digest}}}"
+        echo "${{FAKE_REPO_DIGEST:-{override_repo}@{expected_digest}}}"
         exit 0
     fi
 fi
@@ -205,9 +212,23 @@ exit 1
         "HOME": str(tmp_path),
         "PPU_CI_RUNTIME_IMAGE": "registry.internal/team/vllm-base:base",
         "PPU_CI_RUNTIME_IMAGE_REPO": "registry.internal/team/vllm-nightly",
+        "PPU_CI_RUNTIME_VERSION": version,
+        "PPU_CI_RUNTIME_IMAGE_V034": "registry.internal/team/vllm-v034-base:base",
+        "PPU_CI_RUNTIME_IMAGE_REPO_V034": "registry.internal/team/vllm-v034-nightly",
         "PPU_CI_RUNTIME_IMAGE_ALLOWED_REPOS": "registry.internal/team/",
         "PPU_CI_RUNTIME_DIGEST_OUT": str(digest_out),
     }
+
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_image.sh")],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == expected_id
+    assert f"image inspect {default_ref} " in docker_log.read_text()
+    docker_log.unlink()
 
     # Tag-only override forces docker pull and records redacted @sha256 digest.
     proc = subprocess.run(
@@ -220,10 +241,7 @@ exit 1
     assert proc.stdout.strip() == expected_id
     assert digest_out.read_text().strip() == f"@{expected_digest}"
     assert "registry.internal" not in proc.stdout + proc.stderr + digest_out.read_text()
-    assert (
-        "pull registry.internal/team/vllm-nightly:nightly-20261122"
-        in docker_log.read_text()
-    )
+    assert f"pull {override_repo}:nightly-20261122" in docker_log.read_text()
 
     # Tag + matching digest pulls by immutable @sha256 and succeeds.
     docker_log.unlink()
@@ -238,10 +256,7 @@ exit 1
         text=True,
     )
     assert proc2.returncode == 0, proc2.stderr
-    assert (
-        f"pull registry.internal/team/vllm-nightly@{expected_digest}"
-        in docker_log.read_text()
-    )
+    assert f"pull {override_repo}@{expected_digest}" in docker_log.read_text()
 
     # Mismatched digest fails closed.
     proc3 = subprocess.run(
