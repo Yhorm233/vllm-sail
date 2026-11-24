@@ -411,3 +411,219 @@ def test_verify_rejects_null_native_metadata_and_empty_extensions(
     replacement.replace(sail)
     with pytest.raises(ValueError, match="empty native extension"):
         manifest.wheel_records(tmp_path)
+
+
+def test_create_packages_deterministic_recipes_archive_and_binds_tree_sha256(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import shutil
+    import tarfile
+
+    make_wheels(tmp_path)
+    commit = "b" * 40
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "create",
+            str(tmp_path),
+            "--vllm-commit",
+            commit,
+            "--sail-source",
+            str(ROOT),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    archive_path = tmp_path / manifest.RECIPES_ARCHIVE
+    assert archive_path.is_file()
+    first_bytes = archive_path.read_bytes()
+    second_archive = tmp_path / "second-recipes.tar.gz"
+    second_sha = manifest.build_recipes_archive(ROOT, second_archive)
+    assert second_archive.read_bytes() == first_bytes
+
+    with tarfile.open(archive_path, "r:gz") as tar:
+        members = {
+            member.name: hashlib.sha256(tar.extractfile(member).read()).hexdigest()
+            for member in tar.getmembers()
+            if member.isfile()
+        }
+    assert "tests/ppu/recipes/deepseek-ai/DeepSeek-V4-Flash.yaml" in members
+    assert "tests/ppu/recipes/zai-org/GLM-5.3.yaml" in members
+    assert "scripts/ci/ppu_recipe.py" in members
+    expected_canonical = json.dumps(
+        sorted([name, sha] for name, sha in members.items()),
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected_tree_sha = hashlib.sha256(expected_canonical).hexdigest()
+    assert second_sha == expected_tree_sha
+
+    verified = manifest.verify(tmp_path, vllm_commit=commit, require_recipes=True)
+    assert verified["recipe_tree_sha256"] == expected_tree_sha
+
+    # Tampered archive bytes or missing archive must fail closed.
+    tampered_dir = tmp_path / "tampered"
+    shutil.copytree(tmp_path, tampered_dir, ignore=shutil.ignore_patterns("tampered"))
+    with tarfile.open(tampered_dir / manifest.RECIPES_ARCHIVE, "w:gz") as tar:
+        payload = b"schema_version: ppu-serving/v1\n"
+        info = tarfile.TarInfo("tests/ppu/recipes/tampered.yaml")
+        info.size = len(payload)
+        info.mode = 0o644
+        import io
+
+        tar.addfile(info, io.BytesIO(payload))
+    with pytest.raises(ValueError, match="differ from build manifest"):
+        manifest.verify(tampered_dir, vllm_commit=commit)
+
+    (tampered_dir / manifest.RECIPES_ARCHIVE).unlink()
+    with pytest.raises(ValueError, match="recipes.tar.gz is missing"):
+        manifest.verify(tampered_dir, vllm_commit=commit)
+
+    # Legacy manifest without recipe_tree_sha256 passes default verify, fails --require-recipes,
+    # and rejects an unrecorded recipes.tar.gz dropped beside it.
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    make_wheels(legacy_dir)
+    record(legacy_dir)
+    assert manifest.verify(legacy_dir)["schema"] == 1
+    with pytest.raises(ValueError, match="lacks recipe_tree_sha256"):
+        manifest.verify(legacy_dir, require_recipes=True)
+    shutil.copyfile(archive_path, legacy_dir / manifest.RECIPES_ARCHIVE)
+    with pytest.raises(ValueError, match="invalid recipe_tree_sha256"):
+        manifest.verify(legacy_dir)
+
+
+@pytest.mark.parametrize(
+    "corruption", ["truncated_gzip", "non_tar_gzip", "bad_deflate", "bad_crc"]
+)
+def test_reuse_native_and_verify_fail_closed_on_corrupted_recipes_archive(
+    tmp_path: Path, corruption: str
+) -> None:
+    import gzip
+
+    source = make_native_source(tmp_path / "source")
+    fingerprint = manifest.native_fingerprint(source)
+    vllm_commit = "1" * 40
+    sail_commit = "2" * 40
+
+    # Normal control: donor with valid recipes.tar.gz + recipe_tree_sha256 succeeds.
+    valid_donor = tmp_path / "valid-donor"
+    data = make_donor(
+        valid_donor,
+        vllm_commit=vllm_commit,
+        sail_commit=sail_commit,
+        fingerprint=fingerprint,
+    )
+    tree_sha = manifest.build_recipes_archive(
+        ROOT, valid_donor / manifest.RECIPES_ARCHIVE
+    )
+    data["recipe_tree_sha256"] = tree_sha
+    (valid_donor / manifest.MANIFEST).write_text(json.dumps(data))
+
+    ext_ok = tmp_path / "ext-ok"
+    wheels_ok = tmp_path / "wheels-ok"
+    wheels_ok.mkdir()
+    manifest.reuse_native(
+        valid_donor,
+        ext_ok,
+        wheels_ok,
+        vllm_commit=vllm_commit,
+        sail_commit=sail_commit,
+        sail_source=source,
+    )
+    assert len(list(ext_ok.glob("*.so"))) == len(manifest.NATIVE_MODULES)
+    assert len(list(wheels_ok.glob("vllm-*.whl"))) == 1
+
+    # Corrupt recipes.tar.gz in ways that previously raised EOFError / TarError / zlib.error.
+    archive_path = valid_donor / manifest.RECIPES_ARCHIVE
+    valid_bytes = archive_path.read_bytes()
+    if corruption == "truncated_gzip":
+        archive_path.write_bytes(valid_bytes[: len(valid_bytes) // 2])
+    elif corruption == "non_tar_gzip":
+        archive_path.write_bytes(gzip.compress(b"not a tar stream" * 64, mtime=0))
+    elif corruption == "bad_crc":
+        corrupted = bytearray(valid_bytes)
+        corrupted[-6] ^= 0xFF
+        archive_path.write_bytes(bytes(corrupted))
+    else:
+        corrupted = bytearray(valid_bytes)
+        corrupted[len(corrupted) // 2] ^= 0xFF
+        archive_path.write_bytes(bytes(corrupted))
+
+    with pytest.raises(ValueError, match="corrupted recipes.tar.gz"):
+        manifest.verify(valid_donor, vllm_commit=vllm_commit, sail_commit=sail_commit)
+
+    ext_bad = tmp_path / "ext-bad"
+    wheels_bad = tmp_path / "wheels-bad"
+    wheels_bad.mkdir()
+    cli = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "reuse-native",
+            str(valid_donor),
+            "--output",
+            str(ext_bad),
+            "--wheel-output",
+            str(wheels_bad),
+            "--sail-source",
+            str(source),
+            "--vllm-commit",
+            vllm_commit,
+            "--sail-commit",
+            sail_commit,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert cli.returncode == 1
+    assert "reuse-native: corrupted recipes.tar.gz" in cli.stderr
+    assert "Traceback" not in cli.stderr
+    assert not ext_bad.exists()
+    assert not list(wheels_bad.iterdir())
+
+
+def test_recipe_archive_rejects_dir_under_file_double_slash_and_ancestor_symlink(
+    tmp_path: Path,
+) -> None:
+    import io
+    import tarfile
+
+    # 1. Directory member under an existing regular file path must be rejected.
+    dir_under_file = tmp_path / "dir-under-file.tar.gz"
+    with tarfile.open(dir_under_file, "w:gz") as tar:
+        payload = b"schema_version: ppu-serving/v1\n"
+        file_info = tarfile.TarInfo("tests/ppu/foo")
+        file_info.size = len(payload)
+        file_info.mode = 0o644
+        tar.addfile(file_info, io.BytesIO(payload))
+        dir_info = tarfile.TarInfo("tests/ppu/foo/bar/")
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o755
+        tar.addfile(dir_info)
+    with pytest.raises(ValueError, match="collides with a file"):
+        manifest.recipe_tree_sha256(dir_under_file)
+
+    # 2. Directory member with double slash must be rejected.
+    double_slash = tmp_path / "double-slash.tar.gz"
+    with tarfile.open(double_slash, "w:gz") as tar:
+        dir_info = tarfile.TarInfo("tests/ppu//sub/")
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o755
+        tar.addfile(dir_info)
+    with pytest.raises(ValueError, match="unsafe recipe archive path"):
+        manifest.recipe_tree_sha256(double_slash)
+
+    # 3. Symlinked intermediate ancestor directory inside source must be rejected.
+    fake_src = tmp_path / "src"
+    (fake_src / "real_tests/ppu/recipes/org").mkdir(parents=True)
+    (fake_src / "real_tests/ppu/recipes/org/model.yaml").write_text("a: 1\n")
+    (fake_src / "tests").symlink_to(fake_src / "real_tests")
+    (fake_src / "scripts/ci").mkdir(parents=True)
+    (fake_src / "scripts/ci/ppu_recipe.py").write_text("# recipe\n")
+    with pytest.raises(ValueError, match="symlinked ancestor"):
+        manifest.build_recipes_archive(fake_src, tmp_path / "out.tar.gz")

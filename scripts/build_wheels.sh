@@ -33,8 +33,9 @@ current index configuration. Rustup is bootstrapped if missing; its toolchain
 comes from vLLM's rust-toolchain.toml. RUSTUP_DIST_SERVER/RUSTUP_UPDATE_ROOT
 can override the build pipeline's default rsproxy.cn mirrors.
 
-Outputs: wheels/vllm/*.whl, wheels/vllm-sail/*.whl, wheels/wheel-manifest.json,
-build-manifest.txt and logs/ (including vllm-rust-build.log).
+Outputs: wheels/vllm/*.whl, wheels/vllm-sail/*.whl, wheels/recipes.tar.gz,
+wheels/wheel-manifest.json, build-manifest.txt and logs/ (including
+vllm-rust-build.log).
 EOF
 }
 
