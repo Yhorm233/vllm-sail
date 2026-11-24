@@ -61,6 +61,45 @@ def gemma_rmsnorm(x, weight, eps):
     return out.to(x.dtype)
 
 
+@pytest.mark.parametrize("num_tokens,num_kv_heads", [(1, 1), (7, 4), (129, 1)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_dspark_context_k_norm(num_tokens, num_kv_heads, strided):
+    from types import SimpleNamespace
+
+    from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkModel
+    from vllm.models.minimax_m3.nvidia.model import MiniMAXGemmaRMSNorm
+    from vllm.platforms import current_platform
+
+    from vllm_sail import register_out_of_tree
+
+    assert current_platform.is_ppu()
+    register_out_of_tree()
+    torch.manual_seed(42)
+    eps = 1e-6
+    # Exercise strided context rows as well as the upstream contiguous layout.
+    storage = torch.randn(
+        (2, num_tokens * (2 if strided else 1), num_kv_heads, HEAD_DIM),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    keys = storage[:, ::2] if strided else storage
+    before = keys.clone()
+    norms = [MiniMAXGemmaRMSNorm(HEAD_DIM, eps).to(keys) for _ in range(2)]
+    with torch.no_grad():
+        for norm in norms:
+            norm.weight.copy_(torch.randn_like(norm.weight) * 0.2)
+        model = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=SimpleNamespace(k_norm=n)) for n in norms]
+        )
+        got = MiniMaxM3DSparkModel._normalize_context_k(model, keys)
+        expected = torch.stack(
+            [gemma_rmsnorm(k, n.weight, eps) for k, n in zip(keys, norms, strict=False)]
+        )
+    assert got.shape == keys.shape and got.dtype == keys.dtype
+    torch.testing.assert_close(keys, before, rtol=0, atol=0)
+    torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
+
+
 def apply_rope_neox_partial(x, positions, cos_sin_cache, rotary_dim):
     """NeoX-style RoPE on the leading rotary_dim dims; rest pass through.
 

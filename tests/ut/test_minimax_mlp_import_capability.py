@@ -803,3 +803,25 @@ def test_ppu_mxfp8_emulation_does_not_request_swizzled_norm(
     linear = NS(quant_method=NS(kernel=object()))
     provider.get_input_quant_key = lambda layer: input_key(layer.quant_method.kernel)
     assert provider._consumes_mxfp8_128x4(linear) is False
+
+
+@pytest.mark.upstream_source
+def test_channelwise_qkv_skips_nvidia_provider_import(
+    modules, monkeypatch, upstream_source_root
+):
+    provider = load_model(modules, monkeypatch, upstream_source_root, True)
+    name = "vllm.model_executor.kernels.linear.mxfp8.flashinfer"
+
+    class Forbidden(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == name:
+                raise ModuleNotFoundError("NVIDIA MXFP8 provider", name="flashinfer")
+
+    modules("vllm.model_executor.kernels.linear.mxfp8")
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Forbidden(), *sys.meta_path])
+    # The pin imports this provider before it looks at either the chip or weight.
+    with pytest.raises(ModuleNotFoundError, match="NVIDIA MXFP8"):
+        provider._supports_qkv_fused_epilogue(object())
+    load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
+    assert provider._supports_qkv_fused_epilogue(object()) is False

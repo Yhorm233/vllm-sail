@@ -11,10 +11,24 @@ from vllm_sail.patch.utils import patch
 
 _original_init = MiniMaxM3Model._init_fused_moe_finalize
 _original_mlp_init = _model.MiniMaxM3MLP.__init__
+_original_supports_qkv_fused_epilogue = _model._supports_qkv_fused_epilogue
 _original_maybe_init_gemm_rs = _model._maybe_init_gemm_rs
 _original_bind_gemm_rs = _model._bind_gemm_rs
 _original_norm_forward = _model.MiniMAXGemmaRMSNorm.forward
 _ppu_mlp_init = bind_body(_mlp_body, _model)
+
+
+@patch(
+    "vllm.models.minimax_m3.nvidia.model",
+    "_supports_qkv_fused_epilogue",
+    reason="MiniMax imports NVIDIA MXFP8 kernel providers before checking the device. PPU channelwise FP8/INT8 projections use the ordinary GEMM and SAIL attention path.",
+    affected_versions=">=0.32.0,<0.33.0",
+    remove_when="MiniMax checks platform capability before importing the NVIDIA-only QKV fused-epilogue providers.",
+)
+def supports_qkv_fused_epilogue(attn):
+    if current_platform.is_ppu():
+        return False
+    return _original_supports_qkv_fused_epilogue(attn)
 
 
 @patch(

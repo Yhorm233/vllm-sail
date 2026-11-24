@@ -28,6 +28,7 @@ def test_registered_finalize_retains_ordinary_ppu_path(modules, ppu):
         MiniMaxM3Model=Model,
         MiniMaxM3MLP=type("MLP", (), {}),
         MiniMAXGemmaRMSNorm=type("Norm", (), {"forward": unavailable}),
+        _supports_qkv_fused_epilogue=lambda attn: False,
         _maybe_init_gemm_rs=unavailable,
         _bind_gemm_rs=unavailable,
     )

@@ -320,6 +320,7 @@ _EXPECTED_TARGETS = {
     "vllm.model_executor.models.llama4.Llama4MoE.custom_routing_function",
     "vllm.models.minimax_m3.nvidia.model.MiniMaxM3Model._init_fused_moe_finalize",
     "vllm.models.minimax_m3.nvidia.model.MiniMaxM3MLP.__init__",
+    "vllm.models.minimax_m3.nvidia.model._supports_qkv_fused_epilogue",
     "vllm.models.minimax_m3.nvidia.model._maybe_init_gemm_rs",
     "vllm.models.minimax_m3.nvidia.model._bind_gemm_rs",
     "vllm.models.minimax_m3.nvidia.model.MiniMAXGemmaRMSNorm.forward",
