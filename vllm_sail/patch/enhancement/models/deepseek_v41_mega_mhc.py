@@ -4,8 +4,19 @@
 Upstream gates the kernel on the SM 10.x (Blackwell) family and on
 ``vllm.utils.deep_gemm.is_deep_gemm_supported()``, which is False on PPU
 because the platform does not advertise CUDA DeepGEMM support. The PPU
-DeepGEMM build does ship a Mega mHC kernel, but only for ZW-M890P (SM 8.9)
-and only for the 5120-wide, ``hc_mult=4`` configuration.
+DeepGEMM build ships a Mega mHC kernel for both PPU generations, but only
+for the 5120-wide, ``hc_mult=4`` configuration:
+
+* PPU 1.0 (ZW-810E, capability ``(8, 0)``, ``AC_PPU0010``) runs the BF16
+  variant and rejects FP8 outputs. The V4.1 dispatcher only requests a BF16
+  ``y_bf16``, so that restriction never applies here.
+* PPU 1.5 (ZW-M890P, capability ``(8, 9)``, ``AC_PPU0015``) additionally
+  runs the FP8 variants.
+
+Capability alone is not enough: CUDA's Ampere also reports ``(8, 0)``, so the
+capability set is only consulted behind the ``is_ppu()`` check. DeepGEMM
+enforces its own preconditions (arch, shapes, dtypes), so this gate does not
+restate them beyond the shape contract.
 
 This module therefore replaces the two upstream symbols the V4.1 mHC module
 needs, and delegates to the upstream implementations on every other platform.
@@ -40,8 +51,10 @@ _AFFECTED = ">=0.32.0,<0.33.0"
 # The PPU Mega mHC kernel is generated for exactly one shape.
 _PPU_HIDDEN_SIZE = 5120
 _PPU_HC_MULT = 4
-_PPU_CAPABILITY = (8, 9)
-_PPU_DEVICE_NAME_MARKER = "M890"
+#: Capabilities whose DeepGEMM build carries the Mega mHC kernel: PPU 1.0
+#: (ZW-810E) and PPU 1.5 (ZW-M890P). Only consulted on PPU, where capability
+#: identifies the chip generation; on CUDA ``(8, 0)`` is Ampere instead.
+_MEGA_MHC_CAPABILITIES = frozenset({(8, 0), (8, 9)})
 
 
 @functools.cache
@@ -52,24 +65,21 @@ def _ppu_mega_mhc_capability(hidden_size: int, hc_mult: int) -> bool:
     deep_gemm_supported = ppu_deep_gemm.is_deep_gemm_supported()
     has_mega = ppu_deep_gemm.has_mega_mhc()
     capability = current_platform.get_device_capability()
-    device_name = current_platform.get_device_name()
     supported = (
         deep_gemm_supported
         and has_mega
         and capability is not None
-        and (capability.major, capability.minor) == _PPU_CAPABILITY
-        and _PPU_DEVICE_NAME_MARKER in device_name
+        and (capability.major, capability.minor) in _MEGA_MHC_CAPABILITIES
     )
     logger.info_once(
         "DSV4.1 mHC: PPU Mega mHC gate (hidden_size=%d, hc_mult=%d) -> %s "
-        "[deep_gemm=%s, has_mega_mhc=%s, capability=%s, device=%s]",
+        "[deep_gemm=%s, has_mega_mhc=%s, capability=%s]",
         hidden_size,
         hc_mult,
         supported,
         deep_gemm_supported,
         has_mega,
         capability,
-        device_name,
         scope="global",
     )
     return supported
@@ -97,8 +107,9 @@ def _ppu_mega_mhc_supported(hidden_size: int, hc_mult: int) -> bool:
     "is_mega_mhc_supported",
     reason=(
         "PPU runs the DSV4.1 Mega mHC kernel from the PPU DeepGEMM build, which "
-        "targets ZW-M890P (SM 8.9) instead of the upstream SM 10.x family and "
-        "only supports the 5120-wide, hc_mult=4 configuration."
+        "targets ZW-810E (SM 8.0, BF16 output) and ZW-M890P (SM 8.9) instead of "
+        "the upstream SM 10.x family and only supports the 5120-wide, hc_mult=4 "
+        "configuration."
     ),
     affected_versions=_AFFECTED,
     remove_when=(
