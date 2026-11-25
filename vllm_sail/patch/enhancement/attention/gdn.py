@@ -519,34 +519,34 @@ def _resolve_gdn_prefill_backend(
     # PPU MODIFICATION: end
     """Resolve GDN prefill backend.
 
-    The SYCL kernel is chosen when ``requested in ["sycl", "auto"]``, the
-    platform is XPU and ``_xpu_C::gdn_attention`` is built. Unlike the other
+    The SYCL kernel is chosen when `requested in ["sycl", "auto"]`, the
+    platform is XPU and `_xpu_C::gdn_attention` is built. Unlike the other
     backends it is a fused whole-layer op, so selecting it also replaces the
     conv1d and decode kernels, not just prefill.
 
     FlashInfer's GDN prefill kernel is chosen when:
-    * ``requested in ["flashinfer", "auto"]``;
-    * ``platform == cuda``;
+    * `requested in ["flashinfer", "auto"]`;
+    * `platform == cuda`;
     * one of the following:
       - Hopper (SM90) - no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``;
-      - Blackwell (SM12.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
+      - Blackwell (SM10.x) with `head_k_dim == 128`, `cuda_runtime >= 13`;
+      - Blackwell (SM12.x) with `head_k_dim == 128`, `cuda_runtime >= 13`.
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x or SM11.x) with ``head_k_dim == 128``,
-      ``cuda_runtime >= 13``;
+    * Blackwell (SM10.x or SM11.x) with `head_k_dim == 128`,
+      `cuda_runtime >= 13`;
 
     AITER FlyDSL GDN prefill kernels are chosen when:
     * "aiter_flydsl" is requested, or "auto" is requested on gfx942/gfx950;
     * ROCm AITER exposes the optimized VK prefill API and FlyDSL kernels;
-    * the model uses BF16 activations with ``head_k_dim == head_v_dim == 128``.
+    * the model uses BF16 activations with `head_k_dim == head_v_dim == 128`.
 
     The HIP GDN prefill kernel is chosen when:
     * "hip" is requested on RDNA3.5 (gfx1150-gfx1153), or "auto" on gfx1151;
-    * the build includes ``_rocm_C.rdna35_gdn_chunked``;
+    * the build includes `_rocm_C.rdna35_gdn_chunked`;
     * the model uses BF16 or FP16 activations with
-      ``head_k_dim == head_v_dim == 128``.
+      `head_k_dim == head_v_dim == 128`.
     # PPU MODIFICATION: begin
 
     The PPU pla (FlashQLA) CUDA kernel is chosen when:

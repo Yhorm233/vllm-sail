@@ -57,7 +57,10 @@ def load_model(modules, monkeypatch, source, ppu):
     )
     modules(
         "vllm.model_executor.models.utils",
-        WeightsMapper=lambda *, orig_to_new_prefix, orig_to_new_substr: NS(),
+        WeightsMapper=lambda *,
+        orig_to_new_prefix=None,
+        orig_to_new_substr=None,
+        orig_to_new_stacked=None: NS(),
     )
     modules(
         "vllm.compilation.breakable_cudagraph",
@@ -67,6 +70,10 @@ def load_model(modules, monkeypatch, source, ppu):
         "vllm.platforms", current_platform=NS(is_ppu=lambda: ppu, is_cuda=lambda: True)
     )
     name = "vllm.models.minimax_m3.nvidia.model"
+    modules(
+        "vllm.models.minimax_m3.nvidia.specialized_decode",
+        specialized_decode_config=unavailable,
+    )
     modules(name)
     spec = importlib.util.spec_from_file_location(name, path)
     provider = importlib.util.module_from_spec(spec)
@@ -243,20 +250,6 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
 
 
 @pytest.mark.upstream_source
-@pytest.mark.parametrize("ppu", [False, True])
-def test_registered_mlp_retains_activation_validation(
-    modules, monkeypatch, upstream_source_root, ppu
-):
-    provider = load_model(modules, monkeypatch, upstream_source_root, ppu)
-    provider.MergedColumnParallelLinear = provider.RowParallelLinear = lambda *a, **k: (
-        object()
-    )
-    load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
-    with pytest.raises(ValueError, match="Only swigluoai is supported"):
-        provider.MiniMaxM3MLP(NS(hidden_size=8, hidden_act="unsupported"), 16)
-
-
-@pytest.mark.upstream_source
 def test_complete_mlp_constructor_preserves_upstream_body(upstream_source_root):
     local = definition(ROOT / "vllm_sail/models/minimax_m3_mlp.py", "init_mlp")
     upstream = definition(
@@ -268,8 +261,8 @@ def test_complete_mlp_constructor_preserves_upstream_body(upstream_source_root):
     assert ast.unparse(local.body[0]) == "super(MiniMaxM3MLP, self).__init__()"
     local.body[0] = ast.parse("super().__init__()").body[0]
     regions = [node for node in local.body if isinstance(node, ast.If)]
-    assert len(regions) == 3
-    import_guard, capability_guard = regions[1:]
+    assert len(regions) == 2
+    import_guard, capability_guard = regions
     assert ast.unparse(import_guard.test) == "not current_platform.is_ppu()"
     assert len(import_guard.body) == 1 and not import_guard.orelse
     local.body[local.body.index(import_guard)] = import_guard.body[0]
@@ -704,7 +697,7 @@ def test_real_minimax_pp_transport_restores_residual_aux_and_token_extent(
     model.embed_input_ids = lambda actual: hidden
     model.AUX_HIDDEN_STATE_KEY = "aux_"
     model._aux_slot_base_cached = 0
-    model._aux_upstream_total_cached = 0
+    model._aux_first_local_layer = 0 if first_rank else model.start_layer + 1
     for name in (
         "_maybe_add_hidden_state",
         "pack_local_aux_hidden_states",
@@ -795,9 +788,8 @@ def test_ppu_mxfp8_emulation_does_not_request_swizzled_norm(
             for node in definition(path, name).body
         )
     input_key = function(
-        upstream_source_root
-        / "vllm/model_executor/kernels/linear/mxfp8/Mxfp8LinearKernel.py",
-        "Mxfp8LinearKernel.input_quant_key",
+        upstream_source_root / "vllm/model_executor/kernels/linear/base.py",
+        "LinearKernel.input_quant_key",
         {},
     )
     linear = NS(quant_method=NS(kernel=object()))

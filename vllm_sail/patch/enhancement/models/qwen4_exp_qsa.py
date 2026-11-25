@@ -183,8 +183,12 @@ def impl_init(
     scale: float,
     num_kv_heads: int,
     kv_cache_dtype: str,
+    index_group=None,
 ) -> None:
-    _impl_init(self, num_heads, head_size, scale, num_kv_heads, kv_cache_dtype)
+    _impl_init(self, num_heads, head_size, scale, num_kv_heads, kv_cache_dtype, index_group=index_group)
+    if index_group is not None:
+        self._sail_qsa_fa3 = resolve_qsa_fa3_kernel(envs.VLLM_SAIL_QSA_KERNEL, cuda_reason="HiSparse index groups require upstream QSA")
+        return
     # Resolved here, not per step: the answer depends only on the shape, the
     # environment and the wheel, and reserving the workspace here keeps the
     # allocation out of the CUDA graph capture the builder allows.

@@ -31,10 +31,10 @@ from __future__ import annotations
 
 import re
 
-from vllm_sail.patch.utils import PATCH_REGISTRY, PatchRecord, patch
+from vllm_sail.patch.utils import PATCH_MARKER, PATCH_REGISTRY, PatchRecord, patch
 
 _MTP_MODULE = "vllm.models.glm5next.common.mtp"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.32.0,<0.33.0; upstream main e83d82a"
 
 #: Fused -> checkpoint projection names, as on ``Glm5NextForConditionalGeneration``.
 _PACKED_MODULES_MAPPING = {"gate_up_proj": ["gate_proj", "up_proj"]}
@@ -152,6 +152,11 @@ def _enable_packed_modules_mapping() -> None:
 try:
     from vllm.model_executor.models.utils import WeightsMapper
 
+    class _DraftWeightsMapper(WeightsMapper):
+        # The upstream mapper is slotted. Keep patch provenance on our own
+        # instance without modifying the upstream type or other mappers.
+        __slots__ = (PATCH_MARKER,)
+
     _enable_supports_quant()
     _enable_packed_modules_mapping()
 
@@ -165,7 +170,7 @@ try:
         remove_when=_MAPPER_REMOVE_WHEN,
         allow_missing=True,
     )(
-        WeightsMapper(
+        _DraftWeightsMapper(
             orig_to_new_regex={_LAYER_PREFIX_RE: r"model.layers.\1."},
         )
     )

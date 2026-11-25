@@ -243,6 +243,7 @@ def install() -> None:
         w1_bias=None,
         w2_bias=None,
         per_act_token_quant: bool = False,
+        per_out_ch_quant: bool = False,
         layer=None,
         swiglu_limit: float | None = None,
         gemm1_alpha: float | None = None,
@@ -257,6 +258,7 @@ def install() -> None:
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 per_act_token_quant=per_act_token_quant,
+                per_out_ch_quant=per_out_ch_quant,
                 gemm1_clamp_limit=swiglu_limit,
                 gemm1_alpha=gemm1_alpha,
                 gemm1_beta=gemm1_beta,
@@ -272,6 +274,7 @@ def install() -> None:
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             per_act_token_quant=per_act_token_quant,
+            per_out_ch_quant=per_out_ch_quant,
             layer=layer,
         )
 

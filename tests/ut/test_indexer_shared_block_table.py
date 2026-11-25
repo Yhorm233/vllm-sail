@@ -2,6 +2,7 @@
 """Execute the delegating indexer build wrapper and its builder-aware helpers."""
 
 from types import SimpleNamespace as NS
+from typing import NamedTuple
 from unittest.mock import ANY
 
 import pytest
@@ -9,6 +10,11 @@ import pytest
 from tests.support.source import definition, function
 
 PATCH = "vllm_sail/patch/enhancement/attention/mla_indexer.py"
+
+
+class DecodeSchedule(NamedTuple):
+    schedule_metadata: object
+    indices: object | None = None
 
 
 class Span:
@@ -106,12 +112,12 @@ def test_int8_builder_marks_only_graph_stable_flattened_schedules(
     paged = function(PATCH, "_ppu_paged_metadata", namespace)
     geometry = (1, 64, 128, "int8")
     namespace["_upstream_build"] = lambda *args: NS(
-        decode=NS(schedule_metadata=paged(Span(), 64, 7, geometry))
+        decode=DecodeSchedule(schedule_metadata=paged(Span(), 64, 7, geometry))
     )
-    decode = function(PATCH, "_build_wrapper", namespace)(builder, 0, None).decode
+    step = function(PATCH, "_build_wrapper", namespace)(builder, 0, None)
 
     assert len(calls) == 1
-    assert getattr(decode, "_sail_paged_schedule_key", None) == (
+    assert getattr(step, "_sail_paged_schedule_key", None) == (
         (64, 7, geometry, False) if use_flattening else None
     )
 
@@ -128,6 +134,9 @@ def test_int8_decode_layers_reuse_matching_schedule(page_size, num_sms, padding)
         indices=None,
         requires_padding=padding,
         per_req_decode_lens=None,
+    )
+    step = NS(
+        decode=metadata,
         _sail_paged_schedule_key=(64, 7, (1, 64, 128, "int8"), False),
     )
     calls = []
@@ -153,7 +162,7 @@ def test_int8_decode_layers_reuse_matching_schedule(page_size, num_sms, padding)
     reuse = (page_size, num_sms, padding) == (64, 7, False)
     for _ in range(2):
         assert inputs(
-            metadata, contexts, NS(shape=(3,)), 1, page_size, 64, 128, "int8", False
+            step, contexts, NS(shape=(3,)), 1, page_size, 64, 128, "int8", False
         ) == (contexts, tables, None, schedule if reuse else "rebuilt")
     assert calls == ([] if reuse else ["rebuild"] * 2)
 
@@ -177,19 +186,19 @@ def test_m890_builder_marks_only_native_varlen_or_flattened_schedules(
         repeat_interleave=lambda next_n: fallback_ids
     )
     namespace["_upstream_build"] = lambda *args: NS(
-        decode=NS(
+        decode=DecodeSchedule(
             indices=indices,
             schedule_metadata=paged(Span(), 64, 7, geometry, indices=indices),
         )
     )
-    decode = function(PATCH, "_build_wrapper", namespace)(builder, 0, None).decode
+    step = function(PATCH, "_build_wrapper", namespace)(builder, 0, None)
 
     assert len(calls) == 1
     assert calls[0][-1] is (fallback_ids if fp4 and not prepared else indices)
-    assert getattr(decode, "_sail_paged_schedule_key", None) == (
+    assert getattr(step, "_sail_paged_schedule_key", None) == (
         (64, 7, geometry, fp4) if prepared else None
     )
-    assert decode.indices is indices
+    assert step.decode.indices is indices
 
 
 @pytest.mark.parametrize("fp4", [False, True])
@@ -204,6 +213,9 @@ def test_m890_decode_layers_reuse_matching_schedule_and_ids(fp4, mismatch):
         indices=indices if fp4 and mismatch != "indices" else None,
         requires_padding=mismatch == "padding",
         per_req_decode_lens=None,
+    )
+    step = NS(
+        decode=metadata,
         _sail_paged_schedule_key=(64, 7, (1, 64, 128, "int8" if fp4 else "fp8"), fp4),
     )
     calls = []
@@ -238,7 +250,7 @@ def test_m890_decode_layers_reuse_matching_schedule_and_ids(fp4, mismatch):
     expected_ids = rebuilt_ids if rebuild_schedule else indices
     for _ in range(2):
         used = inputs(
-            metadata,
+            step,
             contexts,
             NS(shape=(3,)),
             1,
@@ -486,7 +498,6 @@ def test_selected_upstream_producer_preserves_the_same_table(
         indexer_uses_fp4=False,
         vllm_config=object(),
         dcp_world_size=1,
-        tp_size=1,
         _prefill_split_seq_lens=lambda values: values,
         _split_indexer_prefill_chunks=lambda *args, **kwargs: [],
     )
@@ -497,7 +508,6 @@ def test_selected_upstream_producer_preserves_the_same_table(
             float32="float32",
         ),
         "envs": NS(VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=1),
-        "tp_prefill_row_sharding_supported": lambda config, dcp, pcp, tp: False,
         "split_decodes_and_prefills": lambda *args, **kwargs: (0, 1, 0, 1),
         "DeepseekV32IndexerMetadata": lambda **kwargs: NS(**kwargs),
         "DeepseekV32IndexerPrefillMetadata": lambda chunks, **kwargs: NS(
@@ -507,3 +517,6 @@ def test_selected_upstream_producer_preserves_the_same_table(
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     result = namespace["build"](builder, 0, common)
     assert result.block_table is block_table
+    assert result.slot_mapping is common.slot_mapping
+    assert result.prefill.shardq_gather_indices is None
+    assert result.prefill.max_prefill_seq_len == 17

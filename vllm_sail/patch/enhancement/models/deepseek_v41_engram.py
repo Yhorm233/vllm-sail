@@ -51,15 +51,25 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID,
+    # PPU MODIFICATION: begin
     SORTED: tl.constexpr,
+    # PPU MODIFICATION: end
     PACKED: tl.constexpr,
     OUT_STRIDE: tl.constexpr,
     PEER_ROWS: tl.constexpr = 0,
+    WORD: tl.constexpr = tl.uint8,
+    PACKED_FP4: tl.constexpr = False,
+    SOFTWARE_FP8: tl.constexpr = False,
 ):
-    """Gather FP8 rows using the current upstream sorted/packed contract.
+    """Gather FP8 or MXFP4 rows as dequantized BF16, or FP8 rows as packed
+    values/scales (copied WORD at a time).
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA.
+    `weight`/`scales` may address pinned host memory through UVA. If SORTED,
+    `ids` holds rows relative to vocab_start in table order and `sorted_dst`
+    their output rows. SOFTWARE_FP8 (GPUs below SM89, which Triton gives no
+    FP8 type): `weight` holds the E4M3 bytes as uint8 and they are decoded
+    with integer operations, which is exact.
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -68,7 +78,7 @@ def _engram_lookup_kernel(
         valid = rows < num_rows
         if SORTED:
             local = tl.load(ids + rows, mask=valid, other=-1).to(tl.int64)
-            dst = tl.load(sorted_dst + rows, mask=valid, other=0).to(tl.int64)
+            dst = tl.load(sorted_dst + rows, mask=valid, other=0).to(tl.int32)
             owned = (local >= 0) & (local < vocab_end - vocab_start)
         else:
             head = HEAD_START + rows % LOCAL_HEADS
@@ -78,54 +88,97 @@ def _engram_lookup_kernel(
                 mask=valid & (head < TOTAL_HEADS),
                 other=-1,
             ).to(tl.int64)
-            dst = rows.to(tl.int64)
+            dst = rows
             owned = valid & (head < TOTAL_HEADS)
             owned &= (index >= vocab_start) & (index < vocab_end)
             local = index - vocab_start
         local = tl.where(owned, local, 0)
+        ROW_BYTES: tl.constexpr = DIM // 2 if PACKED_FP4 else DIM
         if PEER_ROWS:
+            # `weight` holds each rank's buffer: PEER_ROWS rows, then scales.
             owner = local // PEER_ROWS
             peer = tl.load(weight + owner, mask=owned, other=0)
             local -= owner * PEER_ROWS
-            row_weight = peer.to(tl.pointer_type(tl.float8e4nv))
-            row_scales = (peer + PEER_ROWS * DIM).to(tl.pointer_type(tl.uint8))
+            if PACKED_FP4 or SOFTWARE_FP8:
+                row_weight = peer.to(tl.pointer_type(tl.uint8))
+            else:
+                row_weight = peer.to(tl.pointer_type(tl.float8e4nv))
+            row_scales = (peer + PEER_ROWS * ROW_BYTES).to(tl.pointer_type(tl.uint8))
         else:
             row_weight, row_scales = weight, scales
-        row_weight += local * DIM
+        row_weight += local * ROW_BYTES
         row_scales += local * (DIM // QUANT_BLOCK)
-        values = tl.load(
-            row_weight[:, None] + cols[None, :],
-            mask=owned[:, None],
-            other=0.0,
-        )
-        scale = tl.load(
-            row_scales[:, None] + scale_cols[None, :],
-            mask=owned[:, None],
-            other=0,
-        )
         if PACKED:
-            tl.static_assert(
-                row_scales.dtype.element_ty == tl.uint8,
-                "Packed Engram output requires E8M0 byte scales",
-            )
+            # PPU MODIFICATION: begin
+            tl.static_assert(row_scales.dtype.element_ty == tl.uint8, "Packed output requires E8M0 byte scales")
+            # PPU MODIFICATION: end
+            # Copy values and scales WORD at a time: one memory request a word.
+            word_bytes: tl.constexpr = WORD.primitive_bitwidth // 8
+            value_words = tl.arange(0, DIM // word_bytes)
+            scale_words = tl.arange(0, DIM // QUANT_BLOCK // word_bytes)
             width: tl.constexpr = DIM + DIM // QUANT_BLOCK
+            dst = dst.to(tl.int64)
             dst = dst // LOCAL_HEADS * OUT_STRIDE + dst % LOCAL_HEADS * width
-            tl.store(
-                out + dst[:, None] + cols[None, :],
-                values.to(tl.uint8, bitcast=True),
-                mask=valid[:, None],
+            out_row = (out + dst).to(tl.pointer_type(WORD))
+            # Load both first: a load after a store waits out its round trip.
+            values = tl.load(
+                row_weight.to(tl.pointer_type(WORD))[:, None] + value_words[None, :],
+                mask=owned[:, None],
+                other=0,
+            )
+            scale = tl.load(
+                row_scales.to(tl.pointer_type(WORD))[:, None] + scale_words[None, :],
+                mask=owned[:, None],
+                other=0,
             )
             tl.store(
-                out + dst[:, None] + DIM + scale_cols[None, :],
-                scale,
-                mask=valid[:, None] & (cols[None, :] % QUANT_BLOCK == 0),
+                out_row[:, None] + value_words[None, :], values, mask=valid[:, None]
+            )
+            out_row += DIM // word_bytes
+            tl.store(
+                out_row[:, None] + scale_words[None, :], scale, mask=valid[:, None]
             )
         else:
+            if PACKED_FP4:
+                # Even column in the low nibble. E2M1 magnitude with e = bits 2:1,
+                # m = bit 0: m * 0.5 if e == 0, else (2 + m) * 2**(e - 2).
+                byte = tl.load(
+                    row_weight[:, None] + (cols // 2)[None, :],
+                    mask=owned[:, None],
+                    other=0,
+                ).to(tl.int32)
+                nib = tl.where(cols[None, :] % 2 == 0, byte & 0xF, (byte >> 4) & 0xF)
+                e = (nib & 0x7) >> 1
+                m = (nib & 0x1).to(tl.float32)
+                pow2 = ((e - 2 + 127) << 23).to(tl.float32, bitcast=True)
+                mag = tl.where(e == 0, m * 0.5, (2.0 + m) * pow2)
+                values = tl.where((nib & 0x8) != 0, -mag, mag)
+            else:
+                values = tl.load(
+                    row_weight[:, None] + cols[None, :], mask=owned[:, None], other=0.0
+                )
+            scale = tl.load(
+                row_scales[:, None] + scale_cols[None, :], mask=owned[:, None], other=0
+            )
+            # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
+            # PPU MODIFICATION: begin
             if row_scales.dtype.element_ty != tl.float32:
                 scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            # PPU MODIFICATION: end
+            if SOFTWARE_FP8:
+                # E4M3: a normal code's exponent and mantissa shift into the
+                # fp32 fields (bias 7 -> 127); a subnormal code is m * 2^-9.
+                code = values.to(tl.int32)
+                magnitude = code & 0x7F
+                normal = ((magnitude << 20) + (120 << 23)).to(tl.float32, bitcast=True)
+                subnormal = (magnitude & 7).to(tl.float32) * 0.001953125
+                decoded = tl.where(magnitude < 8, subnormal, normal)
+                decoded = tl.where((code & 0x80) != 0, -decoded, decoded)
+            else:
+                decoded = values.to(tl.float32)
             tl.store(
                 out + dst[:, None] * DIM + cols[None, :],
-                (values.to(tl.float32) * scale).to(tl.bfloat16),
+                (decoded * scale).to(tl.bfloat16),
                 mask=valid[:, None],
             )
 

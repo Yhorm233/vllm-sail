@@ -38,6 +38,7 @@ def _forward_impl_body(
     quant_col_major: bool | None = None,
     quant_tma_aligned: bool | None = None,
     q_dcp_replicated: torch.Tensor | None = None,
+    mqa_q_prepared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert output is not None, "Output tensor must be provided."
 
@@ -76,6 +77,12 @@ def _forward_impl_body(
             )
         # PPU MODIFICATION: end
         self.impl.reserve_workspace()
+        if self.use_shardq and self.impl.dcp_world_size > 1:
+            from vllm.v1.attention.ops.dcp_shardq.context import (
+                reserve_dcp_shardq,
+            )
+
+            reserve_dcp_shardq(self, k_c_normed.device)
 
         # The zero fill is required when used with DP + EP
         # to ensure all ranks within a DP group compute the
@@ -123,17 +130,33 @@ def _forward_impl_body(
             num_mqa_tokens = q.size(0)
             num_mha_tokens = 0
 
+    shardq = getattr(attn_metadata, "shardq", None)
+    gathered_context = None if shardq is None else shardq.gathered_context
+    if gathered_context is not None:
+        # A DCP ShardQ step's prefill tokens attend a gathered copy of
+        # their context, which still lacks the step's new tokens; every
+        # rank writes all of them.
+        num_dcp_decode_tokens = gathered_context.num_decode_tokens
+        self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+            k_c_normed[num_dcp_decode_tokens:],
+            k_pe[num_dcp_decode_tokens:],
+            gathered_context.mla_view(kv_cache),
+            gathered_context.slot_mapping,
+            self.kv_cache_dtype,
+            self._k_scale,
+        )
+
     mha_use_quant_output = (
         quant_key is not None
         and self.prefill_backend is not None
         and self.prefill_backend.supports_quant_output(quant_key)
-        and (
-            not self.impl.is_sparse
-            or attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
-            <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
-        )
         and attn_metadata is not None
         and attn_metadata.prefill is not None
+        and (
+            not self.impl.is_sparse
+            or attn_metadata.prefill.route  # type: ignore[attr-defined]
+            is SparseMLAPrefillRoute.DENSE_MHA
+        )
         and attn_metadata.prefill.chunked_context is None
         and self.impl.dcp_world_size <= 1
     )
@@ -158,130 +181,61 @@ def _forward_impl_body(
         )
 
     if num_mqa_tokens > 0:
-        if q_dcp_replicated is not None:
-            mqa_q = q_dcp_replicated[:num_mqa_tokens]
-            qrep_decode = True
-        else:
-            mqa_q = q[:num_mqa_tokens]
-            qrep_decode = False
-        mqa_output_slice = output[:num_mqa_tokens]
-
-        mqa_q_nope, mqa_q_pe = mqa_q.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        has_mla_lora = hasattr(self.kv_b_proj, "apply_mla_absorbed_kv_b_lora")
+        use_fused_v_up_proj = (
+            self.W_UV_dcp is not None
+            and not has_mla_lora
+            and gathered_context is None
         )
-
-        # Convert from (B, N, P) to (N, B, P)
-        mqa_q_nope = mqa_q_nope.transpose(0, 1)
-
-        if self.q_pad_num_heads is not None:
-            B, N, L = mqa_q_pe.shape
-            mqa_pe_padded = mqa_q_pe.new_empty((B, self.q_pad_num_heads, L))
-            mqa_pe_padded.resize_((B, N, L))
-            mqa_pe_padded.copy_(mqa_q_pe)
-            mqa_q_pe = mqa_pe_padded
-
-        if self.is_aiter_triton_fp4_bmm_enabled:
-            mqa_ql_nope = rocm_aiter_ops.batched_gemm_a16wfp4(
-                mqa_q_nope,
-                self.W_K,
-                self.W_K_scale,
-                transpose_bm=True,
-                prequant=True,
-                y_scale=self._q_scale if fp8_attention else None,
-            )
-        elif self.is_aiter_triton_fp8_bmm_enabled:
-            # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-            mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
-                mqa_q_nope,
-                self.W_K,
-                self.W_K_scale,
-                group_size=128,
-                transpose_bm=True,
-            )
-        elif self.is_amx_bmm_enabled:
-            # bmm_cpu computes out[n] = mat1[n] @ mat2[n]^T against
-            # AMXMLAImpl's own (N, L, P) packed W_UK -- same as prefill.
-            N, B, P = mqa_q_nope.shape
-            L = self.kv_lora_rank
-            mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-            ops.bmm_cpu(
-                mqa_ql_nope,
-                mqa_q_nope,
-                self.impl._w_uk_packed,  # type: ignore[attr-defined]
-                True,
-                self.impl._w_scale,  # type: ignore[attr-defined]
-            )
-            mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
-        else:
-            # Pads the head_dim if necessary (for the underlying kernel)
-            N, B, P = mqa_q_nope.shape
-            W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
-            assert W_UK_T is not None
-            _, _, L = W_UK_T.shape
-
-            if self.q_pad_num_heads is not None:
-                mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
-                mqa_ql_nope.resize_((N, B, L))
-                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
-                # Convert from (N, B, L) to (B, N, L)
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
-            else:
-                # Write the (N, B, L) bmm result straight into a
-                # token-major (B, N, L) buffer so the MQA query is already
-                # contiguous; a NoPE model (qk_rope_head_dim == 0) then
-                # needs no concat at all.
-                mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
-
-        if fp8_attention and self.impl.supports_quant_query_input:
-            assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-            assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-            mqa_q = self._decode_concat_quant_fp8_op(
-                mqa_ql_nope, mqa_q_pe, self._q_scale
+        mqa_output_slice = output[:num_mqa_tokens]
+        if mqa_q_prepared is not None:
+            mqa_q = mqa_q_prepared[:num_mqa_tokens]
+        elif q_dcp_replicated is not None and gathered_context is None:
+            mqa_q = self._prepare_mqa_query(
+                q_dcp_replicated[:num_mqa_tokens], qrep_decode=True
             )
         else:
-            mqa_q = (mqa_ql_nope, mqa_q_pe)
-        # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
-        shardq = getattr(attn_metadata, "shardq", None)
+            # A DCP ShardQ step exchanges the local heads' query (shard_q)
+            # instead of gathering it.
+            mqa_q = self._prepare_mqa_query(
+                q[:num_mqa_tokens],
+                qrep_decode=False,
+                fused_q_heads=self._fused_decode_query_heads(attn_metadata),
+                gather_query=gathered_context is None,
+            )
         mqa_metadata = attn_metadata
-        if self.impl.dcp_world_size > 1:
-            assert self.dcp_manager is not None
-            if self.use_pcp:
-                if self.impl.dcp_world_size > self.impl.pcp_world_size:
-                    if isinstance(mqa_q, tuple):
-                        mqa_q = torch.cat(mqa_q, dim=-1)
-                    mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
-            else:
-                if isinstance(mqa_q, tuple):
-                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                    mqa_q = torch.cat(mqa_q, dim=-1)
-                if not qrep_decode:
-                    assert self.dcp_manager.query_gather is not None
-                    mqa_q = self.dcp_manager.query_gather(mqa_q)
-
+        mqa_kv_cache = kv_cache
         if shardq is not None:
             decode_q, mqa_q = shard_q(mqa_q, shardq)
             decode_out = None
-            if decode_q.shape[0]:
+            if decode_q.shape[0] and gathered_context is not None:
+                # Decode tokens keep the DCP path.
+                decode_out = self._forward_dcp_decode(
+                    decode_q, kv_cache, attn_metadata, gathered_context
+                )
+            elif decode_q.shape[0]:
                 # Decode tokens attend head-sharded.
                 decode_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
                     decode_q, kv_cache, attn_metadata, self
                 )
             mqa_metadata = shardq.attn_metadata
+            if gathered_context is not None:
+                mqa_kv_cache = gathered_context.mla_view(kv_cache)
 
         # call decode attn
         if not self.impl.is_sparse:
             assert attn_metadata.decode is not None
-        attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, mqa_metadata, self)  # type: ignore[attr-defined]
+        attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+            mqa_q, mqa_kv_cache, mqa_metadata, self
+        )
         if shardq is not None:
             attn_out = unshard_out(attn_out, shardq, decode_out)
 
         # correct dcp attn_out with lse.
-        if self.impl.dcp_world_size > 1:
+        if self.impl.dcp_world_size > 1 and gathered_context is None:
             assert lse is not None
             assert self.dcp_manager is not None
-            decode_metadata = getattr(attn_metadata, "decode", None)
+            decode_metadata = attn_metadata.decode
             if not use_mha and not self.use_pcp:
                 seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
                 query_start_loc = attn_metadata.query_start_loc
@@ -299,7 +253,17 @@ def _forward_impl_body(
             # Under PCP+DCP the prefill rows attended over the gathered KV,
             # so only the decode rows carry an LSE and take part in the merge.
             num_merge_rows = lse.shape[0]
-            if num_merge_rows == attn_out.shape[0]:
+            if use_fused_v_up_proj:
+                assert self.dcp_manager.v_up_proj_combine is not None
+                self.dcp_manager.v_up_proj_combine(
+                    attn_out,
+                    lse,
+                    self.W_UV_dcp,
+                    mqa_output_slice,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
+            elif num_merge_rows == attn_out.shape[0]:
                 attn_out = self.dcp_manager.combine(
                     attn_out,
                     lse,
@@ -316,8 +280,9 @@ def _forward_impl_body(
             if self.use_pcp:
                 attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-        # v_up projection
-        self._v_up_proj(attn_out, out=mqa_output_slice)
+        # v_up projection, unless the DCP merge already applied it
+        if not use_fused_v_up_proj:
+            self._v_up_proj(attn_out, out=mqa_output_slice)
 
     if quant_key is not None:
         quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks

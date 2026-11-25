@@ -34,11 +34,14 @@ def install():
     @functools.wraps(original)
     def select(scores, current, topk, backend="auto", **kwargs):
         if (not envs.VLLM_SAIL_STEP5_DSA_SELECTOR_PPU or not current_platform.is_ppu()
+                or kwargs.get("out") is not None or kwargs.get("history_only", False)
                 or backend not in ("auto", "per_row") or not 0 < topk <= 1024
                 or not scores.is_contiguous()
                 or str(scores.dtype) != "torch.float32"):
             return original(scores, current, topk, backend, **kwargs)
         from vllm_sail.models.step5.ops.selector_v2 import select_regions
+        kwargs.pop("out", None)
+        kwargs.pop("history_only", None)
         return select_regions(scores, current, topk, backend, **kwargs)
 
     for name in (_TARGET, "vllm.models.step5.nvidia.flashinfer_sparse"):

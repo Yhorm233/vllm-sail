@@ -35,7 +35,6 @@ MLAAttentionSpec.__dataclass_fields__ = {
 MLAAttentionSpec.__annotations__.update(_IndexerGeometry.__annotations__)
 
 _upstream_spec_init = MLAAttentionSpec.__init__
-_upstream_merge = MLAAttentionSpec.merge.__func__
 
 
 @patch(
@@ -62,29 +61,6 @@ def mla_attention_spec_init(
     _upstream_spec_init(self, *args, **kwargs)
     object.__setattr__(self, "indexer_n_head", indexer_n_head)
     object.__setattr__(self, "indexer_q_head_dim", indexer_q_head_dim)
-
-
-@patch(
-    _MODULE,
-    "MLAAttentionSpec.merge",
-    reason=(
-        "Fork forwards indexer_n_head/indexer_q_head_dim through "
-        "MLAAttentionSpec.merge (from specs[0], like the other geometry "
-        "fields); DeepseekV32IndexerMetadataBuilder reads them off the merged "
-        "group spec. Delegates to upstream merge, then copies the values from "
-        "specs[0] onto the merged (frozen) spec."
-    ),
-    affected_versions=_AFFECTED,
-    remove_when="upstream adds the indexer geometry fields to MLAAttentionSpec.",
-)
-def mla_attention_spec_merge(cls, specs):
-    merged = _upstream_merge(cls, specs)
-    first = specs[0]
-    object.__setattr__(merged, "indexer_n_head", getattr(first, "indexer_n_head", None))
-    object.__setattr__(
-        merged, "indexer_q_head_dim", getattr(first, "indexer_q_head_dim", None)
-    )
-    return merged
 
 
 _upstream_eq = MLAAttentionSpec.__eq__

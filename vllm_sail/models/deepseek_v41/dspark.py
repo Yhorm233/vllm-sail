@@ -49,10 +49,10 @@ class DSparkDeepseekV41ForCausalLM(UpstreamDSparkV41, SupportsQuant):
 # vllm/models/deepseek_v41/nvidia/dspark.py. Retain its body and globals.
 # ruff: noqa: F821
 def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-    """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
+    """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
 
     Non-mtp weights (embed/head/main layers) belong to the target model and
-    are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+    are skipped here. `embed_tokens`/`lm_head` are aliased from the target.
     """
     first_layer = self.model.layers[0]
     use_native_mega_moe = first_layer.ffn.use_native_mega_moe
@@ -72,6 +72,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=n_draft_experts,
+            num_redundant_experts=first_layer.ffn.n_redundant_experts,
         )
     expert_scale_suffix = (
         ".weight_scale"
@@ -89,7 +90,6 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
 
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
-    loaded_confidence_head = False
 
     weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
     for name, loaded_weight in weights:
@@ -97,9 +97,6 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if mapped is None:
             continue
         name = mapped
-        if "confidence_head." in name:
-            loaded_confidence_head = True
-
         # ``.scale`` -> per-method scale suffix.
         if name.endswith(".scale"):
             suffix = (
@@ -135,6 +132,8 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if ".experts." in name:
             if "weight_scale" in name and loaded_weight.dtype == torch.float8_e8m0fnu:
                 loaded_weight = loaded_weight.view(torch.uint8)
+            # A checkpoint expert can map to multiple local physical replicas.
+            # Load every local slot or the remaining replicas stay uninitialized.
             for param_name, weight_name, expert_id, shard_id in expert_mapping:
                 if weight_name not in name:
                     continue
@@ -153,7 +152,6 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
                 )
                 if success:
                     loaded_params.add(name_mapped)
-                    break
             continue
 
         # Stacked rules only apply to decoder-layer weights. Head-stack params
@@ -184,12 +182,6 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-    if (
-        self.model.confidence_head is not None
-        and not loaded_confidence_head
-        and is_mtp_completeness_check_enabled()
-    ):
-        self.model.confidence_head = None
     logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
     return loaded_params
 

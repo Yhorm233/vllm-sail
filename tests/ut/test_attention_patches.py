@@ -127,7 +127,6 @@ _ATTENTION_TARGETS = (
         "_hc_prenorm_gemm_outputs",
     ),
     ("vllm.v1.kv_cache_interface", "MLAAttentionSpec.__init__"),
-    ("vllm.v1.kv_cache_interface", "MLAAttentionSpec.merge"),
 )
 
 #: The fork's five forward_ppu overrides (mhc x4 + sparse attn indexer).
@@ -416,20 +415,18 @@ def test_mla_attention_spec_indexer_geometry_defaults_none(installed) -> None:
 def test_mla_attention_spec_merge_forwards_indexer_geometry(
     installed, head_major
 ) -> None:
-    """merge() must carry the geometry from specs[0] onto the merged spec.
-
-    DeepseekV32IndexerMetadataBuilder reads indexer_n_head off the merged
-    group spec; a None there makes its `indexer_n_head > 0` test raise.
-    """
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroup
 
     spec = _make_mla_spec(
         indexer_n_head=64, indexer_q_head_dim=128, kv_head_major_slots=head_major
     )
-    merged = MLAAttentionSpec.merge([spec, spec])
-    assert merged.indexer_n_head == 64
-    assert merged.indexer_q_head_dim == 128
-    assert merged.kv_head_major_slots is head_major
+    group = KVCacheGroup(
+        kv_cache_specs={"a": spec, "b": spec},
+        manager_config=None,
+        block_size=spec.block_size,
+    )
+    assert group.distinct_specs == (spec,)
+    assert group.kv_cache_specs["b"].indexer_q_head_dim == 128
 
 
 @pytest.mark.requires_runtime
@@ -452,7 +449,14 @@ def test_mla_spec_dataclass_operations_preserve_indexer_geometry(installed, head
     assert len({same, spec, other_geometry}) == 2
     assert resized.block_size == 256
     assert (resized.indexer_n_head, resized.indexer_q_head_dim) == (64, 128)
-    merged = MLAAttentionSpec.merge([resized, resized])
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
+    group = KVCacheGroup(
+        kv_cache_specs={"a": resized, "b": resized},
+        manager_config=None,
+        block_size=resized.block_size,
+    )
+    (merged,) = group.distinct_specs
     assert type(merged) is MLAAttentionSpec
     assert (merged.indexer_n_head, merged.indexer_q_head_dim) == (64, 128)
     assert all(

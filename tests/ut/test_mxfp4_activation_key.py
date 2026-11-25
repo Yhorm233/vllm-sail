@@ -154,6 +154,7 @@ def test_real_wna16_converter_redirects_backend_and_keeps_eight_return_slots(
                 HUMMING="humming", MARLIN="marlin", BATCHED_MARLIN="batched_marlin"
             ),
             "QuantizationArgs": quant_cls,
+            "WNA16WeightFormat": type("WNA16WeightFormat", (), {}),
             "_process_weights_marlin": process,
         },
     )

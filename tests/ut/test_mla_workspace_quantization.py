@@ -65,6 +65,7 @@ def _make_case(ppu, quantized):
         num_heads=2,
         v_head_dim=4,
         qk_nope_head_dim=2,
+        use_shardq=False,
         chunked_prefill_workspace_size=128,
         impl=NS(reserve_workspace=lambda: events.append(("reserve",))),
     )
@@ -199,12 +200,18 @@ def test_complete_forward_body_preserves_only_ppu_profile_region(upstream_source
 
 
 @pytest.fixture
-def sparse_forward_case():
+def sparse_forward_case(upstream_source_root):
+    from types import MethodType
+
     torch = pytest.importorskip("torch")
     output = torch.full((5, 8), -99.0)
     q = torch.arange(4 * 2 * 4, dtype=torch.float32).reshape(4, 2, 4)
     layer = NS(
         num_heads=2,
+        kv_b_proj=NS(),
+        W_UV_dcp=None,
+        kv_lora_rank=3,
+        is_aiter_fused_decode_query_enabled=False,
         v_head_dim=4,
         qk_nope_head_dim=2,
         qk_rope_head_dim=2,
@@ -214,6 +221,7 @@ def sparse_forward_case():
         is_amx_bmm_enabled=False,
         W_UK_T=torch.ones(2, 2, 3),
         kv_cache_dtype="auto",
+        use_shardq=False,
         use_pcp=False,
         prefill_backend=None,
         _use_sparse_mha=lambda meta: False,
@@ -238,6 +246,21 @@ def sparse_forward_case():
         projected.append(value.clone())
         out.copy_(value.reshape(out.shape))
 
+    for helper in (
+        "_fused_decode_query_heads",
+        "_prepare_mqa_query",
+        "_apply_lora_projection",
+    ):
+        setattr(
+            layer,
+            helper,
+            MethodType(
+                function(
+                    upstream_source_root / UPSTREAM, f"MLAAttention.{helper}", namespace
+                ),
+                layer,
+            ),
+        )
     layer._v_up_proj = project
     return torch, layer, namespace, metadata, q, output, projected
 
@@ -254,7 +277,7 @@ def test_real_shardq_forward_routes_metadata_and_restores_output(
     torch, layer, namespace, metadata, q, output, projected = sparse_forward_case
     events = []
     local_metadata = object()
-    shardq = NS(attn_metadata=local_metadata)
+    shardq = NS(attn_metadata=local_metadata, gathered_context=None)
     metadata.shardq = shardq
     metadata.num_decode_tokens = decode_rows
     metadata.num_decodes = int(decode_rows > 0)

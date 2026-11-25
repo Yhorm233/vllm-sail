@@ -239,12 +239,9 @@ def _config(
         num_attention_heads=64,
         num_key_value_heads=4,
         head_dim=128,
-        sparse_attention_config={
-            "sparse_topk_blocks": 16,
-            "sparse_index_dim": 128,
-            "sparse_num_index_heads": 4,
-            "sparse_score_type": "max",
-        },
+        index_topk_blocks=16,
+        index_head_dim=128,
+        index_n_heads=4,
     )
     return types.SimpleNamespace(
         model_config=types.SimpleNamespace(hf_config=hf_config, max_model_len=100_000),

@@ -173,10 +173,27 @@ for _consumer, _name, _original, _replacement in (
 
 
 # 完整借用第七日 upstream 的 NVFP4 selector；绑定真实 provider 的活跃 globals。
-def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
+def init_nvfp4_linear_kernel(
+    use_a16: bool = False, act_dtype: torch.dtype | None = None
+) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
-    current platform."""
-    config = NvFp4LinearLayerConfig()
+    current platform.
+
+    Args:
+        use_a16: Weight-only (W4A16) instead of W4A4.
+        act_dtype: Activation dtype of a W4A16 layer, so that BF16-only
+            kernels are skipped for FP16 models. None if unknown.
+
+    Returns:
+        The kernel, or a placeholder for requantization sources, which have
+        no kernel.
+
+    """
+    # TODO: migrate to oracle base method.
+    if LinearKernelOracle.maybe_skip_for_requantization_source():
+        return FakeNvFp4LinearKernel()
+
+    config = NvFp4LinearLayerConfig(act_dtype=act_dtype)
     a16_kernels = (
         B12xNvFp4W4A16LinearKernel,
         FlashInferCuteDslNvFp4W4A16LinearKernel,
@@ -220,6 +237,10 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         cutedsl_ok, _ = FlashInferCuteDslNvFp4W4A16LinearKernel.is_supported(
             compute_capability
         )
+        cutedsl_ok = (
+            cutedsl_ok
+            and FlashInferCuteDslNvFp4W4A16LinearKernel.can_implement(config)[0]
+        )
         if compute_capability in (100, 103) and cutedsl_ok:
             force_kernel = FlashInferCuteDslNvFp4W4A16LinearKernel
         elif not prefers_humming(compute_capability):
@@ -233,12 +254,14 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         if use_a16 and force_kernel not in a16_kernels:
             raise ValueError(f"{force_kernel.__name__} does not support W4A16")
         is_supported, reason = force_kernel.is_supported()
+        if is_supported:
+            is_supported, reason = force_kernel.can_implement(config)
         if not is_supported:
             raise ValueError(
                 f"Forced NVFP4 kernel {force_kernel.__name__} is not "
                 f"supported: {reason}"
             )
-        logger.info_once("Using %s for NVFP4 GEMM", force_kernel.__name__)
+        logger.debug_once("Using %s for NVFP4 GEMM", force_kernel.__name__)
         return force_kernel(config)
 
     # Auto-select from registry (or --linear-backend filtered).
@@ -254,24 +277,10 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         quantization=quantization,
     )
 
-    failure_reasons = []
-    for kernel_cls in possible:
-        if kernel_cls.__name__ in envs.VLLM_DISABLED_KERNELS:
-            failure_reasons.append(
-                f" {kernel_cls.__name__} disabled by environment variable"
-            )
-            continue
-
-        is_supported, reason = kernel_cls.is_supported()
-        if not is_supported:
-            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
-            continue
-
-        can_implement, reason = kernel_cls.can_implement(config)
-        if not can_implement:
-            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
-            continue
-
+    kernel_cls, failure_reasons = _first_usable_kernel(
+        possible, config, None if use_a16 else kNvfp4Dynamic
+    )
+    if kernel_cls is not None:
         if kernel_cls is EmulationNvFp4LinearKernel and failure_reasons:
             logger.warning_once(
                 "NVFP4 linear falling back to the slow and unoptimized "
@@ -282,7 +291,7 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
                 "\n - ".join(failure_reasons),
             )
 
-        logger.info_once("Using %s for NVFP4 GEMM", kernel_cls.__name__)
+        logger.debug_once("Using %s for NVFP4 GEMM", kernel_cls.__name__)
         return kernel_cls(config)
 
     raise ValueError(
@@ -311,7 +320,7 @@ def gated_init_nvfp4_linear_kernel(*args, **kwargs):
 for _consumer in (
     "vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4",
     "vllm.model_executor.layers.quantization.modelopt",
-    "vllm.model_executor.layers.quantization.online.lm_head",
+    "vllm.model_executor.layers.quantization.online.nvfp4",
     "vllm.model_executor.layers.quantization.quark.schemes.quark_nvfp4",
 ):
     _module = sys.modules.get(_consumer)

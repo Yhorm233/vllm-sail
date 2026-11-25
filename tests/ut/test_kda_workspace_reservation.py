@@ -90,8 +90,8 @@ def kda_constructor(modules):
             def _forward(self, *args):
                 raise AssertionError("forward is not part of constructor test")
 
-            def get_kv_cache_spec(self, config):
-                return CacheSpec()
+            def get_kv_cache_checkpoint_alignment(self, config):
+                return 128
 
             def get_state_dtype(self):
                 return "bf16", "fp32"
@@ -207,8 +207,6 @@ def test_cache_spec_keeps_unrelated_fields(kda_constructor, backend):
     c = kda_constructor()
     config, cfg = configs(backend)
     layer = c.provider.KimiK3DeltaAttention(config, cfg)
-    spec = layer.get_kv_cache_spec(cfg)
-    assert spec.retained == "unchanged"
-    assert (spec.num_prefill_checkpoint_blocks, spec.prefill_checkpoint_alignment) == (
-        (0, None) if backend == "flashkda" else (3, 128)
+    assert layer.get_kv_cache_checkpoint_alignment(cfg) == (
+        None if backend == "flashkda" else 128
     )

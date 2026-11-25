@@ -167,7 +167,7 @@ def check_constructor(path, name, recover, capability, source_root=None):
             conv_size=4,
             gate_lower_bound=-5.0,
             conv1d=NS(weight=NS(device="host-double", dtype="bf16"), bias=None),
-            cache_config=NS(mamba_cache_mode="align"),
+            cache_config=NS(mamba_cache_mode="align", enable_prefix_caching=True),
         )
         namespace["self"] = layer
         exec(code, namespace)

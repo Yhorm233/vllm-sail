@@ -60,12 +60,15 @@ def has_humming() -> bool:
 
 _CONSUMERS = {
     "has_cutedsl": (
+        "vllm.model_executor.layers.sparse_attn_indexer",
         "vllm.models.deepseek_v4.common.ops.cache_utils",
         "vllm.models.deepseek_v4.common.ops.fused_indexer_q",
-        "vllm.model_executor.layers.sparse_attn_indexer",
         "vllm.models.deepseek_v41.common.ops.cache_utils",
         "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn",
+        "vllm.models.deepseek_v41.nvidia.ops.mhc",
         "vllm.models.glm5next.nvidia.sparse_indexer",
+        "vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge",
+        "vllm.v1.attention.ops.dcp",
     ),
     "has_humming": (
         "vllm.model_executor.kernels.linear.mixed_precision.humming",
@@ -76,7 +79,6 @@ _CONSUMERS = {
         "vllm.model_executor.kernels.linear.scaled_mm.humming",
         "vllm.model_executor.layers.fused_moe.experts.fused_humming_moe",
         "vllm.model_executor.layers.quantization.utils.humming.moe",
-        "vllm.model_executor.layers.quantization.utils.humming.schema",
     ),
 }
 

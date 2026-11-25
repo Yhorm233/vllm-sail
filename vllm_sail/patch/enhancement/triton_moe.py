@@ -44,9 +44,10 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
-    # PPU MODIFICATION: begin
+    per_out_ch_quant: bool | None = None,
     A_is_sorted: bool = False,
     C_is_sorted: bool = False,
+    # PPU MODIFICATION: begin
     *,
     use_valu: bool = False,
     # PPU MODIFICATION: end
@@ -61,8 +62,10 @@ def invoke_fused_moe_triton_kernel(
 
     # PPU MODIFICATION: end
     assert topk_weights is not None or not mul_routed_weight
-    assert topk_weights is None or topk_weights.stride(1) == 1
+    if topk_weights is not None and not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous")
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+    assert not (A_is_sorted or C_is_sorted) or sorted_token_ids is not None
 
     if use_fp8_w8a8:
         SWAP_AB = enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -98,10 +101,10 @@ def invoke_fused_moe_triton_kernel(
         assert B_scale is None
 
     M = A.size(0)
-    num_tokens = M * top_k
+    num_tokens = C.size(0) * C.size(1) if A_is_sorted else M * top_k
     if sorted_token_ids is not None:
         EM = sorted_token_ids.size(0)
-        if A.size(0) < config["BLOCK_SIZE_M"]:
+        if not A_is_sorted and A.size(0) < config["BLOCK_SIZE_M"]:
             # optimize for small batch_size.
             # We assume that top_ids of each token is unique,
             # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
@@ -196,6 +199,7 @@ def invoke_fused_moe_triton_kernel(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
+        per_out_ch_quant=per_channel_quant if per_out_ch_quant is None else per_out_ch_quant,
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -229,6 +233,7 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    num_input_tokens: int | None = None,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
@@ -327,12 +332,15 @@ def dispatch_fused_moe_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    per_out_ch_quant: bool | None = None,
+    num_input_tokens: int | None = None,
     # PPU MODIFICATION: begin
     use_valu: bool | None = None,
     # PPU MODIFICATION: end
 ) -> None:
     assert topk_weights is not None or not mul_routed_weight
-    assert topk_weights is None or topk_weights.stride(1) == 1
+    if topk_weights is not None and not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous")
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
 
     M = A.size(0)
@@ -342,6 +350,7 @@ def dispatch_fused_moe_kernel(
         block_shape is not None and block_shape[1] > 0
     ):
         assert B_bias is None
+        assert sorted_token_ids is not None
 
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
@@ -384,6 +393,7 @@ def dispatch_fused_moe_kernel(
             use_int8_w8a16,
             use_int4_w4a16,
             block_shape,
+            num_input_tokens=num_input_tokens,
         )
 
     else:
@@ -408,8 +418,9 @@ def dispatch_fused_moe_kernel(
             per_channel_quant,
             block_shape,
             B_bias,
+            per_out_ch_quant=per_out_ch_quant,
             # PPU MODIFICATION: begin
-            use_valu,
+            use_valu=use_valu,
             # PPU MODIFICATION: end
         )
 
@@ -443,8 +454,8 @@ def get_moe_configs(
     dtype: str | None,
     block_n: int | None = None,
     block_k: int | None = None,
-    # PPU MODIFICATION: begin
     down_moe: bool = False,
+    # PPU MODIFICATION: begin
     *,
     use_moe_wna16_cuda: bool = False,
     # PPU MODIFICATION: end
@@ -456,6 +467,7 @@ def get_moe_configs(
     batch sizes to configurations of the fused_moe kernel. To evaluate the
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
+    A down-projection config is optional and uses a separate `_down.json` file.
     """
     # PPU MODIFICATION: begin
     # Separate upstream down-projection configs can enable sorted-A TMA. PPU
@@ -474,6 +486,8 @@ def get_moe_configs(
     # PPU MODIFICATION: begin
     json_file_name = get_config_file_name(E, N, dtype, block_shape, use_moe_wna16_cuda)
     # PPU MODIFICATION: end
+    if down_moe:
+        json_file_name = json_file_name.removesuffix(".json") + "_down.json"
 
     config_file_paths = []
 
@@ -506,11 +520,12 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning_once(
-        "Using default MoE config. Performance might be sub-optimal! "
-        "Config file not found at %s",
-        ", ".join(config_file_paths),
-    )
+    if not down_moe:
+        logger.warning_once(
+            "Using default MoE config. Performance might be sub-optimal! "
+            "Config file not found at %s",
+            ", ".join(config_file_paths),
+        )
     return None
 
 
@@ -669,6 +684,7 @@ def fused_experts_impl(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    per_out_ch_quant: bool | None = None,
 ) -> torch.Tensor:
     if ocp_mx_scheme is not None:
         raise NotImplementedError(
@@ -817,6 +833,7 @@ def fused_experts_impl(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         B_bias=w1_bias,
+        per_out_ch_quant=per_out_ch_quant,
         # PPU MODIFICATION: begin
         use_valu=config.get("USE_VALU", False),
         # PPU MODIFICATION: end
@@ -861,6 +878,8 @@ def fused_experts_impl(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         B_bias=w2_bias,
+        per_out_ch_quant=per_out_ch_quant,
+        num_input_tokens=num_tokens,
         # PPU MODIFICATION: begin
         use_valu=config.get("USE_VALU", False),
         # PPU MODIFICATION: end
@@ -1027,17 +1046,16 @@ def apply(
         torch.int8,
     ]
 
+    # PPU MODIFICATION: begin
     # Empty EP batches have no expert rows. Avoid zero-grid SDK launches,
     # which can leave an error for the next checked device operation.
     if hidden_states.size(0) == 0:
         return
 
-    # We declared expects_unquantized_inputs (LoRA + DP/EP all2all), so the
-    # prepare step deferred activation quantization to this kernel:
-    # `hidden_states` arrives unquantized. Keep the unquantized tensor for
-    # the LoRA shrink input and quantize a copy here for the base GEMM
-    # (mirrors what the prepare step would have done, but after the
-    # all-gather so the layout matches the gathered topk_ids / token map).
+    # PPU MODIFICATION: end
+
+    # Quantize gathered activations after dispatch when prepare deferred
+    # quantization. LoRA also needs the floating-point gathered input.
     lora_unquantized_hidden_states: torch.Tensor | None = None
     if self.expects_unquantized_inputs:
         assert a1q_scale is None
@@ -1067,20 +1085,21 @@ def apply(
         block_shape=self.block_shape,
     )
 
-    if hidden_states.dtype == torch.bfloat16:
+    compute_dtype = (
+        self.moe_config.in_dtype
+        if self.activation_key == kInt8StaticTensorSym
+        else hidden_states.dtype
+    )
+    if compute_dtype == torch.bfloat16:
         compute_type = tl.bfloat16
-    elif hidden_states.dtype == torch.float16:
+    elif compute_dtype == torch.float16:
         compute_type = tl.float16
-    elif hidden_states.dtype == torch.float32:
+    elif compute_dtype == torch.float32:
         compute_type = tl.float32
-    elif (
-        hidden_states.dtype == torch.float8_e4m3fn
-        or hidden_states.dtype == torch.float8_e4m3fnuz
-        or hidden_states.dtype == torch.int8
-    ):
+    elif compute_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.int8):
         compute_type = tl.bfloat16
     else:
-        raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+        raise ValueError(f"Unsupported compute_type: {compute_dtype}")
 
     # Note that the output tensor might be in workspace1
     intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
@@ -1169,6 +1188,12 @@ def apply(
         else (a1q_scale if a1q_scale is not None else self.a1_scale)
     )
 
+    # Legacy static INT8 applies routing after GEMM1 bias, before SiLU.
+    weight_in_gemm1 = (
+        apply_router_weight_on_input
+        and self.router_weight_application() == mk.RouterWeightApplication.GEMM1
+    )
+
     def _base_w13_fn():
         invoke_fused_moe_triton_kernel(
             hidden_states,
@@ -1176,11 +1201,11 @@ def apply(
             intermediate_cache1,
             input_scale,
             self.w1_scale,
-            None,  # topk_weights
+            topk_weights if weight_in_gemm1 else None,
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            False,  # mul_routed_weights
+            weight_in_gemm1,
             top_k_num,
             # PPU MODIFICATION: begin
             config.get("UP", config),
@@ -1191,6 +1216,7 @@ def apply(
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             per_channel_quant=self.per_act_token_quant,
+            per_out_ch_quant=self.per_out_ch_quant,
             block_shape=self.block_shape,
             B_bias=self.w1_bias,
             # PPU MODIFICATION: begin
@@ -1276,14 +1302,50 @@ def apply(
             group_size=128,
             quant_dtype=current_platform.fp8_dtype(),
         )
+    elif (
+        # Only benchmarked on ROCm.
+        current_platform.is_rocm()
+        and activation == MoEActivation.SILU
+        and self.activation_config.clamp_limit is None
+        and self.quant_config.use_fp8_w8a8
+        and self.per_act_token_quant
+        and self.block_shape is None
+        and a2_scale is None
+        and not self.quantization_emulation
+        and lora_context is None
+    ):
+        assert cache2_dim * 2 == N, (
+            "silu_mul_token_quant fuses SiLU-and-mul, which halves N "
+            f"(got N={N}, activation output dim={cache2_dim}). An activation "
+            "that does not halve N needs its own kernel or a condition on "
+            "this branch."
+        )
+        # Under EP the first GEMM never writes the rows of remote routes and the
+        # second never reads them, so they are skipped here too.
+        qintermediate_cache2, a2q_scale = silu_mul_token_quant(
+            intermediate_cache1.view(-1, N),
+            topk_ids if skip_invalid else None,
+            expert_map if skip_invalid else None,
+            num_align_experts,
+        )
     else:
         self.activation(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
 
+        # Row-local schemes quantize per row, but a per-tensor dynamic
+        # scale spans the whole activation. Restrict it to routed rows so
+        # the uninitialized `PaddedStandard` padding rows cannot poison it.
+        a2_quant_scale = a2_scale
+        if self.quant_config.act_scale_is_tensor_wide(a2_scale):
+            a2_quant_scale = masked_amax_scale(
+                intermediate_cache2,
+                self.quant_dtype,
+                row_valid=topk_ids.view(-1) >= 0,
+            )
         qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
             intermediate_cache2,
-            a2_scale,
+            a2_quant_scale,
             self.quant_dtype,
             self.per_act_token_quant,
             self.block_shape,
@@ -1318,6 +1380,7 @@ def apply(
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             per_channel_quant=self.per_act_token_quant,
+            per_out_ch_quant=self.per_out_ch_quant,
             block_shape=self.block_shape,
             B_bias=self.w2_bias,
             # PPU MODIFICATION: begin

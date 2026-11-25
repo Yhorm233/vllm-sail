@@ -65,12 +65,12 @@ _ORACLE_ALIAS_CONSUMERS = {
         ),
     },
     "mxfp4": {
-        "_backend_activation_key": (
-            "vllm.model_executor.layers.quantization.online.mxfp4",
-        ),
         "backend_to_kernel_cls": (
             "vllm.model_executor.layers.quantization.mxfp4",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
+        ),
+        "_backend_activation_key": (
+            "vllm.model_executor.layers.quantization.online.mxfp4",
         ),
         "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format": (
             "vllm.model_executor.layers.quantization.mxfp4",
@@ -80,11 +80,13 @@ _ORACLE_ALIAS_CONSUMERS = {
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4",
             "vllm.model_executor.layers.quantization.mxfp4",
             "vllm.model_executor.layers.quantization.online.mxfp4",
+            "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),
         "make_mxfp4_moe_quant_config": (
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4",
             "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_moe",
             "vllm.model_executor.layers.quantization.mxfp4",
+            "vllm.model_executor.layers.quantization.online.fp8_requant",
             "vllm.model_executor.layers.quantization.online.mxfp4",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),
@@ -107,6 +109,7 @@ _ORACLE_ALIAS_CONSUMERS = {
             "vllm.model_executor.layers.quantization.auto_awq",
             "vllm.model_executor.layers.quantization.auto_gptq",
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16",
+            "vllm.model_executor.layers.quantization.modelopt",
             "vllm.model_executor.layers.quantization.moe_wna16",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),
@@ -114,6 +117,7 @@ _ORACLE_ALIAS_CONSUMERS = {
             "vllm.model_executor.layers.quantization.auto_awq",
             "vllm.model_executor.layers.quantization.auto_gptq",
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16",
+            "vllm.model_executor.layers.quantization.modelopt",
             "vllm.model_executor.layers.quantization.moe_wna16",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),
@@ -121,6 +125,7 @@ _ORACLE_ALIAS_CONSUMERS = {
             "vllm.model_executor.layers.quantization.auto_awq",
             "vllm.model_executor.layers.quantization.auto_gptq",
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16",
+            "vllm.model_executor.layers.quantization.modelopt",
             "vllm.model_executor.layers.quantization.moe_wna16",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),

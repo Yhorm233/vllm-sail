@@ -57,5 +57,3 @@ from vllm_sail.patch.enhancement import dense  # noqa: F401
 
 from vllm_sail.patch.enhancement import fp8_quant  # noqa: F401
 from vllm_sail.patch.enhancement.models import qwen3_fused_quant  # noqa: F401
-
-from vllm_sail.patch.enhancement import runtime  # noqa: F401

@@ -63,6 +63,11 @@ def _select_dsv4_attn_cls(vllm_config):
         DeepseekV41FlashMLAAttention,
     ):
         ok, gate_report = fused_gate(vllm_config)
+        if ok and getattr(vllm_config, "lora_config", None) is not None:
+            # Upstream guards mega attention against LoRA: the grouped wo_a
+            # direct read cannot apply the adapter delta, so LoRA must stay
+            # on the split-KV FlashMLA path.
+            ok, gate_report = False, "lora: mega attention needs the split-KV path"
         if ok:
             logger.info_once(
                 "[vllm_sail] DSV4.1 attention class: "

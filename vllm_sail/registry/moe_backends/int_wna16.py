@@ -95,6 +95,9 @@ def _select_batched_ppu_backend(
     allow_tile_padding: bool,
 ) -> tuple[WNA16MoEBackend, type[mk.FusedMoEExperts]]:
     """Resolve the batched-layout expert for an explicit PPU request."""
+    source = oracle.WNA16MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
     backend = WNA16MoEBackend.BATCHED_PPU_DEEPGEMM
     reason = _backend_incompatibility_reason(
         backend,
@@ -109,6 +112,11 @@ def _select_batched_ppu_backend(
             f"WNA16 MoE backend '{backend.value}' does not support the "
             f"deployment configuration since {reason}."
         )
+    fallback = oracle._activation_fallback_reason(
+        backend, oracle._requested_activation_key()
+    )
+    if fallback is not None:
+        raise ValueError(fallback)
     activation_format = mk.FusedMoEActivationFormat.BatchedExperts
     for k_cls in backend_to_kernel_cls(backend):
         supported, reason = k_cls.is_supported_config(
@@ -184,6 +192,9 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.rdna3_int4_int8_moe import (
+        Rdna3Int4Int8Experts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.rdna3_moe import (
         Rdna3WNA16Experts,
     )
@@ -221,6 +232,7 @@ def make_wna16_moe_kernel(
         ZentorchExpertsWNA16,
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
+        Rdna3Int4Int8Experts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))

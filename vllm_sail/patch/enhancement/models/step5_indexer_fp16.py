@@ -59,7 +59,7 @@ _REMOVE_WHEN = (
 _upstream_indexer_norm_rope = _indexer.indexer_norm_rope
 _upstream_qkv_indexer_norm_rope = _joint.qkv_indexer_norm_rope
 _upstream_pack_summaries = _pack._pack_summaries
-_upstream_get_kv_cache_spec = Step5SparseSummaryCacheLayer.get_kv_cache_spec
+_upstream_get_kv_cache_config = Step5SparseSummaryCacheLayer.get_kv_cache_config
 _upstream_decode_logits = Step5FlashInferSparse.decode_logits
 _upstream_logits = Step5FlashInferSparse.logits
 
@@ -584,17 +584,19 @@ _install(
 
 @patch(
     "vllm.models.step5.common.sparse_summary_cache",
-    "Step5SparseSummaryCacheLayer.get_kv_cache_spec",
+    "Step5SparseSummaryCacheLayer.get_kv_cache_config",
     reason=_REASON,
     affected_versions=_AFFECTED,
     remove_when=_REMOVE_WHEN,
 )
-def _get_kv_cache_spec(self, vllm_config):
-    spec = _upstream_get_kv_cache_spec(self, vllm_config)
+def _get_kv_cache_config(self, vllm_config):
+    layer = _upstream_get_kv_cache_config(self, vllm_config)
+    spec = layer.spec
     if soft_fp8.indexer_fp16():
         # Each region holds 256 E4M3-quantized FP16 values.
         spec = dataclasses.replace(spec, dtype=torch.float16)
-    return spec
+        return dataclasses.replace(layer, spec=spec)
+    return layer
 
 
 @patch(

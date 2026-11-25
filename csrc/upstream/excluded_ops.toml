@@ -6,7 +6,7 @@
 # tiers. vllm_sail/native/stubs.py registers each one so a call fails
 # with a named NotImplementedError instead of an AttributeError, and so
 # capability probes answer False instead of raising.
-# Upstream vLLM 047f6bfbb22cf4815162125f107e6dd90c72478a; compiled tiers a.
+# Upstream vLLM e83d82a46b50a27534584a8bf4c6dd2d2cb9eeb5; compiled tiers a.
 
 [[op]]
 namespace = "_C_custom_ar"
@@ -391,6 +391,38 @@ schema = "init_custom_ar(int[] ipc_tensors, Tensor rank_data, int rank, bool ful
 kind = "compute"
 tier = "b"
 reason = "no PPU implementation"
+
+[[op]]
+namespace = "_C"
+name = "inkling2_allreduce_conv_mix"
+schema = "inkling2_allreduce_conv_mix(Tensor? x, Tensor? down, Tensor? src2dst, bool two_shot, int multicast_ptr, int local_ptr, int buffer_ptrs, Tensor! flags, int rank, int world, Tensor! cache, Tensor conv_weight, Tensor positions, Tensor seq_idx, Tensor slots, Tensor block_table, Tensor query_start, int stream_offset, int stream_width, float conv_scale, Tensor? residual, Tensor? addend, Tensor! conv_out, Tensor stack, Tensor? last, Tensor queries, Tensor? norm_weight, float eps, float norm_eps, Tensor! out) -> ()"
+kind = "compute"
+tier = "unclaimed"
+reason = "not declared in csrc/upstream/manifest.toml"
+
+[[op]]
+namespace = "_C"
+name = "inkling2_conv_mix"
+schema = "inkling2_conv_mix(Tensor x, Tensor! cache, Tensor conv_weight, Tensor positions, Tensor seq_idx, Tensor slots, Tensor block_table, Tensor query_start, int stream_offset, int stream_width, float conv_scale, Tensor? residual, Tensor? addend, Tensor! conv_out, Tensor stack, Tensor? last, Tensor queries, Tensor? norm_weight, float eps, float norm_eps, Tensor! out) -> ()"
+kind = "compute"
+tier = "unclaimed"
+reason = "not declared in csrc/upstream/manifest.toml"
+
+[[op]]
+namespace = "_C"
+name = "inkling2_reduce_scatter"
+schema = "inkling2_reduce_scatter(int bases, Tensor! epochs, int rank, int world, int src_offset, int first, Tensor! out) -> ()"
+kind = "compute"
+tier = "unclaimed"
+reason = "not declared in csrc/upstream/manifest.toml"
+
+[[op]]
+namespace = "_C"
+name = "inkling2_seq_parallel_conv_mix"
+schema = "inkling2_seq_parallel_conv_mix(Tensor x, Tensor! cache, Tensor conv_weight, Tensor positions, Tensor seq_idx, Tensor slots, Tensor block_table, Tensor query_start, int stream_offset, int stream_width, float conv_scale, Tensor? residual, Tensor? addend, Tensor! conv_out, Tensor stack, Tensor? last, Tensor queries, Tensor norm_weight, float eps, float norm_eps, int token_base, int halo_rows, int out_bases, int out_offset, int world, int out_tokens, int rank, int gather_slot, Tensor! epochs, int staging_offset, int tail_rows, int align) -> ()"
+kind = "compute"
+tier = "unclaimed"
+reason = "not declared in csrc/upstream/manifest.toml"
 
 [[op]]
 namespace = "_C"

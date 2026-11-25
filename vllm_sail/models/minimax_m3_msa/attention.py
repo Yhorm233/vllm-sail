@@ -94,7 +94,7 @@ class MiniMaxM3SparseSailMSAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_q_heads = config.num_attention_heads // tp_size
         self.num_kv_heads = kv_cache_spec.num_kv_heads
-        self.topk_blocks = config.sparse_attention_config["sparse_topk_blocks"]
+        self.topk_blocks = config.index_topk_blocks
         self.selection: SailMSASelection = decide_from_config(vllm_config)
         if not self.selection.enable:
             raise ValueError(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
 import sys
 import types
 from pathlib import Path
@@ -114,9 +115,14 @@ def platform_classes(monkeypatch):
     return module.PPUPlatform, NvmlCudaPlatform
 
 
-def test_ppu_identity_exists_before_general_patches(platform_classes):
+def test_ppu_identity_exists_before_general_patches(platform_classes, monkeypatch):
     PPUPlatform, NvmlCudaPlatform = platform_classes
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "1")
+    PPUPlatform()
+    assert os.environ["VLLM_USE_FLASHINFER_SAMPLER"] == "1"
+    monkeypatch.delenv("VLLM_USE_FLASHINFER_SAMPLER")
     platform = PPUPlatform()
+    assert os.environ["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     assert platform.is_ppu() is True
     assert PPUPlatform.is_ppu() is True
     assert platform.is_cuda() is True

@@ -13,8 +13,7 @@ guards the connection.
 
 Modules, and why each is import-on-install like the rest of the framework:
 
-* ``deepseek_v2`` / ``deepseek_mtp`` — fp4-vs-non-fp4 indexer projection +
-  weight-loading guards (the fork's +108/+19).
+* ``deepseek_v2`` — separate PPU indexer wk projection with shared upstream model and MTP loaders.
 * ``deepseek_v4`` — selects the plugin FlashMLA subclass only on PPU; the
   quantization-specific weights mapper remains plugin-local so CUDA behavior
   is unchanged.
@@ -26,9 +25,8 @@ Modules, and why each is import-on-install like the rest of the framework:
   strips the checkpoint's tower prefix (``model.language_model.layers.N.`` ->
   ``model.layers.N.``) and the ``packed_modules_mapping`` the fused
   shared-expert projection needs, so the channelwise dense layers survive the
-  draft's layer naming. The draft's by-value ``_try_load_fp8_attn_proj`` binding
-  is rebound by ``bugfix/glm5_next_int8_mla_dequant`` through its ``_CONSUMERS``
-  list.
+  draft's layer naming. The pinned upstream passes the quantization config
+  directly to the MLA projections.
 * ``kimi_k3`` — quantized routed up-projection support for the latent-MoE
   tail's fused tiers.
 * ``llama4`` — torch.compile on the custom router (+1).
@@ -41,7 +39,6 @@ Modules, and why each is import-on-install like the rest of the framework:
   can run the shape; upstream hard-wires the Triton one.
 * ``qwen4_exp_qsa_fp4`` — QSA indexer compressed key cache as MXFP4, scored by
   DeepGEMM's FP4 average MQA logits kernels.
-* ``step3p5_mtp`` — zero-point buffers as optional checkpoint params (+12).
 * ``step5_dsa_backend`` — admits SM 8.x PPU to Step5 DSA and runs upstream's
   Triton indexer scorer there, since PPU FlashInfer has no ``attn_scores``;
   resolves the region top-k to PPU DeepSelect or ``per_row``.
@@ -59,7 +56,6 @@ Modules, and why each is import-on-install like the rest of the framework:
 # Capture the shared Q alias for V4.1 before V4 patches it to avoid duplicate registration.
 from vllm_sail.patch.enhancement.models import deepseek_v41_int8  # noqa: F401, I001
 from vllm_sail.patch.enhancement.models import (
-    deepseek_mtp,  # noqa: F401
     deepseek_v2,  # noqa: F401
     deepseek_v4,  # noqa: F401
     deepseek_v4_cache,  # noqa: F401
@@ -67,6 +63,7 @@ from vllm_sail.patch.enhancement.models import (
     deepseek_v4_graph_warmup,  # noqa: F401
     deepseek_v4_metadata,  # noqa: F401
     deepseek_v41,  # noqa: F401
+    deepseek_v41_device,  # noqa: F401
     deepseek_v41_engram,  # noqa: F401
     deepseek_v41_indexer,  # noqa: F401
     deepseek_v41_mega_mhc,  # noqa: F401
@@ -82,7 +79,6 @@ from vllm_sail.patch.enhancement.models import (
     qwen3_next,  # noqa: F401
     qwen4_exp_qsa,  # noqa: F401
     qwen4_exp_qsa_fp4,  # noqa: F401
-    step3p5_mtp,  # noqa: F401
     step5_dsa_backend,  # noqa: F401
     step5_indexer_fp16,  # noqa: F401
     step5_mtp,  # noqa: F401

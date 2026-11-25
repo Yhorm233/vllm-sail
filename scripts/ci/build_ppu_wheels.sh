@@ -250,7 +250,14 @@ print(tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["chann
 PY
         )"
         export RUSTUP_TOOLCHAIN
-        rustup toolchain install "${RUSTUP_TOOLCHAIN}" --profile minimal
+        # The configured distribution mirror may return a transient HTTP 504.
+        for attempt in 1 2 3; do
+            if rustup toolchain install "${RUSTUP_TOOLCHAIN}" --profile minimal; then
+                break
+            fi
+            ((attempt < 3)) || fail "failed to install Rust ${RUSTUP_TOOLCHAIN} after ${attempt} attempts"
+            sleep "$((2 ** attempt))"
+        done
         rustc --version | tee "${LOG_DIR}/rustc-version.log"
         cargo --version | tee "${LOG_DIR}/cargo-version.log"
         python tools/use_existing_torch.py

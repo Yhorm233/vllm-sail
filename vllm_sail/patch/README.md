@@ -38,7 +38,7 @@ from vllm_sail.patch.utils import patch
     "vllm.some_module",
     "target_function",
     reason="PPU's foo kernel needs bar; upstream hardcodes baz.",
-    affected_versions=">=0.31.0,<0.32.0",
+    affected_versions=">=0.32.0,<0.33.0",
     remove_when="upstream PR #12345 lands, which makes baz configurable.",
 )
 def target_function(arg: int) -> int:
@@ -94,12 +94,10 @@ That is what makes the next upstream bump a diff rather than an investigation.
 
 ### Borrowed bodies and direct source contracts
 
-The runtime pilot separates `enhancement/runtime.py` (installation, PPU dispatch
-and loaded-consumer rebinding) from `_upstream/runtime.py` (two maintained vLLM
-bodies with limited PPU changes). These bodies are not deterministically
-generated. Their source revision records reviewed provenance and does not select
-a runtime version. Bind each body to its own provider with `bind_body` so globals
-remain live; do not combine the sampler and model runner namespaces.
+Borrowed bodies are not deterministically generated. Their source revision
+records reviewed provenance and does not select a runtime version. Bind each
+body to its own provider with `bind_body` so globals remain live; keep distinct
+upstream namespaces in separate providers.
 
 CPU tests verify framework and feature behavior without importing the complete
 patch set. With `VLLM_SOURCE_ROOT` set to the pinned checkout, source tests check

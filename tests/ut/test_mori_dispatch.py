@@ -104,3 +104,66 @@ def test_actual_upstream_factory_has_same_dispatch_buffer_contract(
         upstream_source_root / "vllm/model_executor/layers/fused_moe/all2all_utils.py"
     )
     check_dispatch(lambda ns: function(path, "maybe_make_prepare_finalize", ns), case)
+
+
+def check_epv2(factory):
+    buffers, constructors = [], []
+    handle, expected = object(), object()
+    moe = NS(
+        moe_parallel_config=NS(use_passthrough_all2all=False, use_all2all_kernels=True),
+        use_deepep_ht_kernels=False,
+        use_deepep_ll_kernels=False,
+        use_deepep_v2_kernels=False,
+        use_moonep_kernels=False,
+        use_mori_epv2_kernels=True,
+        hidden_dim=4096,
+        max_num_tokens=256,
+        num_experts=128,
+        experts_per_token=8,
+    )
+
+    def get_handle(arguments):
+        buffers.append(arguments)
+        return handle
+
+    def prepare(*args, **kwargs):
+        constructors.append((args, kwargs))
+        return expected
+
+    namespace = {"MoriEPv2PrepareAndFinalize": prepare}
+    manager = NS(rank=3, world_size=8, get_handle=get_handle)
+    assert factory(namespace)(moe, None, all2all_manager=manager) is expected
+    assert buffers == [
+        dict(
+            hidden_dim=4096,
+            max_num_inp_token_per_rank=256,
+            num_experts_per_rank=16,
+            num_experts_per_token=8,
+        )
+    ]
+    assert constructors == [
+        (
+            (handle,),
+            dict(
+                max_tokens_per_rank=256,
+                num_dispatchers=8,
+                num_local_experts=16,
+                rank_expert_offset=48,
+            ),
+        )
+    ]
+    moe.num_experts = 130
+    with pytest.raises(ValueError, match="split evenly"):
+        factory(namespace)(moe, None, all2all_manager=manager)
+
+
+def test_copied_factory_routes_mori_epv2_with_even_expert_split():
+    check_epv2(lambda ns: function(PATCH, "_maybe_make_prepare_finalize_body", ns))
+
+
+@pytest.mark.upstream_source
+def test_actual_upstream_factory_routes_mori_epv2(upstream_source_root):
+    path = (
+        upstream_source_root / "vllm/model_executor/layers/fused_moe/all2all_utils.py"
+    )
+    check_epv2(lambda ns: function(path, "maybe_make_prepare_finalize", ns))

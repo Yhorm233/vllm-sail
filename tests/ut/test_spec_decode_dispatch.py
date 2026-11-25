@@ -8,7 +8,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tests.support.source import ROOT, definition, function
+from tests.support.source import definition, function
 from tests.support.spec_decode import Kernel, Tensor
 
 
@@ -46,7 +46,10 @@ def test_resample_dispatch_binds_the_upstream_mask_argument(
         _insert_resampled_kernel=Kernel(),
     )
     sampler = function(
-        "vllm_sail/patch/_upstream/runtime.py", "rejection_sample", namespace
+        upstream_source_root
+        / "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py",
+        "rejection_sample",
+        namespace,
     )
     masked = mask_layout is not None
     sampler(
@@ -141,7 +144,10 @@ def test_all_sampler_kernel_calls_bind_the_upstream_draft_shard_contract(
         **{symbol: bind(symbol) for symbol in symbols},
     }
     sampler = function(
-        "vllm_sail/patch/_upstream/runtime.py", "rejection_sample", namespace
+        upstream_source_root
+        / "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py",
+        "rejection_sample",
+        namespace,
     )
     # A replicated cache has no mapping. Sharded rows are assigned explicitly
     # and no longer derivable by dividing a request-state slot by shard count.
@@ -189,13 +195,10 @@ def test_all_sampler_kernel_calls_bind_the_upstream_draft_shard_contract(
 
 
 @pytest.mark.upstream_source
-def test_complete_sampler_body_keeps_only_ppu_insert_launch(upstream_source_root):
-    """完整签名、默认值和函数体对齐；不将每日 diff 当作完整漂移检查。"""
+def test_upstream_insert_launch_uses_one_warp(upstream_source_root):
+    """The native launcher now supplies the geometry previously patched on PPU."""
     import ast
 
-    copied = definition(
-        ROOT / "vllm_sail/patch/_upstream/runtime.py", "rejection_sample"
-    )
     original = definition(
         upstream_source_root
         / "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py",
@@ -203,7 +206,7 @@ def test_complete_sampler_body_keeps_only_ppu_insert_launch(upstream_source_root
     )
     launches = [
         node
-        for node in ast.walk(copied)
+        for node in ast.walk(original)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Subscript)
         and isinstance(node.func.value, ast.Name)
@@ -212,7 +215,3 @@ def test_complete_sampler_body_keeps_only_ppu_insert_launch(upstream_source_root
     assert len(launches) == 1
     ppu_options = [kw for kw in launches[0].keywords if kw.arg == "num_warps"]
     assert len(ppu_options) == 1 and ast.literal_eval(ppu_options[0].value) == 1
-    launches[0].keywords.remove(ppu_options[0])
-    assert ast.dump(copied, include_attributes=False) == ast.dump(
-        original, include_attributes=False
-    )

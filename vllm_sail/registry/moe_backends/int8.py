@@ -196,6 +196,9 @@ def select_int8_moe_backend(
     if not is_batched or config.moe_backend == "auto":
         return _upstream_select_int8_moe_backend(config, weight_key, activation_key)
 
+    source = oracle.Int8MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
     requested = map_int8_backend(config.moe_backend)
     if requested == Int8MoeBackend.PPU_DEEPGEMM:
         requested = Int8MoeBackend.BATCHED_PPU_DEEPGEMM

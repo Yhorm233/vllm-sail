@@ -50,7 +50,6 @@ def check_loader(load, kind, shared):
         "_duplicate_context_wkv_weights": lambda weights, count: weights,
         "get_spec_layer_idx_from_weight_name": lambda config, name: 0,
         "extract_layer_index": lambda name: 0,
-        "is_mtp_completeness_check_enabled": lambda: True,
         "default_weight_loader": unexpected_default,
         "get_tensor_model_parallel_world_size": lambda: 8,
         "get_tensor_model_parallel_rank": lambda: 3,

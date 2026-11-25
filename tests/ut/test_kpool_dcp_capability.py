@@ -460,6 +460,7 @@ def test_real_dcp_merge_bypasses_single_rank_and_requires_cutedsl(
     namespace = dict(
         torch=NS(float32="fp32", int32="i32"),
         has_cutedsl=cutedsl_available,
+        current_platform=NS(is_rocm=lambda: False),
     )
     path = upstream_source_root / "vllm/model_executor/layers/sparse_attn_indexer.py"
     function(path, "_assert_cutedsl_dcp_merge_supported", namespace)

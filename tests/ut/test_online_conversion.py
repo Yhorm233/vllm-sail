@@ -283,7 +283,7 @@ def test_no_early_bound_oracle_or_fork_imports():
     ],
 )
 def test_upstream_model_config_resolution(
-    upstream_source_root, monkeypatch, user, policy, expected
+    upstream_source_root, monkeypatch, modules, user, policy, expected
 ):
     from typing import Literal, cast, get_args
 
@@ -291,18 +291,45 @@ def test_upstream_model_config_resolution(
 
     def get_config(name):
         if name in ("fp8-to-int8", "fp8-to-bf16"):
-            return SimpleNamespace(
-                override_quantization_method=lambda cfg, user, **kw: select_conversion(
-                    cfg["quant_method"], user, is_ppu=True
-                )
+            return type(
+                "Conversion",
+                (),
+                {
+                    "override_quantization_method": staticmethod(
+                        lambda cfg, user, **kw: select_conversion(
+                            cfg["quant_method"], user, is_ppu=True
+                        )
+                    )
+                },
             )
-        return SimpleNamespace(override_quantization_method=lambda *a, **kw: None)
+        return type(
+            "Native",
+            (),
+            {"override_quantization_method": staticmethod(lambda *a, **kw: None)},
+        )
 
     registry = SimpleNamespace(
         QUANTIZATION_METHODS=["fp8", "fp8-to-int8", "fp8-to-bf16"],
         QuantizationMethods=Literal["fp8"],
         DEPRECATED_QUANTIZATION_METHODS=[],
         get_quantization_config=get_config,
+    )
+    config_path = upstream_source_root / "vllm/config/quantization.py"
+    resolve = function(
+        config_path,
+        "resolve_quantization_config",
+        {"ONLINE_QUANT_SHORTHAND_NAMES": frozenset()},
+    )
+    modules(
+        "vllm.config.quantization",
+        _DEFERRED_ONLINE_SHORTHANDS=set(),
+        _ONLINE_SHORTHANDS={},
+        resolve_quantization_config=resolve,
+        merge_quantization_config=None,
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.online.base",
+        OnlineQuantizationConfig=type("Online", (), {}),
     )
     verified = []
     verify = function(
@@ -317,6 +344,7 @@ def test_upstream_model_config_resolution(
     )
     model = SimpleNamespace(
         quantization=user,
+        quantization_config=None,
         hf_config=None,
         model_arch_config=SimpleNamespace(quantization_config={"quant_method": "fp8"}),
     )

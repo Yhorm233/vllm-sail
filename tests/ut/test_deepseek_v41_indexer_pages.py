@@ -10,6 +10,13 @@ from tests.support.modules import load_patch
 from tests.support.source import function
 
 
+@dataclass(frozen=True)
+class LayerConfig:
+    spec: object
+    manager_config: object = object()
+    is_draft: bool = True
+
+
 @pytest.mark.parametrize("ppu", [True, False])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("fp4", [False, True])
@@ -27,8 +34,8 @@ def test_indexer_publishes_geometry_and_physical_pages(
         indexer_q_head_dim: int | None = None
 
     class Cache:
-        def get_kv_cache_spec(self, config):
-            return Spec()
+        def get_kv_cache_config(self, config):
+            return LayerConfig(Spec())
 
     class Indexer:
         def __init__(self, cache):
@@ -63,7 +70,9 @@ def test_indexer_publishes_geometry_and_physical_pages(
     assert indexer.indexer_weights_dtype == (
         "sparse-dtype" if sparse else "bf16" if ppu and fp4 else "fp32"
     )
-    spec = cache.get_kv_cache_spec(object())
+    layer = cache.get_kv_cache_config(object())
+    assert layer.manager_config is LayerConfig.manager_config and layer.is_draft
+    spec = layer.spec
     if ppu:
         assert spec.block_size == 64 * ratio
         assert spec.page_size_padded is None

@@ -797,6 +797,8 @@ def test_actual_selector_lora_fallback_is_not_promoted_back_to_fused(
         "_select_dsv4_attn_cls",
         {
             "AttentionBackendEnum": enum,
+            "is_ampere": lambda: False,
+            "is_hopper": lambda: False,
             "current_platform": gate.platform,
             "DeepseekV4FlashMLAAttention": selector.classes.upstream_flashmla,
             "DeepseekV4MegaAttnAttention": selector.classes.upstream_mega,

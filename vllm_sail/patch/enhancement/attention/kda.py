@@ -10,7 +10,6 @@ branches re-checked instead of the whole layer re-copied.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from types import ModuleType
 
 import torch
@@ -43,7 +42,7 @@ _upstream_is_fused_kda_decode_supported = _kda.is_fused_kda_decode_supported
 _upstream_flashkda_prefill = _kda._flashkda_prefill
 _upstream_forward = _kda.KimiK3DeltaAttention._forward
 _upstream_init = _kda.KimiK3DeltaAttention.__init__
-_upstream_get_kv_cache_spec = _kda.KimiK3DeltaAttention.get_kv_cache_spec
+_upstream_get_kv_cache_checkpoint_alignment = _kda.KimiK3DeltaAttention.get_kv_cache_checkpoint_alignment
 
 
 def is_fused_kda_decode_supported(
@@ -291,13 +290,9 @@ def _init(
 patch(_MODULE, "KimiK3DeltaAttention.__init__", **_META)(_init)
 
 
-@patch(_MODULE, "KimiK3DeltaAttention.get_kv_cache_spec", **_META)
-def _get_kv_cache_spec(self, vllm_config):
-    spec = _upstream_get_kv_cache_spec(self, vllm_config)
+@patch(_MODULE, "KimiK3DeltaAttention.get_kv_cache_checkpoint_alignment", **_META)
+def _get_kv_cache_checkpoint_alignment(self, vllm_config):
     if current_platform.is_ppu() and self.kda_prefill_backend == "flashkda":
-        # PLA exposes the final state, but not FlashKDA's intermediate
-        # checkpoint output. Keep the same cache contract as Triton prefill.
-        return replace(
-            spec, num_prefill_checkpoint_blocks=0, prefill_checkpoint_alignment=None
-        )
-    return spec
+        # PLA can export the final state only.
+        return None
+    return _upstream_get_kv_cache_checkpoint_alignment(self, vllm_config)

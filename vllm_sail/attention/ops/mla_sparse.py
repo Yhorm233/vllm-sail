@@ -473,7 +473,7 @@ def ppu_sparse_attn_indexer(
                     decode_weights, decode_lens, pad_value=0
                 ).reshape(num_padded_tokens, -1)
             contexts, tables, request_ids, schedule = _paged_decode_inputs(
-                decode_metadata,
+                attn_metadata_narrowed,
                 seq_lens,
                 decode_lens,
                 next_n,
@@ -644,16 +644,17 @@ def _use_deep_select(logits, topk, backend):
 
 
 def _paged_decode_inputs(
-    metadata, seq_lens, decode_lens, next_n, page_size, heads, head_dim, q_dtype, fp4
+    step, seq_lens, decode_lens, next_n, page_size, heads, head_dim, q_dtype, fp4
 ):
     """Reuse a schedule only for the matching builder-owned decode layout."""
     num_sms = get_num_sms()
     geometry = (1, heads, head_dim, torch.int8 if fp4 else q_dtype)
+    metadata = step.decode
     tables = metadata.block_table
     rows = decode_lens.shape[0]
     indices = metadata.indices if fp4 else None
     if (
-        getattr(metadata, "_sail_paged_schedule_key", None)
+        getattr(step, "_sail_paged_schedule_key", None)
         == (page_size, num_sms, geometry, fp4)
         and next_n == 1
         and not metadata.requires_padding

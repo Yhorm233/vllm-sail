@@ -661,8 +661,6 @@ def test_every_unresolved_installation_has_a_feature_contract():
             "module_name",
             "name",
         ),
-        ("patch/enhancement/runtime.py", "_install", "module.__name__", "target"),
-        ("patch/enhancement/runtime.py", "_install", "name", "attribute"),
         (
             "patch/enhancement/triton_moe.py",
             "_install",
@@ -727,8 +725,7 @@ def test_every_unresolved_installation_has_a_feature_contract():
 @pytest.mark.upstream_source
 def test_declared_targets_and_calls_fit_pinned_source(upstream_source_root):
     hooks, _ = scan_patches()
-    for name in ("runtime.py", "triton_moe.py"):
-        hooks.extend(dispatcher_hooks(PATCH_ROOT / "enhancement" / name))
+    hooks.extend(dispatcher_hooks(PATCH_ROOT / "enhancement" / "triton_moe.py"))
     hooks.extend(registry_alias_hooks(hooks))
     problems = target_problems(upstream_source_root, hooks)
     assert not problems, "\n".join(problems)

@@ -103,6 +103,9 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
 
 
 def _select_ppu_backend(config, weight_key, activation_key, backend):
+    source = oracle.Fp8MoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
     activation_format = config.activation_format
     if (
         activation_format == mk.FusedMoEActivationFormat.BatchedExperts

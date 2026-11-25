@@ -91,7 +91,8 @@ def context(modules, resident, source_root=None, copied=True, functional=False):
         ),
         "tl": NS(float32="f32", float16="f16", bfloat16="bf16"),
         "functools": functools,
-        "current_platform": NS(is_ppu=lambda: True),
+        "current_platform": NS(is_ppu=lambda: True, is_rocm=lambda: False),
+        "kInt8StaticTensorSym": "static_int8",
         "try_get_optimal_moe_config": lambda *a, **kw: config,
         "_get_config_quant_dtype": lambda **kw: None,
         "_get_config_dtype_str": lambda **kw: None,
@@ -99,7 +100,8 @@ def context(modules, resident, source_root=None, copied=True, functional=False):
         "moe_kernel_quantize_input": lambda A, A_scale, *a, **kw: (A, A_scale),
         "MoEActivation": NS(SILU="silu", from_str=lambda x: x),
         "mk": NS(
-            FusedMoEExpertsModular=NS(adjust_N_for_activation=lambda n, a: n // 2)
+            RouterWeightApplication=NS(GEMM1="gemm1"),
+            FusedMoEExpertsModular=NS(adjust_N_for_activation=lambda n, a: n // 2),
         ),
         "apply_moe_activation": lambda *a: events.append(("activation", a)),
         "ops": NS(moe_sum=lambda *a: events.append(("sum", a))),
@@ -205,6 +207,8 @@ def check_apply(modules, resident, router, source_root=None, copied=True):
         quant_dtype=None,
         block_shape=None,
         per_act_token_quant=False,
+        per_out_ch_quant=False,
+        activation_key=None,
         quantization_emulation=False,
         _lora_context=None,
         # This fixture exercises legacy host assignment, with no tail consumer.
@@ -219,6 +223,7 @@ def check_apply(modules, resident, router, source_root=None, copied=True):
         w1_bias=None,
         w2_bias=None,
         moe_sum=lambda *a: pytest.fail("finalize helper was bypassed"),
+        router_weight_application=lambda: "prepare",
         _apply_router_weight_in_gemm2=route,
         _finalize_expert_output=finalize,
     )
@@ -274,6 +279,8 @@ def test_empty_expert_batch_does_not_prepare_or_launch(
         a1_scale=None,
         quant_dtype=None,
         per_act_token_quant=False,
+        per_out_ch_quant=False,
+        activation_key=None,
         block_shape=None,
         quantization_emulation=False,
         moe_problem_size=unexpected,
@@ -294,7 +301,10 @@ def test_empty_expert_batch_does_not_prepare_or_launch(
     experts = modules("vllm.model_executor.layers.fused_moe.experts.triton_moe")
     experts.__dict__.update(ctx.namespace)
     experts.TritonExperts = type("TritonExperts", (), {"apply": unexpected})
-    modules("vllm.platforms", current_platform=NS(is_ppu=lambda: True))
+    modules(
+        "vllm.platforms",
+        current_platform=NS(is_ppu=lambda: True, is_rocm=lambda: False),
+    )
     registry = patch_utils_module.PATCH_REGISTRY
     before = len(registry)
     spec = importlib.util.spec_from_file_location(

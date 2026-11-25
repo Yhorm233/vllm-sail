@@ -28,6 +28,7 @@
 #   reason      why this entry is direct|adapted (audited on every bump)
 #   min_tests   minimum number of upstream test cases that must be collected;
 #               guards against a silently-empty run after an upstream refactor
+#   config_fixtures  config-only Hub IDs resolved under config_fixtures/ during this entry
 #   hub_repos   optional list of Hub repo IDs required by the selected tests;
 #               only declared repos are checked before offline execution
 #   # --- optional adaptation knobs (mode = "adapted" only) ---
@@ -161,12 +162,14 @@ min_tests = 1
 
 [[entry]]
 id = "spec_decode_ngram"
-path = "tests/v1/spec_decode/test_ngram.py"
-mode = "direct"
-chips = ["cpu", "810e", "890p"]
+path = "tests/v1/spec_decode/test_ngram_gpu.py"
+mode = "adapted"
+chips = ["810e", "890p"]
 category = "spec_decode"
-reason = "ngram proposer is pure-CPU matching logic (analysis: near-L1 subset of spec_decode)."
-min_tests = 1
+reason = "V2 n-gram matching on device: longest/rightmost match, slot mapping and invalid proposals. The upstream test uses OPT config metadata only, never weights."
+config_fixtures = ["facebook/opt-125m"]
+hub_repos = []
+min_tests = 18
 
 [[entry]]
 id = "logits_processor_loader"
@@ -188,12 +191,12 @@ min_tests = 1
 
 [[entry]]
 id = "v1_sample_sampler"
-path = "tests/v1/sample/test_sampler.py"
+path = "tests/v1/worker/test_gpu_sampler_flags.py"
 mode = "direct"
-chips = ["cpu", "810e", "890p"]
+chips = ["810e", "890p"]
 category = "sample"
-reason = "Sampler applies top-k/top-p/penalties on current_platform.device_type; runs verbatim on CPU and on PPU (cuda-disguised), no narrowing required."
-min_tests = 1
+reason = "Construct the active V2 sampler and verify per-request top-k, top-p, penalties, custom processor and slot reuse behavior on device."
+min_tests = 16
 
 # ---------------------------------------------------------------------------
 # L2 少量适配 -- skeleton reusable, but the file mixes CPU logic with

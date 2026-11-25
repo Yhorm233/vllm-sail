@@ -89,3 +89,73 @@ def test_actual_one_sided_layout_constructor(upstream_source_root, copied, paylo
         else (upstream_source_root / UPSTREAM, "maybe_make_prepare_finalize")
     )
     check_factory(path, name, payload, upstream_source_root)
+
+
+TWO_SIDED_CONSTRUCTOR = (
+    "vllm/model_executor/layers/fused_moe/prepare_finalize/"
+    "flashinfer_nvlink_two_sided.py"
+)
+
+
+def check_two_sided(path, name, source_root=None):
+    calls = []
+    result = object()
+
+    def prepare_finalize(**kwargs):
+        if source_root is not None:
+            constructor = function(
+                source_root / TWO_SIDED_CONSTRUCTOR,
+                "FlashInferNVLinkTwoSidedPrepareAndFinalize.__init__",
+                {},
+            )
+            inspect.signature(constructor).bind(object(), **kwargs)
+        calls.append(kwargs)
+        return result
+
+    moe = NS(
+        moe_parallel_config=NS(use_passthrough_all2all=False, use_all2all_kernels=True),
+        use_deepep_ht_kernels=False,
+        use_deepep_ll_kernels=False,
+        use_deepep_v2_kernels=False,
+        use_moonep_kernels=False,
+        use_mori_epv2_kernels=False,
+        use_mori_epv1_kernels=False,
+        use_fi_nvl_two_sided_kernels=True,
+        hidden_dim=4096,
+        experts_per_token=8,
+        num_experts=256,
+    )
+    namespace = {
+        "get_current_vllm_config": lambda: NS(
+            scheduler_config=NS(max_num_batched_tokens=512)
+        ),
+        "FlashInferNVLinkTwoSidedPrepareAndFinalize": prepare_finalize,
+    }
+    actual = function(path, name, namespace)(
+        moe, object(), all2all_manager=NS(world_size=8)
+    )
+    assert actual is result
+    assert calls == [
+        {
+            "max_num_tokens": 512,
+            "top_k": 8,
+            "num_experts": 256,
+            "hidden_size": 4096,
+            "num_dispatchers": 8,
+        }
+    ]
+
+
+def test_two_sided_factory_forwards_required_constructor_args():
+    check_two_sided(PATCH, "_maybe_make_prepare_finalize_body")
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("copied", [False, True])
+def test_actual_two_sided_constructor(upstream_source_root, copied):
+    path, name = (
+        (PATCH, "_maybe_make_prepare_finalize_body")
+        if copied
+        else (upstream_source_root / UPSTREAM, "maybe_make_prepare_finalize")
+    )
+    check_two_sided(path, name, upstream_source_root)

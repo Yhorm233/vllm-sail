@@ -207,9 +207,8 @@ def decide_from_config(
         return _off("no active vllm config")
     text_config = vllm_config.model_config.hf_config
     text_config = getattr(text_config, "text_config", text_config)
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    if not sparse_cfg:
-        return _off("model has no sparse_attention_config")
+    if not getattr(text_config, "index_topk_blocks", None):
+        return _off("model has no sparse attention index config")
 
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     head_dim = int(getattr(text_config, "head_dim", 0) or 0)
@@ -222,14 +221,14 @@ def decide_from_config(
         indexer_kv_dtype = resolved
 
     return decide(
-        topk_blocks=int(topk_blocks or sparse_cfg["sparse_topk_blocks"]),
+        topk_blocks=int(topk_blocks or text_config.index_topk_blocks),
         block_size=int(vllm_config.cache_config.block_size or PAGE_SIZE),
-        score_type=sparse_cfg.get("sparse_score_type", "max"),
+        score_type="max",
         head_dim=head_dim,
-        idx_head_dim=int(sparse_cfg.get("sparse_index_dim", head_dim)),
+        idx_head_dim=int(text_config.index_head_dim),
         num_q_heads=_shard_heads(int(text_config.num_attention_heads), tp_size),
         num_kv_heads=_shard_heads(int(text_config.num_key_value_heads), tp_size),
-        num_idx_heads=_shard_heads(int(sparse_cfg["sparse_num_index_heads"]), tp_size),
+        num_idx_heads=_shard_heads(int(text_config.index_n_heads), tp_size),
         kv_cache_dtype=kv_cache_dtype or vllm_config.cache_config.cache_dtype,
         indexer_kv_dtype=indexer_kv_dtype,
         max_model_len=int(vllm_config.model_config.max_model_len),

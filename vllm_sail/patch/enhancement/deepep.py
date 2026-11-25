@@ -162,9 +162,6 @@ def _maybe_make_prepare_finalize_body(
             use_fp8_dispatch=use_fp8_dispatch,
         )
         handle = all2all_manager.get_handle(all_to_all_args)
-        vllm_config = get_current_vllm_config()
-        use_cudagraph = not vllm_config.model_config.enforce_eager
-
         prepare_finalize = DeepEPV2PrepareAndFinalize(
             buffer=handle,
             num_dispatchers=all2all_manager.world_size,
@@ -173,7 +170,6 @@ def _maybe_make_prepare_finalize_body(
             num_experts=moe.num_experts,
             num_topk=moe.experts_per_token,
             use_fp8_dispatch=use_fp8_dispatch,
-            use_cudagraph=use_cudagraph,
             sp_size=moe.moe_parallel_config.sp_size,
         )
 
@@ -311,6 +307,23 @@ def _maybe_make_prepare_finalize_body(
             dispatch_format=dispatch_layout.dispatch_format,
             extra_payload_bytes_per_token=dispatch_layout.extra_payload_bytes_per_token,
         )
+
+    elif moe.use_alltoall_batched_kernels and allow_new_interface:
+        if current_platform.is_xpu() and not use_monolithic:
+            prepare_finalize = AllToAllBatchedPrepareAndFinalize(
+                max_num_tokens=moe.max_num_tokens,
+                num_local_experts=moe.num_local_experts,
+                num_dispatchers=all2all_manager.world_size,
+                rank=moe.moe_parallel_config.ep_rank,
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+            )
+            logger.info_once("XPU MoE EP: using AllToAllBatchedPrepareAndFinalize.")
+        else:
+            prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
+                use_monolithic=use_monolithic,
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+                num_dispatchers=all2all_manager.world_size,
+            )
 
     elif moe.use_ag_rs_all2all_kernels and allow_new_interface:
         prepare_finalize = make_moe_prepare_and_finalize_naive_dp_ep(
