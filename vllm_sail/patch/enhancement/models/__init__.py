@@ -19,8 +19,8 @@ Modules, and why each is import-on-install like the rest of the framework:
   quantization-specific weights mapper remains plugin-local so CUDA behavior
   is unchanged.
 * ``deepseek_v41_mega_mhc`` — routes the V4.1 Mega mHC kernel to the PPU
-  DeepGEMM build, which supports ZW-810E (BF16 output) and ZW-M890P instead
-  of the upstream SM 10.x family.
+  DeepGEMM build, which supports Zhenwu 810E and Zhenwu M890 instead of the
+  upstream SM 10.x family.
 * ``glm5_next_mtp`` — quantization support for the GLM-5.3-Flash MTP draft:
   ``SupportsQuant`` in ``Glm5NextMTP``'s bases, a ``hf_to_vllm_mapper`` that
   strips the checkpoint's tower prefix (``model.language_model.layers.N.`` ->

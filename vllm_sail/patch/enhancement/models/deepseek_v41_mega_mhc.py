@@ -4,19 +4,8 @@
 Upstream gates the kernel on the SM 10.x (Blackwell) family and on
 ``vllm.utils.deep_gemm.is_deep_gemm_supported()``, which is False on PPU
 because the platform does not advertise CUDA DeepGEMM support. The PPU
-DeepGEMM build ships a Mega mHC kernel for both PPU generations, but only
-for the 5120-wide, ``hc_mult=4`` configuration:
-
-* PPU 1.0 (ZW-810E, capability ``(8, 0)``, ``AC_PPU0010``) runs the BF16
-  variant and rejects FP8 outputs. The V4.1 dispatcher only requests a BF16
-  ``y_bf16``, so that restriction never applies here.
-* PPU 1.5 (ZW-M890P, capability ``(8, 9)``, ``AC_PPU0015``) additionally
-  runs the FP8 variants.
-
-Capability alone is not enough: CUDA's Ampere also reports ``(8, 0)``, so the
-capability set is only consulted behind the ``is_ppu()`` check. DeepGEMM
-enforces its own preconditions (arch, shapes, dtypes), so this gate does not
-restate them beyond the shape contract.
+DeepGEMM build ships a Mega mHC kernel for Zhenwu 810E and Zhenwu M890,
+but only for the 5120-wide, ``hc_mult=4`` configuration.
 
 This module therefore replaces the two upstream symbols the V4.1 mHC module
 needs, and delegates to the upstream implementations on every other platform.
@@ -51,9 +40,6 @@ _AFFECTED = ">=0.32.0,<0.33.0"
 # The PPU Mega mHC kernel is generated for exactly one shape.
 _PPU_HIDDEN_SIZE = 5120
 _PPU_HC_MULT = 4
-#: Capabilities whose DeepGEMM build carries the Mega mHC kernel: PPU 1.0
-#: (ZW-810E) and PPU 1.5 (ZW-M890P). Only consulted on PPU, where capability
-#: identifies the chip generation; on CUDA ``(8, 0)`` is Ampere instead.
 _MEGA_MHC_CAPABILITIES = frozenset({(8, 0), (8, 9)})
 
 
@@ -107,9 +93,8 @@ def _ppu_mega_mhc_supported(hidden_size: int, hc_mult: int) -> bool:
     "is_mega_mhc_supported",
     reason=(
         "PPU runs the DSV4.1 Mega mHC kernel from the PPU DeepGEMM build, which "
-        "targets ZW-810E (SM 8.0, BF16 output) and ZW-M890P (SM 8.9) instead of "
-        "the upstream SM 10.x family and only supports the 5120-wide, hc_mult=4 "
-        "configuration."
+        "targets Zhenwu 810E and Zhenwu M890 instead of the upstream SM 10.x "
+        "family and only supports the 5120-wide, hc_mult=4 configuration."
     ),
     affected_versions=_AFFECTED,
     remove_when=(
