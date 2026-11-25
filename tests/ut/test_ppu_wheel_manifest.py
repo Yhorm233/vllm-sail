@@ -41,7 +41,7 @@ def make_wheels(
                         "vllm/_rust_tool_parser.abi3.so", b"test extension"
                     )
             elif name == "vllm_sail":
-                for module in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C"):
+                for module in manifest.NATIVE_MODULES:
                     archive.writestr(f"vllm_sail/{module}.abi3.so", b"test extension")
     return next(directory.rglob("vllm-*.whl"))
 

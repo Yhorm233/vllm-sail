@@ -27,7 +27,7 @@ RECIPE_BUNDLE_INPUTS = (
 )
 MAX_RECIPE_ARCHIVE_BYTES = 16 * 1024 * 1024
 MAX_RECIPE_ARCHIVE_MEMBERS = 4096
-NATIVE_MODULES = ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C")
+NATIVE_MODULES = ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C", "_cumem_allocator")
 FINGERPRINT_COMPAT = "scripts/ci/ppu_native_fingerprint_compat.json"
 FINGERPRINT_COMPAT_PATHS = (
     ".github/workflows/_ppu-build.yaml",

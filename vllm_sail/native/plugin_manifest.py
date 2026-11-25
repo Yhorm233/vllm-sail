@@ -25,6 +25,7 @@ _PLUGIN_ROOT = "csrc/plugin/"
 _CMAKE_VARIABLES = {
     "_C": "PPU_PLUGIN_EXT_SRC",
     "_moe_C": "PPU_PLUGIN_MOE_EXT_SRC",
+    "_cumem_allocator": "PPU_PLUGIN_CUMEM_EXT_SRC",
 }
 
 
@@ -89,8 +90,10 @@ def _extension(src: Path, item: dict) -> Extension:
     cmake_variable(name)
     device_sources = tuple(item.get("device_sources") or ())
     bindings = tuple(item.get("bindings") or ())
-    if not device_sources or not bindings:
+    if not bindings or (name != "_cumem_allocator" and not device_sources):
         raise PluginManifestError(f"{src}: {name} needs device_sources and bindings")
+    if name == "_cumem_allocator" and device_sources:
+        raise PluginManifestError(f"{src}: {name} only accepts host bindings")
     for path in device_sources:
         if not str(path).startswith(_PLUGIN_ROOT) or not str(path).endswith(".hg"):
             raise PluginManifestError(f"{src}: invalid device source {path!r}")

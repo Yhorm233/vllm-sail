@@ -152,6 +152,26 @@ class PPUPlatform(NvmlCudaPlatform):
         return True
 
     @classmethod
+    def is_cumem_allocator_available(cls) -> bool:
+        from vllm_sail.native.cumem import is_available
+
+        return is_available()
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.enable_cumem_allocator:
+            cache_config = vllm_config.cache_config
+            if cache_config.enable_extensible_kv_cache is True:
+                raise ValueError(
+                    "Extensible KV cache bypasses the native HGGC cuMem pool. "
+                    "Disable it when using the cuMem allocator on PPU."
+                )
+            # vLLM resolves the automatic default after this platform hook.
+            cache_config.enable_extensible_kv_cache = False
+        super().check_and_update_config(vllm_config)
+
+    @classmethod
     def get_hisparse_backend_cls(cls) -> str | None:
         """HiSparse compute kernels are excluded from the PPU native corpus."""
         return None

@@ -19,7 +19,7 @@ Four extensions are produced (see ``CMakeLists.txt``):
 Native extensions are the default. The only Python-only path is an explicit
 opt-out; otherwise the build validates every prerequisite before running CMake:
 
-* ``VLLM_SAIL_PREBUILT_EXT_DIR`` -> package four prebuilt native extensions
+* ``VLLM_SAIL_PREBUILT_EXT_DIR`` -> package prebuilt native extensions
 * ``VLLM_SAIL_SKIP_EXT`` truthy   -> pure-Python wheel
 * otherwise                      -> require importable torch, hgcc and CMake,
                                     then configure and build
@@ -33,7 +33,7 @@ Environment variables:
                           the HGGC toolkit.
 * ``HGCC``                explicit ``hgcc`` path; wins over ``PPU_SDK/bin/hgcc``.
 * ``VLLM_SAIL_SKIP_EXT``  force a pure-Python wheel.
-* ``VLLM_SAIL_PREBUILT_EXT_DIR`` directory containing the four extension files
+* ``VLLM_SAIL_PREBUILT_EXT_DIR`` directory containing the five extension files
                                   to package without invoking CMake/HGCC.
 * ``PYTORCH_SAIL_ARCH``  -> HG and Torch architecture lists (default ``ppu_15;ppu_10``).
 * ``VLLM_SAIL_HG_ARCH``   plugin architecture list; must match ``PYTORCH_SAIL_ARCH``
@@ -63,7 +63,7 @@ logger = logging.getLogger("vllm-sail-build")
 
 _ROOT = Path(__file__).resolve().parent
 
-# One Extension per CMake target. CMake still builds all four in a single
+# One Extension per CMake target. CMake builds them in a single
 # invocation, but each output must be declared: PEP 660 editable installs build
 # into build_lib and setuptools then copies back exactly the declared
 # extensions, while the wheel packages build_lib as a whole.
@@ -72,6 +72,7 @@ _EXT_NAMES = (
     "vllm_sail._upstream_moe_C",
     "vllm_sail._C",
     "vllm_sail._moe_C",
+    "vllm_sail._cumem_allocator",
 )
 
 
@@ -119,7 +120,7 @@ class _CMakeBuildExt(build_ext):
 
     ``build_ext`` is kept only for its output-path bookkeeping: it knows where a
     wheel build and an ``--inplace`` editable build each want the shared objects,
-    and CMake is told to put all four there via ``PPU_EXT_OUTPUT_DIR``.
+    and CMake is told to put all extensions there via ``PPU_EXT_OUTPUT_DIR``.
     """
 
     def build_extensions(self) -> None:

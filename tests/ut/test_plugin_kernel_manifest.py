@@ -37,6 +37,14 @@ def test_cmake_uses_the_native_plugin_sources_and_include_root() -> None:
 
     for extension in extensions:
         variable = plugin_manifest.cmake_variable(extension.name)
+        if extension.name == "_cumem_allocator":
+            assert not extension.device_sources
+            assert (
+                f"Python_add_library(_cumem_allocator MODULE WITH_SOABI ${{{variable}}})"
+                in cmake
+            )
+            assert "PRIVATE HGGC::hggc HGGC::hggcrt" in cmake
+            continue
         block = re.search(
             rf"ppu_add_extension\({re.escape(extension.name)}\b(?P<body>.*?)\)",
             cmake,
