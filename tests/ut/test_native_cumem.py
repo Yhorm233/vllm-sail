@@ -22,7 +22,10 @@ def allocator(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "vllm.device_allocator",
-        SimpleNamespace(DEFERRABLE_TAGS=("weights", "kv_cache")),
+        SimpleNamespace(
+            DEFERRABLE_TAGS=("weights", "kv_cache"),
+            discardable_allocations=Mock(return_value=set()),
+        ),
     )
     monkeypatch.setitem(
         sys.modules, "vllm.device_allocator.cumem", SimpleNamespace(PIN_MEMORY=False)
@@ -32,6 +35,7 @@ def allocator(monkeypatch):
         default_tag = "default"
 
         def __init__(self):
+            self.allocator_and_pools = {}
             self.pointer_to_data = {
                 tag: self._data(tag) for tag in ("weights", "kv_cache")
             }
@@ -75,3 +79,32 @@ def test_failed_wake_retries_with_same_backup(allocator):
         ("weights", 11),
         ("weights", 11),
     ]
+
+
+def test_sleep_skips_backup_for_discardable_weight_segments(allocator):
+    pool, native, backup = allocator
+    pool.pointer_to_data[100] = pool._data("weights")
+    discardable = {200}
+    find_discardable = sys.modules["vllm.device_allocator"].discardable_allocations
+    find_discardable.return_value = {100}
+
+    pool.sleep(("weights",), discardable)
+
+    find_discardable.assert_called_once_with(pool.allocator_and_pools, discardable)
+    native.suspend.assert_any_call(100, 0)
+    assert pool.pointer_to_data[100].is_asleep
+    assert pool.pointer_to_data[100].cpu_backup_tensor is None
+    assert pool.pointer_to_data["weights"].cpu_backup_tensor is backup
+
+
+def test_pluggable_allocator_hook_uses_hggc_callbacks(allocator, monkeypatch):
+    pool, _, _ = allocator
+    pool.python_malloc_callback = Mock()
+    pool.python_free_callback = Mock()
+    allocator_factory = Mock()
+    monkeypatch.setattr(cumem, "get_pluggable_allocator", allocator_factory)
+
+    assert pool._get_pluggable_allocator() is allocator_factory.return_value
+    allocator_factory.assert_called_once_with(
+        pool.python_malloc_callback, pool.python_free_callback
+    )

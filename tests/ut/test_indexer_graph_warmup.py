@@ -8,8 +8,8 @@ import pytest
 from tests.support.modules import load_patch
 
 
-@pytest.fixture(params=["v1", "v2"])
-def harness(modules, patch_utils_module, request):
+@pytest.fixture
+def harness(modules, patch_utils_module):
     state = NS(
         ppu=True, capturing=False, ready=False, calls=0, fail=False, max_seq_len=1
     )
@@ -57,17 +57,14 @@ def harness(modules, patch_utils_module, request):
     def run():
         return indexer.forward(None, "qr", None, "weights", "pos", "rope")
 
-    class Runner:
-        def _warmup_and_capture(self):
+    class Manager:
+        def capture(self):
             run()
             state.capturing = True
             try:
                 return run()
             finally:
                 state.capturing = False
-
-    class Manager:
-        capture = Runner._warmup_and_capture
 
     modules("torch", cuda=NS(is_current_stream_capturing=lambda: state.capturing))
     modules("vllm.platforms", current_platform=NS(is_ppu=lambda: state.ppu))
@@ -78,21 +75,17 @@ def harness(modules, patch_utils_module, request):
         ),
     )
     modules("vllm.models.deepseek_v4.attention", DeepseekV4Indexer=Indexer)
-    modules("vllm.v1.worker.gpu_model_runner", GPUModelRunner=Runner)
     modules("vllm.v1.worker.gpu.cudagraph_utils", CudaGraphManager=Manager)
     relative = "vllm_sail/patch/enhancement/models/deepseek_v4_graph_warmup.py"
     load_patch(relative)
-    runner = (
-        Runner() if request.param == "v1" else NS(_warmup_and_capture=Manager().capture)
-    )
-    return state, runner, run
+    return state, NS(capture=Manager().capture), run
 
 
 def test_short_context_projection_is_ready_before_capture(harness):
     state, runner, run = harness
     assert run() == (None, None, None)
     assert state.calls == 0
-    runner._warmup_and_capture()
+    runner.capture()
     assert state.ready
     assert state.calls == 2
     run()
@@ -103,7 +96,7 @@ def test_warmup_scope_restores_on_error(harness):
     state, runner, run = harness
     state.fail = True
     with pytest.raises(ValueError, match="warmup failed"):
-        runner._warmup_and_capture()
+        runner.capture()
     state.fail = False
     before = state.calls
     run()
@@ -114,12 +107,12 @@ def test_non_ppu_keeps_original_behavior(harness):
     state, runner, run = harness
     state.ppu = False
     with pytest.raises(RuntimeError, match="STREAM_CAPTURE_UNSUPPORTED"):
-        runner._warmup_and_capture()
+        runner.capture()
     assert state.calls == 0
 
 
 def test_long_context_warmup_does_not_duplicate_projection(harness):
     state, runner, _ = harness
     state.max_seq_len = 8192
-    runner._warmup_and_capture()
+    runner.capture()
     assert state.calls == 2

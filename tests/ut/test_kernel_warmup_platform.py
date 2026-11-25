@@ -72,18 +72,25 @@ def test_real_replayssm_lifecycle_admission_uses_config_not_cuda_identity(
             "replayssm_lifecycle_warmup",
             {},
         )
-        assert lifecycle(NS(vllm_config=NS(use_flashinfer_replayssm=False))) is None
+        assert (
+            lifecycle(
+                NS(
+                    vllm_config=NS(
+                        use_flashinfer_replayssm=False, use_replayssm_trackers=False
+                    )
+                )
+            )
+            is None
+        )
 
 
 @pytest.mark.upstream_source
 @pytest.mark.requires_runtime
-@pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("align", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
 def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     modules,
     upstream_source_root,
-    v2,
     align,
     fail,
 ):
@@ -96,7 +103,9 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     mixer_cls = type("MambaMixer2", (base,), {})
     spec_cls = type("MambaSpec", (), {})
     mixer = mixer_cls()
-    mixer.use_replayssm = mixer.use_flashinfer_replayssm = True
+    mixer.use_replayssm_trackers = mixer.use_replayssm = (
+        mixer.use_flashinfer_replayssm
+    ) = True
     mixer.replayssm_buffer_len = 4
     mixer.kv_cache = [torch.full((5, 2), 7.0), torch.full((5, 3), 9.0)]
     mixer._replayssm_ring_start = torch.ones(5, dtype=torch.int32)
@@ -106,7 +115,7 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     table = torch.full((1, 4), 99, dtype=torch.int32)
     config = NS(
         use_flashinfer_replayssm=True,
-        use_v2_model_runner=v2,
+        use_replayssm_trackers=True,
         compilation_config=NS(static_forward_context={"mixer": mixer}),
     )
     runner = NS(
@@ -115,7 +124,13 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
         decode_query_len=2,
         uniform_decode_query_len=2,
         kv_cache_config=NS(
-            kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=["mixer"])]
+            kv_cache_groups=[
+                NS(
+                    kv_cache_spec=spec,
+                    kv_cache_specs={"mixer": spec},
+                    layer_names=["mixer"],
+                )
+            ]
         ),
         block_tables=NS(input_block_tables=[table]),
         input_batch=NS(block_table=[NS(get_device_tensor=lambda n: table)]),
@@ -123,6 +138,14 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     )
     modules("vllm.model_executor.layers.mamba.abstract", MambaBase=base)
     modules("vllm.model_executor.layers.mamba.mamba_mixer2", MambaMixer2=mixer_cls)
+    modules(
+        "vllm.v1.core.kv_cache_utils",
+        is_mamba_group=lambda group: isinstance(group.kv_cache_spec, spec_cls),
+        is_mamba_prefix_caching_group=lambda group: getattr(
+            group.kv_cache_spec, "mamba_cache_mode", None
+        )
+        == "align",
+    )
     modules("vllm.v1.kv_cache_interface", MambaSpec=spec_cls)
     modules(
         "vllm.v1.worker.extensible_kv_cache",
@@ -137,18 +160,14 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
         calls.append("reset")
 
     def postprocess(**kwargs):
-        assert kwargs["query_metadata"].tolist() == ([0, 2] if v2 else [2])
-        assert kwargs["query_metadata_is_cumulative"] is v2
-        assert kwargs["num_computed_tokens"].tolist() == ([16] if v2 else [15])
-        assert kwargs["num_computed_is_post_step"] is v2
+        assert kwargs["query_metadata"].tolist() == [0, 2]
+        assert kwargs["query_metadata_is_cumulative"] is True
+        assert kwargs["num_computed_tokens"].tolist() == [16]
+        assert kwargs["num_computed_is_post_step"] is True
         assert kwargs["num_accepted_tokens"].tolist() == [1]
         assert kwargs["is_prefilling"].tolist() == [False]
         assert kwargs["num_reqs"] == 1
-        assert (
-            kwargs["idx_mapping"].tolist() == [0]
-            if v2
-            else kwargs["idx_mapping"] is None
-        )
+        assert kwargs["idx_mapping"].tolist() == [0]
         assert (
             kwargs["live_cols"].tolist() == [1]
             if align
@@ -162,7 +181,8 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
         if fail:
             raise error
 
-    def create(grouped, max_reqs):
+    def create(grouped, max_reqs, *, materialize_prefixes):
+        assert materialize_prefixes is align
         assert max_reqs == 4 and len(grouped) == 1
         actual_mixers, actual_spec, scratch = grouped[0]
         assert actual_mixers == [mixer] and actual_spec is spec
@@ -211,6 +231,7 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
         "cutedsl_warmup": ["cutedsl_warmup"],
         "deep_gemm_warmup": ["deep_gemm_warmup"],
         "flashinfer_autotune_cache": [
+            "get_flashinfer_mm_encoder_autotune_config",
             "resolve_flashinfer_autotune_v2_root",
             "resolve_rank_flashinfer_autotune_file",
             "use_flashinfer_autotune_v2",
@@ -239,6 +260,8 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
         exception=lambda *a: None,
     )
     modules("vllm.logger", init_logger=lambda _: logger)
+    modules("vllm.v1.core.kv_cache_utils", KVCacheBlockCopy=unavailable)
+    modules("vllm.v1.worker.utils", copy_kv_cache_blocks_inplace=unavailable)
     modules("torch", nn=NS(Module=object), Tensor=object)
     envs = modules(
         "vllm.envs",
@@ -365,7 +388,7 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
     expected = ["sampler"] if ppu else []
     if jit:
         expected += ["registry", "triton"]
-    expected += ["qwen", "vl", "mamba", "replayssm_lifecycle"]
+    expected += ["qwen", "vl", "replayssm_lifecycle"]
     if jit:
         expected += ["kimi", "watermark", "qsa"]
     expected += ["gemm_rs_ar"]
@@ -413,16 +436,15 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
 
 
 @pytest.mark.upstream_source
-@pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize(
     "backends", [[], ["OTHER"], ["FLASHINFER", "OTHER"], ["FLASHINFER"]]
 )
 @pytest.mark.parametrize("remote_eligible", [0, 1])
 @pytest.mark.parametrize("pooling", [False, True])
 def test_flashinfer_warmup_coordinates_all_pp_ranks(
-    modules, upstream_source_root, v2, backends, remote_eligible, pooling
+    modules, upstream_source_root, backends, remote_eligible, pooling
 ):
-    """使用真实 helper 验证 V2 的 any 和旧 runner 的 all 集体决策。"""
+    """使用真实 helper 验证 任一 PP rank 有 FlashInfer 工作时所有 rank 一起预热。"""
     calls = []
     collective_inputs = []
 
@@ -456,7 +478,6 @@ def test_flashinfer_warmup_coordinates_all_pp_ranks(
     )
     groups = [NS(backend=NS(get_name=lambda name=name: name)) for name in backends]
     worker = NS(
-        use_v2_model_runner=v2,
         model_runner=NS(
             is_pooling_model=pooling, attn_groups=[groups] if groups else []
         ),
@@ -465,11 +486,11 @@ def test_flashinfer_warmup_coordinates_all_pp_ranks(
     eligible = (
         not pooling
         and bool(backends)
-        and (any if v2 else all)(name == "FLASHINFER" for name in backends)
+        and any(name == "FLASHINFER" for name in backends)
     )
     assert collective_inputs == [int(eligible)]
     count = int(eligible) + remote_eligible
-    assert calls == ([worker] if (count > 0 if v2 else count == 2) else [])
+    assert calls == ([worker] if count > 0 else [])
 
 
 @pytest.mark.upstream_source
@@ -558,9 +579,19 @@ def test_real_replayssm_lifecycle_skips_without_committable_eligible_state(
 
     base, spec_cls = type("MambaBase", (), {}), type("MambaSpec", (), {})
     mixer = base() if ineligible != "wrong-mixer" else NS()
-    mixer.use_flashinfer_replayssm = ineligible != "replay-disabled"
+    mixer.use_replayssm_trackers = mixer.use_flashinfer_replayssm = (
+        ineligible != "replay-disabled"
+    )
     spec = spec_cls() if ineligible != "non-mamba" else object()
     modules("vllm.model_executor.layers.mamba.abstract", MambaBase=base)
+    modules(
+        "vllm.v1.core.kv_cache_utils",
+        is_mamba_group=lambda group: isinstance(group.kv_cache_spec, spec_cls),
+        is_mamba_prefix_caching_group=lambda group: getattr(
+            group.kv_cache_spec, "mamba_cache_mode", None
+        )
+        == "align",
+    )
     modules("vllm.v1.kv_cache_interface", MambaSpec=spec_cls)
     modules(
         "vllm.v1.worker.replayssm_utils", ReplaySSMModelContext=NS(create=forbidden)
@@ -578,12 +609,14 @@ def test_real_replayssm_lifecycle_skips_without_committable_eligible_state(
     runner = NS(
         vllm_config=NS(
             use_flashinfer_replayssm=True,
+            use_replayssm_trackers=True,
             use_v2_model_runner=v2,
             compilation_config=NS(static_forward_context={"mixer": mixer}),
         ),
         kv_cache_config=NS(
             kv_cache_groups=[
                 NS(
+                    kv_cache_specs={"mixer": spec},
                     kv_cache_spec=spec,
                     layer_names=[] if ineligible == "no-mixer" else ["mixer"],
                 )
@@ -663,6 +696,7 @@ def _glm_kda_warmup_boundary(modules, monkeypatch, root, torch, capability):
 
     platform = NS(
         is_cuda=lambda: True,
+        is_rocm=lambda: False,
         get_device_capability=lambda: NS(major=capability // 10),
         has_device_capability=lambda required: capability >= required,
     )
@@ -737,7 +771,7 @@ def _glm_kda_warmup_boundary(modules, monkeypatch, root, torch, capability):
 @pytest.mark.parametrize("capability", [80, 89])
 @pytest.mark.parametrize("backend", ["auto", "triton"])
 @pytest.mark.parametrize("failure", [None, "base", "duplicate", "registration"])
-def test_glm_real_kda_constructor_registers_l2norm_and_restores_quant_config(
+def test_glm_real_kda_constructor_registers_l2norm_and_preserves_quant_config(
     modules,
     monkeypatch,
     upstream_source_root,
@@ -767,7 +801,7 @@ def test_glm_real_kda_constructor_registers_l2norm_and_restores_quant_config(
     class Base(torch.nn.Module):
         def __init__(self, text, actual_config, prefix):
             super().__init__()
-            assert actual_config is config and actual_config.quant_config is None
+            assert actual_config is config and actual_config.quant_config is quant
             if failure == "base":
                 raise error
             self.quant_config = actual_config.quant_config
@@ -820,6 +854,25 @@ def test_glm_real_kda_constructor_registers_l2norm_and_restores_quant_config(
         ),
         current_platform=sys.modules["vllm.platforms"].current_platform,
     )
+    checkpoint = (
+        upstream_source_root / "vllm/model_executor/layers/mamba/kda_checkpoint.py"
+    )
+    namespace.update(
+        FlashKDAPrefillCheckpointExporter=NS,
+        kda_prefill_checkpoint_alignment=function(
+            checkpoint,
+            "kda_prefill_checkpoint_alignment",
+            {"_KDA_PREFILL_CHECKPOINT_ALIGNMENT": {"triton": 64}},
+        ),
+        reserve_triton_kda_checkpoint_buffer=function(
+            checkpoint,
+            "reserve_triton_kda_checkpoint_buffer",
+            {"is_workspace_manager_initialized": lambda: False},
+        ),
+        has_flashinfer_packed_fused_kda_decode=lambda: False,
+    )
+    function(path, "_is_flashinfer_kda_decode_supported", namespace)
+    function(path, "_resolve_kda_decode_backend", namespace)
     function(path, "_resolve_kda_prefill_backend", namespace)
     layer_type = function(path, "Glm5NextLinearAttention", namespace)
     text = NS(
@@ -847,12 +900,15 @@ def test_glm_real_kda_constructor_registers_l2norm_and_restores_quant_config(
         else:
             first = layer_type(text, config, "layer")
             second = layer_type(text, config, "layer2")
-            assert first.quant_config is second.quant_config is None
+            assert first.quant_config is second.quant_config is quant
             assert first.kda_prefill_backend == second.kda_prefill_backend == "triton"
-            assert first._flashkda_buffer_specs is first._checkpoint_exporter is None
+            assert first.kda_decode_backend == "triton"
+            assert first._flashkda_buffer_specs is None
+            assert first._checkpoint_exporter.state_len == 3
+            assert first._triton_checkpoint_spec == ((8, 2, 128, 128), torch.float32)
             assert static == {"layer": first, "layer2": second}
     assert config.quant_config is quant
-    assert all(kwargs.get("quant_config") is None for kwargs in projections)
+    assert all(kwargs["quant_config"] is quant for kwargs in projections if kwargs)
     if failure:
         assert state.norm not in registry._registrations and state.launches == []
         assert len(registry) == (0 if failure == "base" else 1)

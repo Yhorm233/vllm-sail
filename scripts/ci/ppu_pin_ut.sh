@@ -50,6 +50,8 @@ python - <<'PY'
 import torch
 import vllm
 import vllm_sail
+# Platform discovery can succeed even if the wheel has unresolved native symbols.
+import vllm_sail._upstream_C
 from vllm.platforms import current_platform
 from vllm_sail.compat import check_vllm_compatibility
 

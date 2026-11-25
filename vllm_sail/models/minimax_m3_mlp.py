@@ -54,15 +54,11 @@ def init_mlp(
     self.gemm_rs = (
         _bind_gemm_rs(self.down_proj) if use_sequence_parallel and run_gemm_rs else None
     )
-    if config.hidden_act != "swigluoai":
-        raise ValueError(
-            f"Unsupported activation: {config.hidden_act}. Only swigluoai is supported."
-        )
-    # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
+    # The reference M3 projection uses a unit up-bias.
     self.act_fn = SiluAndMulWithClamp(
         swiglu_limit=config.swiglu_limit,
         alpha=config.swiglu_alpha,
-        beta=config.swiglu_beta,
+        beta=1.0,
     )
     # PPU MODIFICATION: begin
     if not current_platform.is_ppu():

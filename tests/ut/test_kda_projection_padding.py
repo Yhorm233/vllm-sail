@@ -79,9 +79,7 @@ def check_constructor(path, name, heads):
     padding = 8 if heads == 64 else 0
     assert layer.in_proj_padding == padding
     assert args[0] == 512
-    assert args[1] == [128 * heads] * 4 + [128, heads] + (
-        [padding * 8] if padding else []
-    )
+    assert args[1] == [128 * heads] * 4 + [128, heads]
     assert kwargs == {
         "replicated_shard_id": 4,
         "tp_size": 8,
@@ -125,32 +123,53 @@ class Weight:
 def actual_linear(source_root, padding, failure=False):
     events = []
 
-    class Base:
-        def __init__(self, input_size, output_sizes, **kwargs):
+    class Stacked:
+        def __init__(self, *, input_size, output_size, **kwargs):
             self.tp_rank, self.tp_size = 3, 8
-            self.output_sizes = output_sizes
-            self.weight = Weight(sum(output_sizes) // 8, input_size)
-
-        def weight_loader(self, param, loaded, shard):
-            events.append(("v1", self.tp_rank, param.tp_rank, loaded, shard))
-            param.values[:] = [9] * param.rows
-            if failure:
-                raise ValueError("load failed")
-
-        def weight_loader_v2(self, param, loaded, shard):
-            events.append(("v2", self.tp_rank, param.tp_rank, loaded, shard))
-            param.values[:] = [9] * param.rows
-            if failure:
-                raise ValueError("load failed")
+            self.weight, self.bias = Weight(output_size // 8, input_size), None
 
     def attrs(weight, values):
         for key, value in values.items():
             setattr(weight, key, value)
 
+    linear_path = source_root / "vllm/model_executor/layers/linear.py"
+    node = definition(linear_path, "MergedColumnParallelLinear")
+    node.decorator_list = []
+    node.body = [
+        n
+        for n in node.body
+        if getattr(n, "name", None)
+        in ("__init__", "_zero_output_padding", "weight_loader", "weight_loader_v2")
+    ]
+    base = compile_class(
+        node,
+        dict(
+            StackedColumnParallelLinear=Stacked,
+            set_weight_attrs=attrs,
+            get_tensor_model_parallel_world_size=lambda: 8,
+            get_tensor_model_parallel_rank=lambda: 3,
+        ),
+        linear_path,
+    )
+    # Stop after the real loader has validated the shard and zeroed the padding.
+    # The copied parameter here represents the native load operation.
+    zero = base._zero_output_padding
+
+    def load_at_boundary(owner, param):
+        zero(owner, param)
+        if hasattr(owner, "observed_shard"):
+            loader, shard, loaded = owner.observed_shard
+            events.append((loader, owner.tp_rank, param.tp_rank, loaded, shard))
+            if failure:
+                raise ValueError("load failed")
+            param.values[:7] = [9] * 7
+            raise ProjectionReady
+
+    base._zero_output_padding = load_at_boundary
+    base.validate_shard_id = lambda owner, shard, param: None
     namespace = {
-        "MergedColumnParallelLinear": Base,
+        "MergedColumnParallelLinear": base,
         "BlockQuantScaleParameter": type("BlockScale", (), {}),
-        "set_weight_attrs": attrs,
     }
     path = source_root / UPSTREAM
     cls = compile_class(
@@ -159,10 +178,12 @@ def actual_linear(source_root, padding, failure=False):
     sizes = [8, 8, 8, 8, 2, 8]
     layer = cls(4, sizes, replicated_shard_id=4, tp_size=8, padding_size=padding)
     assert sizes == [8, 8, 8, 8, 2, 8]
-    assert layer.output_sizes == [8, 8, 8, 8, 16, 8]
-    assert layer.weight.values == [7] * (7 - padding) + [0] * padding
+    assert layer.output_sizes == [8, 8, 8, 8, 16, 8] + (
+        [8 * padding] if padding else []
+    )
+    assert layer.weight.values == [7] * 7 + [0] * padding
     if padding:
-        assert layer.weight.weight_loader_numel == (7 - padding) * 4
+        assert layer.weight.weight_loader_numel == 7 * 4
     else:
         assert not hasattr(layer.weight, "weight_loader_numel")
     return layer, events
@@ -177,8 +198,10 @@ def test_actual_padding_survives_both_weight_loaders(
 ):
     layer, events = actual_linear(upstream_source_root, padding)
     loaded = object()
-    getattr(layer, loader)(layer.weight, loaded, shard)
-    assert layer.weight.values == [9] * (7 - padding) + [0] * padding
+    layer.observed_shard = ("v2" if loader.endswith("v2") else "v1", shard, loaded)
+    with pytest.raises(ProjectionReady):
+        getattr(layer, loader)(layer.weight, loaded, shard)
+    assert layer.weight.values == [9] * 7 + [0] * padding
     rank = 0 if shard == 4 else 3
     param_rank = 0 if shard == 4 else 5
     assert events == [
@@ -191,7 +214,9 @@ def test_actual_padding_survives_both_weight_loaders(
 @pytest.mark.parametrize("loader", ["weight_loader", "weight_loader_v2"])
 def test_actual_replicated_loader_restores_ranks_on_error(upstream_source_root, loader):
     layer, events = actual_linear(upstream_source_root, 2, failure=True)
+    loaded = object()
+    layer.observed_shard = ("v2" if loader.endswith("v2") else "v1", 4, loaded)
     with pytest.raises(ValueError, match="load failed"):
-        getattr(layer, loader)(layer.weight, object(), 4)
+        getattr(layer, loader)(layer.weight, loaded, 4)
     assert events[0][1:3] == (0, 0)
     assert (layer.tp_rank, layer.weight.tp_rank) == (3, 5)

@@ -467,7 +467,9 @@ def _build_wrapper(
             self, common_prefix_len, common_attn_metadata, fast_build
         )
         if self._sail_paged_schedule_key is not None and metadata.decode is not None:
-            metadata.decode._sail_paged_schedule_key = self._sail_paged_schedule_key
+            # The decode record is slotted upstream. Keep SAIL provenance on
+            # the step that owns it, not on a shared tensor or the decode row.
+            metadata._sail_paged_schedule_key = self._sail_paged_schedule_key
         return metadata
     finally:
         _current_builder.pop()

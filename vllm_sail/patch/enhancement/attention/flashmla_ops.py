@@ -79,6 +79,7 @@ _FLASHMLA_ALIAS_CONSUMERS = {
     ),
     "flash_mla_with_kvcache_fp8": ("vllm.v1.attention.backends.mla.flashmla",),
     "get_mla_metadata": (
+        "vllm.models.hy_v4.nvidia.flashmla_sparse",
         "vllm.v1.attention.backends.mla.flashmla",
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         "vllm.v1.attention.backends.mla.sparse_swa",

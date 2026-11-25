@@ -19,6 +19,7 @@ Deliberately inherited from ``NvmlCudaPlatform`` (do not re-implement):
 
 from __future__ import annotations
 
+import os
 from functools import cache
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -140,6 +141,13 @@ class PPUPlatform(NvmlCudaPlatform):
     ray_noset_device_env_vars: list[str] = [
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        # The SAIL FlashInfer distribution lacks the attention API imported by
+        # the upstream sampler probe. Default to the native V2 sampler on PPU,
+        # including in workers that construct a Sampler without a VllmConfig.
+        os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     @classmethod
     def is_ppu(cls) -> bool:

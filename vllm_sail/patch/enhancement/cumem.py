@@ -27,10 +27,6 @@ def install():
     def get_instance():
         return hggc.get_instance()
 
-    @patch(_MODULE, "get_pluggable_allocator", **_PATCH)
-    def get_pluggable_allocator(python_malloc_fn, python_free_func):
-        return hggc.get_pluggable_allocator(python_malloc_fn, python_free_func)
-
     @patch(
         "vllm.v1.executor.abstract",
         "Executor.sleep",

@@ -103,7 +103,7 @@ def test_engram_factory_keeps_offload_and_original_layouts(modules):
     modules("vllm_sail.models.deepseek_v41.config", int8_w8a8_enabled=lambda: False)
     modules(
         "vllm.triton_utils",
-        tl=SimpleNamespace(constexpr=object()),
+        tl=SimpleNamespace(constexpr=object(), uint8="uint8"),
         triton=SimpleNamespace(jit=lambda **kw: lambda fn: fn),
     )
     calls = []

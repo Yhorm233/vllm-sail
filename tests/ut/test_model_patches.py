@@ -42,7 +42,6 @@ MODELS_PATCH_DIR = (
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 EXPECTED_MODULES = {
-    "deepseek_mtp",
     "deepseek_v2",
     "deepseek_v4",
     "deepseek_v4_cache",
@@ -50,6 +49,7 @@ EXPECTED_MODULES = {
     "deepseek_v4_compressor",
     "deepseek_v4_graph_warmup",
     "deepseek_v41",
+    "deepseek_v41_device",
     "deepseek_v41_engram",
     "deepseek_v41_indexer",
     "deepseek_v41_int8",
@@ -67,7 +67,6 @@ EXPECTED_MODULES = {
     "qwen3_next",
     "qwen4_exp_qsa",
     "qwen4_exp_qsa_fp4",
-    "step3p5_mtp",
     "step5_dsa_backend",
     "step5_indexer_fp16",
     "step5_mtp",
@@ -305,10 +304,8 @@ def installed_model_patches():
 _EXPECTED_TARGETS = {
     "vllm.model_executor.models.deepseek_v2.Indexer.__init__",
     "vllm.model_executor.models.deepseek_v2.Indexer.forward",
-    "vllm.model_executor.models.deepseek_v2.DeepseekV2Model.__init__",
-    "vllm.model_executor.models.deepseek_v2.DeepseekV2Model.load_weights",
-    "vllm.model_executor.models.deepseek_mtp.DeepSeekMTP.__init__",
-    "vllm.model_executor.models.deepseek_mtp.DeepSeekMTP.load_weights",
+    "vllm.model_executor.models.deepseek_v2.init_indexer_wk_weights_proj",
+    "vllm.model_executor.models.deepseek_v2.Indexer.process_weights_after_loading",
     "vllm.models.deepseek_v4.nvidia.model._select_dsv4_attn_cls",
     (
         "vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner."
@@ -331,7 +328,6 @@ _EXPECTED_TARGETS = {
     "vllm.model_executor.models.qwen3_next.th_nvtx_range_pop",
     "vllm.models.qwen4_exp.nvidia.qsa.Qwen4ExpQSAImpl.__init__",
     "vllm.models.qwen4_exp.nvidia.qsa.Qwen4ExpQSAImpl.forward",
-    "vllm.model_executor.models.step3p5_mtp.Step3p5MTP.load_weights",
     "vllm.models.qwen4_exp.common.qsa_indexer.QSACompressedKeyCache.__init__",
     (
         "vllm.models.qwen4_exp.common.qsa_indexer."
@@ -371,7 +367,7 @@ _EXPECTED_TARGETS = {
     "vllm.models.step5.nvidia.ops.qkv_indexer_norm_rope.qkv_indexer_norm_rope",
     (
         "vllm.models.step5.common.sparse_summary_cache."
-        "Step5SparseSummaryCacheLayer.get_kv_cache_spec"
+        "Step5SparseSummaryCacheLayer.get_kv_cache_config"
     ),
     "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.decode_logits",
     "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.logits",
@@ -639,12 +635,12 @@ def test_step5_summary_cache_dtype_follows_fp16_switch(
     )
 
     config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
-    get_spec = Step5SparseSummaryCacheLayer.get_kv_cache_spec
+    get_spec = Step5SparseSummaryCacheLayer.get_kv_cache_config
     monkeypatch.delenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", raising=False)
-    byte_spec = get_spec(object(), config)
+    byte_spec = get_spec(object(), config).spec
     assert byte_spec.dtype == torch.uint8
     monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", mode)
-    half_spec = get_spec(object(), config)
+    half_spec = get_spec(object(), config).spec
     assert half_spec.dtype == torch.float16
     assert (half_spec.head_size, half_spec.tokens_per_state) == (
         byte_spec.head_size,
@@ -1045,10 +1041,14 @@ def _marlin_boundary(modules, root, preloaded):
     )
     modules("vllm.platforms", current_platform=platform)
     envs = modules("vllm_sail.envs", VLLM_SAIL_ENABLE_MOE_MARLIN=False)
+    modules(
+        "vllm.model_executor.layers.quantization.online.requantization",
+        is_requantization_source=lambda: False,
+    )
     utils_path = root / "vllm/model_executor/layers/quantization/utils"
     scalar_types = NS(
         **{
-            name: object()
+            name: type(name, (), {"size_bits": 4 if "4" in name else 8})()
             for name in (
                 "uint4",
                 "uint8",
@@ -1084,7 +1084,7 @@ def _marlin_boundary(modules, root, preloaded):
     nvfp4_consumers = (
         "vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4",
         "vllm.model_executor.layers.quantization.modelopt",
-        "vllm.model_executor.layers.quantization.online.lm_head",
+        "vllm.model_executor.layers.quantization.online.nvfp4",
         "vllm.model_executor.layers.quantization.quark.schemes.quark_nvfp4",
     )
     if preloaded:
@@ -1119,6 +1119,9 @@ def _marlin_boundary(modules, root, preloaded):
         (),
         {
             "_supports_current_device": staticmethod(device_check),
+            "executed_activation_key": staticmethod(
+                function(experts_path, "MarlinExpertsBase.executed_activation_key", {})
+            ),
             "_supports_quant_scheme": staticmethod(lambda *a: True),
         },
     )
@@ -1323,6 +1326,7 @@ def test_real_mxfp4_oracle_rejects_marlin_compute_and_keeps_auto_fallback(
                 "BATCHED_MARLIN",
                 "EMULATION",
                 "FALLBACK",
+                "NONE",
                 "XPU",
             )
         },
@@ -1397,6 +1401,8 @@ def _linear_selection_boundary(state, root, backend):
     linear = state.linear
     linear.envs = NS(VLLM_DISABLED_KERNELS=[], VLLM_BATCH_INVARIANT=False)
     linear.logger = NS(
+        debug=lambda *a, **kw: None,
+        debug_once=lambda *a, **kw: None,
         info=lambda *a, **kw: None,
         info_once=lambda *a, **kw: None,
         warning_once=lambda *a, **kw: None,
@@ -1470,6 +1476,14 @@ def test_real_mp_constructor_and_weight_creation_preserve_non_marlin_selection(
     state.dense.get_min_capability = classmethod(
         function(marlin_path, "MarlinLinearKernel.get_min_capability", {})
     )
+    for cls in (state.dense, triton):
+        cls.is_supported = classmethod(
+            function(
+                marlin_path.with_name("MPLinearKernel.py"),
+                "MPLinearKernel.is_supported",
+                {"current_platform": state.platform},
+            )
+        )
     linear._POSSIBLE_KERNELS = {state.platform._enum: [state.dense, triton]}
     linear._LINEAR_BACKEND_KERNEL_MAP = {"marlin": {state.dense}, "triton": {triton}}
     awq = method_name == "AutoAWQMarlinLinearMethod"
@@ -1637,6 +1651,16 @@ def _nvfp4_selection_boundary(state, modules, root, backend, has_humming):
                 },
             ),
         )
+    linear.LinearKernelOracle = NS(maybe_skip_for_requantization_source=lambda: False)
+    linear._first_usable_kernel = function(
+        root / "vllm/model_executor/kernels/linear/__init__.py",
+        "_first_usable_kernel",
+        linear.__dict__,
+    )
+    linear._check_activation_fallback = (
+        lambda cls, key: None
+    )  # Activation policy is outside the hardware-admission test.
+    linear.kNvfp4Dynamic = object()
     linear.NvFp4LinearLayerConfig = NS
     linear.prefers_humming = lambda *a: False
     linear._POSSIBLE_NVFP4_KERNELS = {
@@ -1772,7 +1796,7 @@ def _nvfp4_cutlass_bias_boundary(root, capability, padded_rows, padded_k, fail_a
 
     kernel_root = root / "vllm/model_executor/kernels/linear/nvfp4"
     utils = root / "vllm/model_executor/layers/quantization/utils/nvfp4_utils.py"
-    base_init = function(kernel_root / "base.py", "NvFp4LinearKernel.__init__", {})
+    base_init = function(kernel_root.parent / "base.py", "LinearKernel.__init__", {})
     base = type("NvFp4LinearKernel", (), {"__init__": base_init})
     namespace = {
         "NvFp4LinearKernel": base,
@@ -1785,6 +1809,17 @@ def _nvfp4_cutlass_bias_boundary(root, capability, padded_rows, padded_k, fail_a
         "nvfp4_weight_padding_bytes": function(utils, "nvfp4_weight_padding_bytes", {}),
         "slice_nvfp4_output": function(utils, "slice_nvfp4_output", {}),
     }
+    namespace.update(
+        torch=NS(Tensor=Tensor),
+        kNvfp4Dynamic="nvfp4",
+        as_quantized_activation=lambda value, key: None,
+        QuantizedActivation=lambda data, scale, dtype, shape, key: NS(
+            data=data, scale=scale, orig_dtype=dtype, orig_shape=shape
+        ),
+    )
+    base.prepare_input = function(
+        kernel_root / "base.py", "NvFp4LinearKernel.prepare_input", namespace
+    )
     cls = function(kernel_root / "cutlass.py", "CutlassNvFp4LinearKernel", namespace)
     config = object()
     kernel = cls(config)
@@ -1825,7 +1860,6 @@ def test_nvfp4_cutlass_bias_applies_once_after_padding_or_in_epilogue(
         f.layer.input_global_scale_inv,
         dict(
             is_sf_swizzled_layout=True,
-            backend="cutlass",
             padded_n=96 if padded_k else 64,
         ),
     )
@@ -1985,6 +2019,7 @@ def _real_nvfp4_consumer_call(state, root, consumer, use_a16):
         key_type = type("QuantKey", (), {})
         key = key_type()
         key.dtype = object()
+        provider.kInt8Static = object()
         provider.QuantKey, provider.FP4_DTYPE = key_type, key.dtype
         function(path, "select_linear_kernel", provider.__dict__)
         provider.Shapes = lambda *args: args
@@ -2034,14 +2069,14 @@ def _real_nvfp4_consumer_call(state, root, consumer, use_a16):
             invoke_args = {"activation_quant_key": provider.kNvfp4Dynamic}
             expected_call = ((), {})
         else:
-            path = base / "online/lm_head.py"
-            class_name = "_LMHeadNvfp4Method"
-            provider.OnlineLinearBase = object
-            packed, scales, global_scale = object(), object(), object()
-            provider._quantize_nvfp4 = lambda weight: (packed, scales, global_scale)
-            provider.replace_parameter = setattr
-            invoke_args = {}
-            expected_call = ((), {"use_a16": True})
+            path = base / "online/nvfp4.py"
+            class_name = "Nvfp4WeightOnlyOnlineLinearMethod"
+            provider.OnlineLinearBase = type(
+                "Base", (), {"create_weights": lambda self, *a, **kw: None}
+            )
+            provider.NVFP4_BLOCK_SIZE = 16
+            params_dtype = object()
+            expected_call = ((), {"use_a16": True, "act_dtype": params_dtype})
         tree = ast.Module(
             body=[
                 ast.ImportFrom(
@@ -2056,11 +2091,12 @@ def _real_nvfp4_consumer_call(state, root, consumer, use_a16):
             provider.__dict__,
         )
         cls = getattr(provider, class_name)
-        if consumer.endswith("lm_head"):
+        if consumer.endswith("online.nvfp4"):
             method = cls()
 
             def invoke():
-                return method.process_weights_after_loading(layer)
+                method.create_weights(layer, 128, [128], 128, 128, params_dtype)
+                return method
         else:
 
             def invoke():
@@ -2109,8 +2145,8 @@ def test_real_nvfp4_consumers_keep_actual_call_shapes_and_ppu_selection(
             assert len(call.exposed) == 1
             assert isinstance(call.exposed[0], linear.HummingNvFp4LinearKernel)
         else:
-            assert call.processed == [call.layer]
-            assert not hasattr(call.layer, "input_global_scale")
+            assert isinstance(result.kernel, linear.HummingNvFp4LinearKernel)
+            assert result.kernel.config.act_dtype is call.expected_call[1]["act_dtype"]
     assert call.selected == [call.expected_call]
 
 
@@ -2166,7 +2202,7 @@ def _glm_mtp_quant_boundary(modules, patch_utils_module, root, torch):
     mapper_module = modules(
         "vllm.model_executor.models.utils", field=field, replace=replace, logger=logger
     )
-    mapper = dataclass(
+    mapper = dataclass(slots=True)(
         function(model_dir / "utils.py", "WeightsMapper", mapper_module.__dict__)
     )
     mapper_module.WeightsMapper = mapper
@@ -2287,8 +2323,12 @@ def test_glm_mtp_real_mro_applies_rename_only_mapping_before_predictor(
     patch_module._enable_supports_quant()
     patch_module._enable_packed_modules_mapping()
     assert patch_utils_module.PATCH_REGISTRY == records
-    assert all(r.affected_versions == ">=0.32.0,<0.33.0" for r in records)
+    assert all("e83d82a" in r.affected_versions for r in records)
     mapper = captured.hf_to_vllm_mapper
+    assert not hasattr(mapper, "__dict__")
+    assert f"{state.module.__name__}.Glm5NextMTP.hf_to_vllm_mapper" in getattr(
+        mapper, patch_utils_module.PATCH_MARKER
+    )
     # 加载专用丢弃/堆叠/变换不能流入量化层列表；保留原 mapper 以独立比较。
     mapper.orig_to_new_substr = {"load_only": None}
     mapper.orig_to_new_stacked = {"gate_proj": ("wrong_fused", 0)}
@@ -2393,6 +2433,11 @@ def test_glm_real_decoder_keeps_mtp_topk_layout_and_unsummed_residual(
             "torch": torch,
             "_is_moe": lambda config: False,
             "_is_kda_layer": is_kda,
+            "_mla_dequantized_at_load": function(
+                upstream_source_root / "vllm/models/glm5next/common/model.py",
+                "_mla_dequantized_at_load",
+                {},
+            ),
             "Glm5NextMLAAttention": Attention,
             "Glm5NextMLP": MLP,
             "Glm5NextMoE": type("MoE", (), {}),
@@ -2435,7 +2480,7 @@ def test_glm_real_decoder_keeps_mtp_topk_layout_and_unsummed_residual(
     assert owner.layer_kind == "mla" and len(attention_calls) == len(mlp_calls) == 1
     assert attention_calls[0]["shardq_eligible"] is (not is_mtp)
     assert attention_calls[0]["topk_indices_buffer"] is topk
-    assert attention_calls[0]["quant_config"] is None
+    assert attention_calls[0]["quant_config"] is quant
     assert attention_calls[0]["cache_config"] is cache
     assert mlp_calls[0]["quant_config"] is quant
     assert owner.self_attn.o_proj.reduce_results is (is_mtp or not sequence_parallel)

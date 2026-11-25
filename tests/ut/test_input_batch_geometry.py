@@ -1,209 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the one-argument batch reinitialization call and PPU invalidation."""
+"""Exercise real token ownership and request transport across the scheduler boundary."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace as NS
 
 import pytest
 
 from tests.support.source import definition, function
-
-PATCH = "vllm_sail/patch/_upstream/runtime.py"
-
-
-@pytest.fixture
-def batch_geometry():
-    def make(case, signature=None):
-        calls, warmup = [], []
-        token_mode = object()
-        config = NS(reasoning_config=object())
-        old_batch = NS(
-            max_model_len=1024,
-            logitsprocs=object(),
-            logitsprocs_need_output_token_ids=True,
-        )
-
-        @contextmanager
-        def activate():
-            warmup.append("enter")
-            yield
-            warmup.append("exit")
-
-        def allocate(**kwargs):
-            if signature is not None:
-                signature.bind(None, **kwargs)
-            assert "kernel_block_sizes" not in kwargs
-            assert "use_replayssm" not in kwargs
-            calls.append(kwargs)
-            return NS(**kwargs)
-
-        spec = NS(
-            block_size=512 if case == "block-geometry" else 256,
-            max_num_blocks_per_req=lambda config, max_len: 8,
-        )
-        cache = NS(kv_cache_groups=[NS(kv_cache_spec=spec)])
-        owner = NS(
-            max_model_len=2048 if case == "context-only" else 1024,
-            max_encoder_len=0,
-            _init_block_sizes=[256],
-            _init_max_num_blocks=[8],
-            _init_slot_mapping_modes=[token_mode],
-            cp_kv_cache_interleave_size=1,
-            parallel_config=NS(cp_kv_cache_interleave_size=1),
-            input_batch=old_batch,
-            vllm_config=config,
-            jit_warmup_registry=NS(activate=activate),
-            max_num_reqs=128,
-            max_num_tokens=1024,
-            device=object(),
-            model_config=NS(get_vocab_size=lambda: 128),
-            num_spec_tokens=7,
-            is_pooling_model=False,
-            cache_config=NS(use_replayssm=False),
-        )
-        namespace = {
-            "KVCacheSpecKind": NS(ENCODER_ONLY_ATTENTION="encoder", MAMBA="mamba"),
-            "SlotMappingMode": NS(NONE=object(), TOKEN_TO_KV_SLOT=token_mode),
-            "get_kv_cache_spec_kind": lambda spec: "attention",
-            "InputBatch": allocate,
-        }
-        return owner, cache, namespace, calls, warmup, old_batch
-
-    return make
-
-
-def check_body(load, batch_geometry, case, expected, signature=None):
-    owner, cache, namespace, calls, warmup, old = batch_geometry(case, signature)
-    load(namespace)(owner, cache)
-    assert len(calls) == expected
-    assert warmup == (["enter", "exit"] if expected else [])
-    if expected:
-        assert owner.input_batch.max_model_len == owner.max_model_len
-        assert calls[0]["logitsprocs"] is old.logitsprocs
-        assert calls[0]["num_spec_tokens"] == 7
-        assert calls[0]["block_sizes"] == [512 if case == "block-geometry" else 256]
-    else:
-        assert owner.input_batch is old
-
-
-@pytest.mark.parametrize(
-    "case,expected", [("stable", 0), ("context-only", 1), ("block-geometry", 1)]
-)
-def test_one_argument_call_keeps_ppu_context_invalidation(
-    batch_geometry, case, expected
-):
-    check_body(
-        lambda ns: function(PATCH, "may_reinitialize_input_batch", ns),
-        batch_geometry,
-        case,
-        expected,
-    )
-
-
-def test_context_only_invalidation_check_detects_removed_condition(
-    batch_geometry, tmp_path
-):
-    import ast
-
-    from tests.support.source import ROOT
-
-    tree = ast.parse((ROOT / PATCH).read_text())
-    body = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "may_reinitialize_input_batch"
-    )
-    branch = next(node for node in body.body if isinstance(node, ast.If))
-    # The fault removes the context comparison while retaining block geometry.
-    branch.test.values.pop()
-    source = tmp_path / "runtime.py"
-    source.write_text(ast.unparse(ast.fix_missing_locations(tree)))
-    with pytest.raises(AssertionError):
-        check_body(
-            lambda ns: function(source, "may_reinitialize_input_batch", ns),
-            batch_geometry,
-            "context-only",
-            1,
-        )
-
-
-@pytest.mark.upstream_source
-@pytest.mark.parametrize(
-    "case,expected", [("stable", 0), ("context-only", 0), ("block-geometry", 1)]
-)
-def test_current_upstream_call_and_input_batch_abi(
-    upstream_source_root, batch_geometry, case, expected
-):
-    import ast
-    import inspect
-
-    from tests.support.source import definition
-
-    source = upstream_source_root / "vllm/v1/worker/gpu_model_runner.py"
-    node = definition(source, "GPUModelRunner.may_reinitialize_input_batch")
-    node.decorator_list = []
-    batch_source = upstream_source_root / "vllm/v1/worker/gpu_input_batch.py"
-    constructor = definition(batch_source, "InputBatch.__init__")
-    constructor.body = [ast.Pass()]
-    constructor.decorator_list = []
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0
-            ),
-            constructor,
-            node,
-        ],
-        type_ignores=[],
-    )
-    namespace = {}
-    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
-    signature = inspect.signature(namespace["__init__"])
-
-    def load(values):
-        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), values)
-        return values["may_reinitialize_input_batch"]
-
-    check_body(load, batch_geometry, case, expected, signature)
-    plugin_expected = 1 if case != "stable" else 0
-    check_body(
-        lambda ns: function(PATCH, "may_reinitialize_input_batch", ns),
-        batch_geometry,
-        case,
-        plugin_expected,
-        signature,
-    )
-
-
-@pytest.mark.upstream_source
-def test_complete_reinitialization_body_keeps_only_context_invalidation(
-    upstream_source_root,
-):
-    import ast
-
-    from tests.support.source import ROOT, definition
-
-    copied = definition(ROOT / PATCH, "may_reinitialize_input_batch")
-    original = definition(
-        upstream_source_root / "vllm/v1/worker/gpu_model_runner.py",
-        "GPUModelRunner.may_reinitialize_input_batch",
-    )
-    branch = next(node for node in copied.body if isinstance(node, ast.If))
-    assert ast.unparse(branch.test.values[-1]) == (
-        "max_model_len != self.input_batch.max_model_len"
-    )
-    branch.test.values.pop()
-    # Extraction out of the class changes only docstring indentation.
-    import inspect
-
-    assert inspect.cleandoc(ast.get_docstring(copied, clean=False)) == inspect.cleandoc(
-        ast.get_docstring(original, clean=False)
-    )
-    copied.body[0] = original.body[0]
-    assert ast.dump(copied, include_attributes=False) == ast.dump(
-        original, include_attributes=False
-    )
 
 
 def _source_classes(modules, name, path, names, **globals_):
@@ -297,14 +99,6 @@ def _token_request_boundary(modules, root):
         cached_property=cached_property,
         replace=replace,
     )
-    worker = _source_classes(
-        modules,
-        "vllm.v1.worker.gpu_input_batch",
-        root / "vllm/v1/worker/gpu_input_batch.py",
-        ["CachedRequestState"],
-        dataclass=dataclass,
-        length_from_prompt_token_ids_or_embeds=length,
-    )
 
     def sampling(**overrides):
         return NS(
@@ -330,7 +124,6 @@ def _token_request_boundary(modules, root):
         token=token,
         request=request,
         output=output,
-        worker=worker,
         gc_calls=gc_calls,
         sampling=sampling,
         make=make,
@@ -349,7 +142,6 @@ def test_real_token_buffer_copies_remain_resizable_at_tensor_and_pickle_boundari
 
     np = pytest.importorskip("numpy")
     torch = pytest.importorskip("torch")
-    from tests.support.source import ROOT
 
     provider = _token_buffer_provider(modules, upstream_source_root)
     tokens = provider.TokenBuffer(np.array([1, 2, 3], dtype=np.int32))
@@ -378,8 +170,6 @@ def test_real_token_buffer_copies_remain_resizable_at_tensor_and_pickle_boundari
     provider.extend_from_slice(extended, tokens, 1, 4)
     assert extended == [2, 3, 4]
     assert list(provider.token_slice(tokens, 1, 3)) == [2, 3]
-    # SAIL 不替换 token 存储或 tensorize；真实 provider 的复制行为必须保留。
-    assert "token_ids_to_tensor" not in (ROOT / PATCH).read_text()
 
 
 @pytest.mark.upstream_source
@@ -520,27 +310,40 @@ def test_real_new_request_pickle_keeps_prefill_alias_and_worker_token_boundaries
         value is received.prefill_token_ids or value is received.prompt_token_ids
         for value in state.gc_calls
     )
-    worker = state.worker.CachedRequestState(
-        req_id=received.req_id,
-        prompt_token_ids=received.prompt_token_ids,
-        mm_features=[],
-        sampling_params=received.sampling_params,
-        generator=None,
-        block_ids=received.block_ids,
-        num_computed_tokens=0,
-        output_token_ids=[90],
-        prompt_embeds=received.prompt_embeds,
-        prompt_is_token_ids=received.prompt_is_token_ids,
+    # MRv2 passes the deserialized prefill buffer directly to request state.
+    recorded = []
+
+    def noop(*a, **kw):
+        return None
+
+    owner = NS(
+        req_states=NS(
+            add_request=lambda **kw: recorded.append(kw),
+            req_id_to_index={received.req_id: 0},
+            apply_staged_writes=noop,
+        ),
+        _remove_request=noop,
+        adaptive_verification=None,
+        speculator=None,
+        pooling_runner=None,
+        encoder_cache=None,
+        model_state=NS(
+            add_request=noop, get_mrope_position_delta=noop, apply_staged_writes=noop
+        ),
+        block_tables=NS(append_block_ids=noop),
+        lora_state=NS(add_request=noop),
+        is_last_pp_rank=False,
+        sampler=None,
     )
-    assert worker.num_prompt_tokens == 3 and worker.num_tokens == 4
-    if mode == "embeds":
-        with pytest.raises(ValueError, match="ID is unknown"):
-            worker.get_token_id(0)
-    else:
-        assert worker.get_token_id(0) == 10
-    assert worker.get_token_id(3) == 90 and worker.get_token_id(4) == -1
-    received.prefill_token_ids.extend([100])
-    assert request._all_token_ids[-1] == 70
+    add = function(
+        upstream_source_root / "vllm/v1/worker/gpu/model_runner.py",
+        "GPUModelRunner.add_requests",
+        {},
+    )
+    add(owner, NS(scheduled_new_reqs=[received]))
+    assert recorded[0]["prompt_len"] == 3
+    assert recorded[0]["all_token_ids"] is received.prefill_token_ids
+    assert recorded[0]["num_computed_tokens"] == received.num_computed_tokens
 
 
 def _request_block_hasher(state, root, lookahead=0):
@@ -666,7 +469,13 @@ def test_real_streaming_session_mutates_owned_buffers_and_rehashes_kept_output(
     feature = NS(mm_position=Position(0, 1), identifier="session-image")
     update.mm_features = [feature] if update_tokens else []
     queued = object()
-    scheduler = NS(hash_block_size=2, num_waiting_for_streaming_input=3, log_stats=True)
+    scheduler = NS(
+        hash_block_size=2,
+        num_waiting_for_streaming_input=3,
+        log_stats=True,
+        num_sampled_tokens_per_step=1,
+        max_model_len=16,
+    )
     apply = function(
         upstream_source_root / "vllm/v1/core/sched/scheduler.py",
         "Scheduler._update_request_as_session",
@@ -677,7 +486,7 @@ def test_real_streaming_session_mutates_owned_buffers_and_rehashes_kept_output(
             "EngineCoreEventType": NS(QUEUED=queued),
         },
     )
-    apply(scheduler, session, update)
+    assert apply(scheduler, session, update) is True
     expected = [10, 20, 30, 40, 50] + (update_tokens or [])
     assert session.prompt_token_ids is prompt and session._all_token_ids is all_tokens
     assert session._output_token_ids is outputs
@@ -714,17 +523,14 @@ def test_real_streaming_session_mutates_owned_buffers_and_rehashes_kept_output(
 
 @pytest.mark.upstream_source
 @pytest.mark.requires_runtime
-@pytest.mark.parametrize("use_v2", [False, True])
 @pytest.mark.parametrize("use_pp", [False, True])
 @pytest.mark.parametrize("async_scheduling", [False, True])
 def test_real_cached_scheduler_payloads_copy_int32_tokens_before_worker_transport(
     modules,
     upstream_source_root,
-    use_v2,
     use_pp,
     async_scheduling,
 ):
-    import itertools
     import pickle
 
     state = _token_request_boundary(modules, upstream_source_root)
@@ -742,35 +548,24 @@ def test_real_cached_scheduler_payloads_copy_int32_tokens_before_worker_transpor
 
     scheduler = NS(
         use_pp=use_pp,
-        use_v2_model_runner=use_v2,
         scheduler_config=NS(async_scheduling=async_scheduling),
-        prev_step_scheduled_req_ids={"running"},
     )
     make = function(
         upstream_source_root / "vllm/v1/core/sched/scheduler.py",
         "Scheduler._make_cached_request_data",
-        {"itertools": itertools, "CachedRequestData": state.output.CachedRequestData},
+        {"CachedRequestData": state.output.CachedRequestData},
     )
     payload = make(
         scheduler,
-        [running],
-        [resumed],
+        [running, resumed],
         {"running": 3, "resumed": 2},
         {"running": [1], "resumed": [2]},
         {"running": NS(get_block_ids=blocks), "resumed": NS(get_block_ids=blocks)},
     )
     expected_new = [[40, 50], [80]] if use_pp and not async_scheduling else []
-    expected_all = {} if use_v2 else {"resumed": [60, 70, 80]}
-    assert payload.req_ids == ["running", "resumed"] and payload.resumed_req_ids == {
-        "resumed"
-    }
-    assert (
-        payload.new_token_ids == expected_new and payload.all_token_ids == expected_all
-    )
-    assert all(
-        type(value) is list
-        for value in [*payload.new_token_ids, *payload.all_token_ids.values()]
-    )
+    assert payload.req_ids == ["running", "resumed"]
+    assert payload.new_token_ids == expected_new
+    assert all(type(value) is list for value in payload.new_token_ids)
     assert payload.num_computed_tokens == [3, 2] and payload.num_output_tokens == [4, 1]
     assert payload.new_block_ids == [None, None] and block_calls == [True, True]
     assert payload.num_reqs == 2 and not payload.is_context_phase("running")
@@ -778,141 +573,3 @@ def test_real_cached_scheduler_payloads_copy_int32_tokens_before_worker_transpor
     running.append_output_token_ids(90)
     resumed.append_output_token_ids(100)
     assert payload.new_token_ids == transported.new_token_ids == expected_new
-    assert payload.all_token_ids == transported.all_token_ids == expected_all
-
-
-@pytest.mark.upstream_source
-@pytest.mark.requires_runtime
-@pytest.mark.parametrize("mode", ["prompt", "mixed", "embeds"])
-@pytest.mark.parametrize("reuse_slot", [False, True])
-def test_real_input_batch_copies_token_buffers_and_keeps_logits_processor_views(
-    modules, upstream_source_root, mode, reuse_slot
-):
-    """真实完整 add/register body；构造器分配、block table 和 SamplingParams 是边界。"""
-    state = _token_request_boundary(modules, upstream_source_root)
-    np = state.np
-    embeds = np.zeros((3, 2)) if mode != "prompt" else None
-    mask = [True, False, True] if mode == "mixed" else None
-    prompt = None if mode == "embeds" else state.token.TokenBuffer([10, 20, 30])
-    params = NS(
-        sampling_type="greedy",
-        temperature=0.0,
-        top_p=1.0,
-        top_k=0,
-        frequency_penalty=0.0,
-        presence_penalty=0.0,
-        repetition_penalty=1.0,
-        logprobs=None,
-        logprob_token_ids=None,
-        allowed_token_ids=None,
-        bad_words_token_ids=None,
-    )
-    request = state.worker.CachedRequestState(
-        req_id="buffer",
-        prompt_token_ids=prompt,
-        prompt_embeds=embeds,
-        prompt_is_token_ids=mask,
-        mm_features=[],
-        sampling_params=params,
-        generator=None,
-        block_ids=([1, 2],),
-        num_computed_tokens=2,
-        output_token_ids=[40, 50],
-    )
-    row = 1 if reuse_slot else 0
-    builder = NS(
-        pop_removed=lambda: row if reuse_slot else None, batch_changed=False, added=[]
-    )
-    block_calls = []
-
-    def add_row(blocks, index):
-        block_calls.append((blocks, index))
-
-    batch = NS(
-        num_reqs=1 if reuse_slot else 0,
-        max_num_reqs=2,
-        vocab_size=128,
-        _req_ids=["existing", None] if reuse_slot else [],
-        req_output_token_ids=[[], None] if reuse_slot else [],
-        spec_token_ids=[[], [99]],
-        req_id_to_index={},
-        batch_update_builder=builder,
-        token_ids_cpu=np.full((2, 8), -777, dtype=np.int32),
-        is_token_ids=np.zeros((2, 8), dtype=bool),
-        req_prompt_embeds={},
-        block_table=NS(add_row=add_row),
-        generators={},
-        num_logprobs={},
-        logprob_token_ids={},
-        bad_words_token_ids={},
-        lora_id_to_request_ids={},
-        lora_id_to_lora_request={},
-    )
-    for name in (
-        "num_prompt_tokens",
-        "num_tokens_no_spec",
-        "num_computed_tokens_cpu",
-        "temperature_cpu",
-        "top_p_cpu",
-        "top_k_cpu",
-        "frequency_penalties_cpu",
-        "presence_penalties_cpu",
-        "repetition_penalties_cpu",
-        "num_accepted_tokens_cpu",
-        "request_lora_mapping",
-    ):
-        setattr(batch, name, np.zeros(2))
-    for name in (
-        "greedy_reqs",
-        "random_reqs",
-        "top_p_reqs",
-        "top_k_reqs",
-        "frequency_penalties_reqs",
-        "presence_penalties_reqs",
-        "repetition_penalties_reqs",
-    ):
-        setattr(batch, name, set())
-    source = upstream_source_root / "vllm/v1/worker/gpu_input_batch.py"
-    register = function(source, "InputBatch._register_add_request", {})
-    batch._register_add_request = lambda value: register(batch, value)
-    length = function(
-        upstream_source_root / "vllm/utils/__init__.py",
-        "length_from_prompt_token_ids_or_embeds",
-        {},
-    )
-    add = function(
-        source,
-        "InputBatch.add_request",
-        {
-            "length_from_prompt_token_ids_or_embeds": length,
-            "SamplingType": NS(GREEDY="greedy"),
-        },
-    )
-    assert add(batch, request) == row
-    assert batch._req_ids[row] == "buffer" and batch.req_id_to_index["buffer"] == row
-    assert batch.req_output_token_ids[row] is request.output_token_ids
-    assert batch.spec_token_ids[row] == []
-    assert builder.batch_changed and builder.added == [
-        (row, params, prompt, request.output_token_ids)
-    ]
-    expected = ([-777] * 3 if mode == "embeds" else [10, 20, 30]) + [40, 50]
-    assert batch.token_ids_cpu[row, :5].tolist() == expected
-    assert batch.token_ids_cpu[row, 5:].tolist() == [-777] * 3
-    expected_mask = ([False] * 3 if mode == "embeds" else mask or [True] * 3) + [
-        True
-    ] * 2
-    assert batch.is_token_ids[row, :5].tolist() == expected_mask
-    assert batch.num_prompt_tokens[row] == 3 and batch.num_tokens_no_spec[row] == 5
-    assert batch.num_computed_tokens_cpu[row] == 2 and block_calls == [
-        (request.block_ids, row)
-    ]
-    assert batch.num_accepted_tokens_cpu[row] == 1 and batch.greedy_reqs == {"buffer"}
-    if embeds is not None:
-        assert batch.req_prompt_embeds[row] is embeds
-    request.output_token_ids.append(60)
-    if prompt is not None:
-        prompt.extend([70])
-        prompt[0] = 99
-        assert builder.added[0][2] is prompt and list(prompt) == [99, 20, 30, 70]
-    assert builder.added[0][3] == [40, 50, 60]
-    assert batch.token_ids_cpu[row, :5].tolist() == expected

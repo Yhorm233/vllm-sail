@@ -23,6 +23,9 @@ model:
     - --trust-remote-code
     - --tensor-parallel-size
     - "2"
+    # The Python recipe serves text; image/video preprocessing requires Rust.
+    - --limit-mm-per-prompt
+    - '{"image":0,"video":0}'
     - --block-size
     - "256"
     - --max-model-len

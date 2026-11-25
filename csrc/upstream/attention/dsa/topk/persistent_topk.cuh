@@ -347,7 +347,9 @@ __device__ __noinline__ overflow::MediumResume histogram_medium_topk(
 
 __device__ __forceinline__ int ld_acquire(int* ptr) {
   int state = 0;
-#if (COMPATIBLE_ARCH >= 700)
+#if defined(USE_ROCM)
+  state = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+#elif (COMPATIBLE_ARCH >= 700)
   asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
                : "=r"(state)
                : "l"(ptr));
@@ -563,7 +565,7 @@ __device__ void radix_topk(const InT* __restrict__ row_input,
     if (shared_ordered[i] > ordered_pivot) my_gt_count++;
   }
   for (int offset = 16; offset > 0; offset /= 2) {
-    my_gt_count += __shfl_down_sync(0xffffffff, my_gt_count, offset);
+    my_gt_count += VLLM_SHFL_DOWN_SYNC_WIDTH(my_gt_count, offset, 32);
   }
   if (tx % 32 == 0 && my_gt_count > 0) {
     atomicAdd(&suffix_sum[0], my_gt_count);
@@ -1149,7 +1151,8 @@ hggcError_t FilteredTopKRaggedTransform(const DType* input,
       }                                                                     \
     }                                                                       \
     FLASHINFER_CUDA_CALL(hggcFuncSetAttribute(                              \
-        kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
+        reinterpret_cast<const void*>(kernel),                              \
+        hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));           \
     FLASHINFER_CUDA_CALL(hggcLaunchKernel((void*)kernel, grid, block, args, \
                                           smem_size, stream));              \
     return hggcSuccess;                                                     \

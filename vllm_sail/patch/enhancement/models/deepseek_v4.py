@@ -210,6 +210,7 @@ def compress_norm_rope_store_triton(
     quant_block,
     token_stride,
     scale_dim,
+    fp8_scale=None,
 ):
     implementation = getattr(compress_norm_rope_store_triton, PATCH_MARKER)[
         f"{_K_MODULE}.compress_norm_rope_store_triton"
@@ -232,6 +233,8 @@ def compress_norm_rope_store_triton(
     ):
         from vllm_sail.models.deepseek_v4.ops.cache import compress_mla_rope_store_fp8
 
+        if fp8_scale is not None:
+            raise NotImplementedError("810E packed MLA does not support a plain FP8 KV scale")
         implementation = compress_mla_rope_store_fp8
     return implementation(
         state_cache,
@@ -256,6 +259,7 @@ def compress_norm_rope_store_triton(
         quant_block,
         token_stride,
         scale_dim,
+        **({"fp8_scale": fp8_scale} if fp8_scale is not None and head_dim != 128 else {}),
     )
 
 

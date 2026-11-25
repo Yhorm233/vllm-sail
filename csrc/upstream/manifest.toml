@@ -18,7 +18,7 @@ schema = 1
 
 # The exact upstream vLLM tag the corpus is translated from. Bumping this means
 # re-running tools/port_upstream_kernels.py and reviewing the diff.
-upstream_ref = "047f6bfbb22cf4815162125f107e6dd90c72478a"
+upstream_ref = "e83d82a46b50a27534584a8bf4c6dd2d2cb9eeb5"
 
 # Compiled tiers, in the order CMake receives them. `x` must never appear here.
 # Must stay above [tiers]: a bare key after a table header belongs to that table.
@@ -75,7 +75,7 @@ _moe_C_stable_libtorch = "_upstream_moe_C"
 
 # HGGC 的兼容 SM80/89 标识不能选择 NVIDIA 的 redux 指令。
 # 保留同一 32-lane 归约，使用 upstream 现有 shuffle fallback。
-[overlay.replace_text."csrc/topk_histogram_4096.cuh"]
+[overlay.replace_text."csrc/attention/dsa/topk/topk_histogram_4096.cuh"]
 "warp_reduce_sum_full(uint32_t v) {\n#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)" = "warp_reduce_sum_full(uint32_t v) {\n#if !defined(__HGGCCC__) && defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)"
 "warp_reduce_or_full(uint32_t v) {\n#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)" = "warp_reduce_or_full(uint32_t v) {\n#if !defined(__HGGCCC__) && defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 800)"
 
@@ -145,13 +145,6 @@ _moe_C_stable_libtorch = "_upstream_moe_C"
 "void cp_async_wait_group() {\n#if defined(COMPATIBLE_ARCH)" = "void cp_async_wait_group() {\n#if defined(__HGGCCC__)\n  __syncwarp();\n#elif defined(COMPATIBLE_ARCH)"
 
 [overlay.replace_text."csrc/fused_qknorm_rope_kernel.cu"]
-"#endif\n\nnamespace tensorrt_llm::common {" = "#endif\n\n// HGGC requires every named shuffle/barrier lane to participate. Partial\n// rotary dimensions leave only the low rotary_lanes lanes in the RoPE branch.\n#if defined(__HGGCCC__)\n  #define VLLM_SAIL_ROPE_MASK (FINAL_MASK >> (32 - rotary_lanes))\n  #define VLLM_SAIL_ROPE_SYNCWARP() __syncwarp(VLLM_SAIL_ROPE_MASK)\n#else\n  #define VLLM_SAIL_ROPE_MASK FINAL_MASK\n  #define VLLM_SAIL_ROPE_SYNCWARP() __syncwarp()\n#endif\n\nnamespace tensorrt_llm::common {"
-"// Before data exchange with in warp, we need to sync.\n        __syncwarp();" = "// Before data exchange with in warp, we need to sync.\n        VLLM_SAIL_ROPE_SYNCWARP();"
-"\n          elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);" = "\n          elements2[i] = __shfl_xor_sync(VLLM_SAIL_ROPE_MASK, elements[i], pairOffset);"
-"// __shfl_xor_sync does not provide memfence. Need to sync again.\n        __syncwarp();" = "// __shfl_xor_sync does not provide memfence. Need to sync again.\n        VLLM_SAIL_ROPE_SYNCWARP();"
-"        } else {\n          __syncwarp();\n          int const pairOffset" = "        } else {\n          VLLM_SAIL_ROPE_SYNCWARP();\n          int const pairOffset"
-"\n            elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);" = "\n            elements2[i] = __shfl_xor_sync(VLLM_SAIL_ROPE_MASK, elements[i], pairOffset);"
-"          __syncwarp();\n        }\n      }\n\n      // Store." = "          VLLM_SAIL_ROPE_SYNCWARP();\n        }\n      }\n\n      // Store."
 "  // Select token_heads_per_warp: forced value if >0, else auto-select." = "  if (num_tokens == 0) return;\n\n  // Select token_heads_per_warp: forced value if >0, else auto-select."
 
 # Map GDN's PTX copies and group completion to the SAIL SDK pipeline on HGGC.
@@ -219,6 +212,13 @@ hazards = ["cub"]
 ops = ["fused_add_rms_norm", "rms_norm"]
 
 [[entry]]
+path = "csrc/gdn/fused_gdn_decode_16bit_kernel.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Defines the FP16 and BF16 unsplit launch specializations referenced by fused_gdn_decode_kernel; both translation units must be linked into _upstream_C."
+
+[[entry]]
 path = "csrc/gdn/fused_gdn_decode_kernel.cu"
 tier = "a"
 hazards = ["cp_async", "ptx"]
@@ -264,7 +264,7 @@ notes = "Step5 attention dependency: per-head Q/K RMSNorm, partial NeoX RoPE and
 path = "csrc/pos_encoding_kernels.cu"
 tier = "a"
 hazards = []
-ops = ["rotary_embedding"]
+ops = ["rotary_embedding", "rotary_embedding_out"]
 
 [[entry]]
 path = "csrc/cache_kernels.cu"
@@ -291,14 +291,16 @@ notes = "One 1707-line CUTLASS-free TU carrying five of the ops the plugin alrea
 path = "csrc/sampler.cu"
 tier = "a"
 hazards = ["cub"]
-ops = [
-    "apply_repetition_penalties_",
-    "top_k_per_row_decode",
-    "top_k_per_row_prefill",
-]
+ops = ["apply_repetition_penalties_"]
 
 [[entry]]
-path = "csrc/topk.cu"
+path = "csrc/attention/dsa/topk/top_k_per_row.cu"
+tier = "a"
+hazards = ["cub"]
+ops = ["top_k_per_row_decode", "top_k_per_row_prefill"]
+
+[[entry]]
+path = "csrc/attention/dsa/topk/topk.cu"
 tier = "a"
 hazards = ["cub", "ptx"]
 ops = ["persistent_topk"]
@@ -568,7 +570,7 @@ ops = ["qwen4_exp_hc_up_gate_mix"]
 notes = "SM100 专用 TMA/TMEM、tcgen05 和 cluster launch；PPU 80/89 不满足真实设备门控，保留 ReplicatedLinear 与 hc_gate_mix fallback。"
 
 [[entry]]
-path = "csrc/fused_mqa_topk/fused_mqa_topk.cu"
+path = "csrc/attention/dsa/fused_mqa_topk/fused_mqa_topk.cu"
 tier = "x"
 hazards = ["tcgen05", "mma", "ptx"]
 ops = ["fused_mqa_topk_prefill"]

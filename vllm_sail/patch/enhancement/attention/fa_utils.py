@@ -22,9 +22,6 @@ def get_flash_attn_version(
     head_size: int | None = None,
     head_size_v: int | None = None,
     has_sinks: bool = False,
-    requires_softcap: bool = False,
-    kv_cache_block_size: int | None = None,
-    supports_fa4_hd256: bool = False,
 ) -> int | None:
     if current_platform.is_xpu():
         return 2
@@ -126,21 +123,6 @@ def get_flash_attn_version(
             )
             fa_version = 2
 
-        if fa_version == 4 and uses_fa4_hd256_kernel(head_size, head_size_v):
-            if not supports_fa4_hd256:
-                fa_version = 2
-            elif (
-                reason := _fa4_hd256_fallback_reason(
-                    has_sinks, requires_softcap, kv_cache_block_size, vllm_config
-                )
-            ) is not None:
-                logger.warning_once(
-                    "FA4's Blackwell head_size=256 kernel does not support %s, "
-                    "defaulting to FA version 2.",
-                    reason,
-                )
-                fa_version = 2
-
         # FA4 head dimensions on Blackwell are limited by TMEM capacity.
         if (
             fa_version == 4
@@ -160,8 +142,8 @@ def get_flash_attn_version(
             fa_version = 2
 
         if not is_fa_version_supported(fa_version):
-            logger.error(
-                "Cannot use FA version %d is not supported due to %s",
+            logger.warning_once(
+                "FlashAttention %d is not supported (%s); it will not be used.",
                 fa_version,
                 fa_version_unsupported_reason(fa_version),
             )
@@ -188,9 +170,6 @@ def flash_attn_supports_kv_cache_dtype(
     head_size: int | None = None,
     head_size_v: int | None = None,
     has_sinks: bool = False,
-    requires_softcap: bool = False,
-    kv_cache_block_size: int | None = None,
-    supports_fa4_hd256: bool = False,
 ) -> bool:
     if kv_cache_dtype == "fp8_e5m2":
         return False
@@ -201,9 +180,6 @@ def flash_attn_supports_kv_cache_dtype(
         head_size=head_size,
         head_size_v=head_size_v,
         has_sinks=has_sinks,
-        requires_softcap=requires_softcap,
-        kv_cache_block_size=kv_cache_block_size,
-        supports_fa4_hd256=supports_fa4_hd256,
     )
     is_sm90 = current_platform.is_device_capability_family(90)
     sm90_fp8_kv_supported = fa_version == 3 or (

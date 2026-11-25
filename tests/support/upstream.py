@@ -311,5 +311,16 @@ def compatibility_problems(replacement: ast.AST, upstream: ast.AST) -> list[str]
                         f"{len(call_args)} positional, keywords {sorted(call_kwargs)}: {exc}"
                     )
                     continue
+                # Older inspect versions can leave a required positional-only
+                # parameter unbound when its name was passed through **kwargs.
+                for param in rep.parameters.values():
+                    if (
+                        param.kind is inspect.Parameter.POSITIONAL_ONLY
+                        and param.default is inspect.Parameter.empty
+                        and param.name not in bound.arguments
+                    ):
+                        problems.append(
+                            f"missing required positional-only argument {param.name!r}"
+                        )
                 problems.extend(bound_value_problems(original, bound))
     return sorted(set(problems))

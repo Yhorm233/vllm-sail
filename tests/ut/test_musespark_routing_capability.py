@@ -105,9 +105,9 @@ def test_registered_router_preserves_fallback_and_preloaded_aliases(
     monkeypatch.setitem(sys.modules, name, provider)
     monkeypatch.setattr(sys.modules[name.rpartition(".")[0]], "fused_routing", provider)
     spec.loader.exec_module(provider)
-    original = provider.fused_musespark1x_routing
+    original = provider.fused_muse_spark_routing
     consumers = [
-        modules(n, fused_musespark1x_routing=original)
+        modules(n, fused_muse_spark_routing=original)
         for n in (
             "vllm.models.muse_spark.common.moe",
             "vllm.models.muse_spark.nvidia.model",
@@ -115,16 +115,16 @@ def test_registered_router_preserves_fallback_and_preloaded_aliases(
     ]
     load_patch("vllm_sail/patch/enhancement/attention/musespark_routing.py")
     assert all(
-        c.fused_musespark1x_routing is provider.fused_musespark1x_routing
+        c.fused_muse_spark_routing is provider.fused_muse_spark_routing
         for c in consumers
     )
-    assert inspect.signature(provider.fused_musespark1x_routing) == inspect.signature(
+    assert inspect.signature(provider.fused_muse_spark_routing) == inspect.signature(
         original
     )
     weights, ids = Tensor((2, 8)), Tensor((2, 8), "int32")
     mask = Tensor((2,), "bool") if padding else None
     bias = Tensor((experts,), bias_dtype)
-    outputs = consumers[0].fused_musespark1x_routing(
+    outputs = consumers[0].fused_muse_spark_routing(
         Tensor((2, experts)),
         bias,
         8,
@@ -202,5 +202,5 @@ def test_unimportable_provider_skips_with_a_warning(modules, monkeypatch):
     )
 
     assert patch_module._unavailable is True
-    assert not hasattr(patch_module, "fused_musespark1x_routing")
+    assert not hasattr(patch_module, "fused_muse_spark_routing")
     assert len(warnings) == 1 and "MuseSpark routing patch" in warnings[0]

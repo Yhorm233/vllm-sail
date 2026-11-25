@@ -70,6 +70,7 @@ JSON_FLAGS = frozenset(
         "--engram-config",
         "--hf-overrides",
         "--kv-transfer-config",
+        "--limit-mm-per-prompt",
         "--override-generation-config",
         "--reasoning-config",
         "--speculative-config",

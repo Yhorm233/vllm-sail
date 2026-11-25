@@ -185,6 +185,7 @@ def test_real_wna16_ppu_conversion_preserves_expert_weights_scales_and_padding(
     ):
         function(utils_path, name, namespace)
     for name in (
+        "WNA16WeightFormat",
         "WNA16MoEBackend",
         "_pad_w13_shard_cols",
         "_pad_rows",

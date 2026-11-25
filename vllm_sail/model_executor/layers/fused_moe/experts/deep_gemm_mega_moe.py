@@ -49,6 +49,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
         fast_math=True,
         max_num_tokens=None,
         prefix="",
+        l2_input_scale=None,
     ):
         if weight_format != MEGA_MOE_MXFP4:
             raise ValueError("SAIL MegaMoE requires MXFP4 weights.")
@@ -66,6 +67,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 f"SAIL MegaMoE {self.mma_type} supports at most "
                 f"{max_local_experts} local experts per EP rank."
             )
+        self.l2_input_scale = l2_input_scale
         self.weight_format = weight_format
         self.activation = activation
         self.fast_math = fast_math

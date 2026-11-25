@@ -87,6 +87,7 @@ class ReuseEntry(NamedTuple):
     skip_reason: str
     allowed_skips: tuple[dict[str, Any], ...] = ()
     hub_repos: tuple[str, ...] | None = None
+    config_fixtures: tuple[str, ...] = ()
 
     @property
     def cpu_runnable(self) -> bool:
@@ -224,6 +225,12 @@ def load_manifest(path: Path = MANIFEST_PATH) -> list[ReuseEntry]:
             )
         ):
             raise AssertionError(f"{entry_id}: hub_repos must be a list of repo IDs")
+        config_fixtures = raw.get("config_fixtures", [])
+        if not isinstance(config_fixtures, list) or any(
+            not isinstance(repo, str) or not re.fullmatch(_HUB_REPO_ID_PATTERN, repo)
+            for repo in config_fixtures
+        ):
+            raise AssertionError(f"{entry_id}: invalid config fixture repo ID")
         allowed_skips = raw.get("allowed_skips", [])
         for rule in allowed_skips:
             if set(rule) != {"nodeid", "reason", "max_count"}:
@@ -252,6 +259,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> list[ReuseEntry]:
                 skip_reason=raw.get("skip_reason", ""),
                 allowed_skips=tuple(allowed_skips),
                 hub_repos=tuple(hub_repos) if hub_repos is not None else None,
+                config_fixtures=tuple(config_fixtures),
             )
         )
     return entries
@@ -724,6 +732,18 @@ class UpstreamRunner:
             env.update(dict.fromkeys(HUB_OFFLINE_VARS, "1"))
         with tempfile.TemporaryDirectory(prefix="vllm_sail_reuse_") as workdir:
             junit_path = Path(workdir) / "report.xml"
+            if entry.config_fixtures:
+                # Redirect config-only model lookups in this subprocess, keeping
+                # both the upstream tests and the shared HF cache untouched.
+                mapping = {}
+                for repo in entry.config_fixtures:
+                    config_dir = HERE / "config_fixtures" / repo
+                    if not (config_dir / "config.json").is_file():
+                        raise FileNotFoundError(config_dir / "config.json")
+                    mapping[repo] = str(config_dir)
+                redirect = Path(workdir) / "model-redirect.json"
+                redirect.write_text(json.dumps(mapping), encoding="utf-8")
+                env["VLLM_MODEL_REDIRECT_PATH"] = str(redirect)
             command = self.build_command(entry, junit_path)
             try:
                 completed = subprocess.run(

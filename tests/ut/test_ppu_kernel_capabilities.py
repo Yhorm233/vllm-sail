@@ -220,7 +220,7 @@ def test_qwen35_real_budget_blocks_flashinfer_and_preserves_norm_fallback(
         def norm_quant(value, skip, gamma, eps, actual_scale, nvfp4, write_y):
             assert value is reduced and skip is residual and gamma is weight
             assert eps == 1e-6 and actual_scale is scale
-            assert not nvfp4 and write_y
+            assert nvfp4 == "fp8" and write_y
             calls.append("norm_quant")
             return codes, None, normed
 
@@ -230,6 +230,7 @@ def test_qwen35_real_budget_blocks_flashinfer_and_preserves_norm_fallback(
             dict(
                 _norm_quant_key=lambda _: "fp8",
                 kNvfp4Dynamic="nvfp4",
+                kFp8DynamicTokenSym="dynamic_fp8",
                 fused_allreduce_gemma_rms_norm_quant=compute,
                 tensor_model_parallel_all_reduce=allreduce,
                 gemma_add_rms_norm_quant=norm_quant,
@@ -247,12 +248,14 @@ def test_qwen35_real_budget_blocks_flashinfer_and_preserves_norm_fallback(
         path = source / "model_executor/layers/fused_allreduce_gemma_rms_norm.py"
         namespace = dict(
             torch=torch,
+            envs=ns(VLLM_BATCH_INVARIANT=False),
             _FI_SUPPORTED_DTYPES=("bf16", "fp16"),
             MiB=1024 * 1024,
             flashinfer_trtllm_fused_allreduce_norm=forbidden,
             get_fi_ar_workspace=forbidden,
             _AR_RESIDUAL_RMS_NORM=object(),
             get_tensor_model_parallel_world_size=lambda: 2,
+            dbo_enabled=lambda feature: False,
             _can_use_aiter_fused_ar_rms=lambda _: False,
             tensor_model_parallel_all_reduce=allreduce,
         )
@@ -408,6 +411,7 @@ def complete_warmup_contract(modules, provider, worker, platform, *, entered=Non
     platform.is_cuda = lambda: True
     platform.is_rocm = lambda: False
     platform.is_device_capability_family = lambda _: False
+    worker.vllm_config.cache_config = ns(enable_prefix_caching=False)
     worker.use_v2_model_runner = True
     modules("vllm.distributed.parallel_state", get_pp_group=lambda: ns(world_size=1))
     worker.model_runner.attn_groups = []
@@ -1098,13 +1102,6 @@ def test_indexer_fields_survive_runner_replace_and_merge(modules):
     class MLAAttentionSpec(AttentionSpec):
         alignment: int = 576
 
-        @classmethod
-        def merge(cls, specs):
-            first = specs[0]
-            return cls(
-                first.block_size, first.indexes_kv_by_block_stride, first.alignment
-            )
-
     @dataclass(frozen=True)
     class HiddenStateCacheSpec(MLAAttentionSpec):
         pass
@@ -1118,7 +1115,7 @@ def test_indexer_fields_survive_runner_replace_and_merge(modules):
     load_patch("vllm_sail/patch/enhancement/attention/kv_cache_interface.py")
     spec = MLAAttentionSpec(64, indexer_n_head=64, indexer_q_head_dim=128)
     rebuilt = replace(spec, indexes_kv_by_block_stride=True)
-    merged = MLAAttentionSpec.merge([rebuilt, rebuilt])
+    (merged,) = tuple(dict.fromkeys([rebuilt, rebuilt]))
     assert (merged.indexer_n_head, merged.indexer_q_head_dim) == (64, 128)
     assert merged.indexes_kv_by_block_stride
     assert len(fields(AttentionSpec)) == 2  # inherited metadata remains untouched
@@ -1127,7 +1124,7 @@ def test_indexer_fields_survive_runner_replace_and_merge(modules):
     assert spec == replace(spec) and hash(spec) == hash(replace(spec))
     assert len({spec, replace(spec, indexer_n_head=32)}) == 2
     hidden = HiddenStateCacheSpec(64, indexer_n_head=16, indexer_q_head_dim=128)
-    assert isinstance(hidden.merge([hidden]), HiddenStateCacheSpec)
+    assert isinstance(replace(hidden), HiddenStateCacheSpec)
     assert replace(hidden).indexer_n_head == 16
     assert hidden == replace(hidden) and hash(hidden) == hash(replace(hidden))
 
@@ -1147,54 +1144,6 @@ def test_body_binding_preserves_keyword_defaults_and_live_globals(modules):
     other.value = 20
     assert bound() == 22
     assert bound.__annotations__ == namespace.body.__annotations__
-
-
-def test_input_batch_reinitializes_when_only_context_length_changes(modules):
-    platform = types.SimpleNamespace(is_ppu=lambda: True)
-    modules("vllm.platforms", current_platform=platform)
-    cls = type("GPUModelRunner", (), {"may_reinitialize_input_batch": lambda *a: None})
-    modules(
-        "vllm.v1.worker.gpu_model_runner",
-        GPUModelRunner=cls,
-        InputBatch=lambda **kwargs: types.SimpleNamespace(**kwargs),
-    )
-    modules(
-        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
-        rejection_sample=lambda *a: None,
-    )
-    load_patch("vllm_sail/patch/enhancement/runtime.py")
-    runner = cls()
-    runner.__dict__.update(
-        max_model_len=8192,
-        cp_kv_cache_interleave_size=1,
-        jit_warmup_registry=types.SimpleNamespace(
-            activate=__import__("contextlib").nullcontext
-        ),
-        max_encoder_len=0,
-        _init_block_sizes=[],
-        _init_max_num_blocks=[],
-        _init_slot_mapping_modes=[],
-        input_batch=types.SimpleNamespace(
-            max_model_len=4096,
-            logitsprocs=object(),
-            logitsprocs_need_output_token_ids=False,
-        ),
-        max_num_reqs=16,
-        max_num_tokens=2048,
-        device="ppu",
-        model_config=types.SimpleNamespace(get_vocab_size=lambda: 1024),
-        num_spec_tokens=2,
-        is_pooling_model=False,
-        parallel_config=types.SimpleNamespace(cp_kv_cache_interleave_size=1),
-        vllm_config=types.SimpleNamespace(reasoning_config=None),
-        cache_config=types.SimpleNamespace(use_replayssm=False),
-    )
-    old = runner.input_batch
-    runner.may_reinitialize_input_batch(types.SimpleNamespace(kv_cache_groups=[]))
-    assert runner.input_batch is not old and runner.input_batch.max_model_len == 8192
-    new = runner.input_batch
-    runner.may_reinitialize_input_batch(types.SimpleNamespace(kv_cache_groups=[]))
-    assert runner.input_batch is new
 
 
 def test_deepseek_config_preserves_dense_channelwise_patterns_for_mtp(modules):
@@ -1452,7 +1401,7 @@ def test_fa_complete_copied_body_matches_upstream_outside_ppu_regions(
         # sinks 放宽和 PPU 错误说明之外，所有旧及新增准入条件都应一致。
         for test in (
             "has_sink and device_capability < DeviceCapability(9, 0)",
-            "kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype) and not flash_attn_supports_kv_cache_dtype(kv_cache_dtype, head_size=head_size, head_size_v=cls.head_size_v, has_sinks=has_sink, kv_cache_block_size=block_size, supports_fa4_hd256=True)",
+            "kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype) and not flash_attn_supports_kv_cache_dtype(kv_cache_dtype, head_size=head_size, head_size_v=getattr(cls, 'head_size_v', None), has_sinks=has_sink)",
         ):
             local = [
                 node
@@ -1653,6 +1602,7 @@ def lut_b_source_contract(modules, upstream_source_root):
         FusedMoEActivationFormat=fmt,
         envs=ns(VLLM_BATCH_INVARIANT=False),
         kLutBStatic="lut_b",
+        kInt8StaticTensorSym="int8",
         kMxfp8Dynamic="mxfp8",
         LUT_B_SM107_TILE_K=128,
         LUT_B_SM107_TILE_N=128,
@@ -1695,6 +1645,14 @@ def lut_b_source_contract(modules, upstream_source_root):
                 )
             ),
         )
+    TritonBoundary.executed_activation_key = staticmethod(
+        function(modular, "FusedMoEExperts.executed_activation_key", namespace)
+    )
+    namespace["check_activation_quant_fallback"] = function(
+        source / "model_executor/layers/quantization/utils/quant_utils.py",
+        "check_activation_quant_fallback",
+        {},
+    )
     TritonBoundary.is_monolithic = staticmethod(
         function(
             modular,
@@ -2144,7 +2102,7 @@ def test_lut_b_real_requantization_consumes_shared_staging_in_source_order(
     loader.staging_parameters = dict(parameters)
     layer.shared_expert_online_loader = loader
     assert loader.routed_requantized and loader.stages_shared_experts
-    assert loader.quantizer is None and method.uses_meta_device is False
+    assert loader.quantizer is None and method.uses_meta_device is True
     if fail_at == "shared_shape":
         shared[1].shape = (1, 128, 64)
 
@@ -2325,6 +2283,7 @@ def test_qwen_hc_real_admission_avoids_compute_stub_and_keeps_linear_fallback(
     )
     platform = ns(get_device_capability=lambda **kw: ns(to_int=lambda: capability))
     platform.is_device_capability_family = lambda value: family(platform, value)
+    platform.is_device_capability = lambda value: capability == value
 
     def forbidden(*args, **kwargs):
         pytest.fail("PPU 80/89 不得调用 SM100 compute stub")
@@ -2433,6 +2392,7 @@ def test_kimi_real_constructor_resolves_sleep_and_ppu_flags_before_tail_admissio
     )
     platform.get_device_capability = lambda **kw: ns(to_int=lambda: capability)
     platform.is_device_capability_family = lambda value: family(platform, value)
+    platform.is_device_capability = lambda value: capability == value
     cls = function(
         upstream_source_root / "vllm/models/kimi_k3/nvidia/latent_moe_runner.py",
         "LatentMoERunner",
@@ -2442,6 +2402,9 @@ def test_kimi_real_constructor_resolves_sleep_and_ppu_flags_before_tail_admissio
             "current_platform": platform,
             "UnquantizedLinearMethod": Unquantized,
             "get_current_vllm_config": lambda: config,
+            "get_symmetric_memory_topology": lambda group: "supported",
+            "get_tp_group": lambda: ns(cpu_group=object()),
+            "SymmetricMemoryTopology": ns(UNSUPPORTED="unsupported"),
             "logger": ns(warning_once=lambda *args: warnings.append(args)),
         },
     )
@@ -2455,7 +2418,7 @@ def test_kimi_real_constructor_resolves_sleep_and_ppu_flags_before_tail_admissio
         },
     )
     owner = object.__new__(cls)
-    if capability == 100 and not sleep:
+    if capability == 100 and ubatching:
         with pytest.raises(ValueError, match="DBO or ubatching"):
             initialize(owner, marker, routed_output_transform=transform)
     else:
@@ -2468,7 +2431,7 @@ def test_kimi_real_constructor_resolves_sleep_and_ppu_flags_before_tail_admissio
             assert not hasattr(owner, "_up_proj_is_quantized")
     assert calls == ["base"] and owner._shared_ar_events == tuple(events)
     assert len(events) == 2
-    assert bool(warnings) is (capability == 100 and sleep)
+    assert warnings == []
 
 
 @pytest.mark.upstream_source

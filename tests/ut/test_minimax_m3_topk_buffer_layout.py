@@ -49,6 +49,14 @@ def m3_model_cls(monkeypatch):
     monkeypatch.setattr(m3_model, "VocabParallelEmbedding", lambda *a, **k: None)
     monkeypatch.setattr(m3_model, "MiniMAXGemmaRMSNorm", lambda *a, **k: None)
     monkeypatch.setattr(m3_model, "make_layers", lambda n, fn, prefix="": (0, 0, []))
+    # The SM100-only fused MoE finalize init eagerly imports the CuteDSL ops
+    # package (quack), an optional dep absent here; it runs after the buffer
+    # allocation under test and is irrelevant to the layout contract.
+    monkeypatch.setattr(
+        m3_model.MiniMaxM3Model,
+        "_init_fused_moe_finalize",
+        lambda self, vllm_config: None,
+    )
     return m3_model.MiniMaxM3Model
 
 
@@ -59,10 +67,11 @@ def vllm_config():
         hidden_size=64,
         num_hidden_layers=2,
         rms_norm_eps=1e-6,
-        sparse_attention_config={
-            "sparse_num_index_heads": NUM_INDEX_HEADS,
-            "sparse_topk_blocks": TOPK_BLOCKS,
-        },
+        index_n_heads=NUM_INDEX_HEADS,
+        index_topk_blocks=TOPK_BLOCKS,
+        # Upstream gates the shared buffer on _sparse_attention_layer_ids(),
+        # which reads config.layer_types; both layers run the sparse branch.
+        layer_types=["minimax_m3_sparse", "minimax_m3_sparse"],
     )
     return types.SimpleNamespace(
         kernel_config=types.SimpleNamespace(moe_backend="auto"),

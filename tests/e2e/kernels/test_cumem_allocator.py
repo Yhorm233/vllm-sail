@@ -91,7 +91,7 @@ class TestHggcAllocator(unittest.TestCase):
         cache_ptr = cache.data_ptr()
         expected = weights.cpu()
         before = torch.cuda.mem_get_info()[0]
-        backend.suspend(level=1)
+        backend.suspend()
         asleep = torch.cuda.mem_get_info()[0]
         print(f"vLLM Level 1 recovered_bytes={asleep - before}")
         self.assertGreaterEqual(asleep - before, 2 * SEGMENT - 2 * MIB)
@@ -104,6 +104,64 @@ class TestHggcAllocator(unittest.TestCase):
         cache.fill_(1)
         self.assertEqual(int(cache[0]), 1)
         del weights, cache
+        allocator.release_pools()
+        self.assertEqual(allocator.get_current_usage(), 0)
+
+    @unittest.skipUnless(
+        any(dist.metadata["Name"] == "vllm" for dist in metadata.distributions()),
+        "requires the pinned vLLM wheel",
+    )
+    def test_plugin_backend_suspend_with_discardable_weights(self):
+        from vllm.plugins import load_general_plugins
+
+        load_general_plugins()
+
+        from vllm.device_allocator import get_mem_allocator_instance
+        from vllm.device_allocator.sleep_mode_backend import CuMemBackend
+
+        torch = self.torch
+        allocator = get_mem_allocator_instance()
+        backend = CuMemBackend()
+        with allocator.use_memory_pool("weights"):
+            rewrite = torch.full((SEGMENT,), 0x39, dtype=torch.uint8, device="cuda")
+        with allocator.use_memory_pool("weights"):
+            keep = torch.full((256 << 10,), 0xA7, dtype=torch.uint8, device="cuda")
+            rewrite_mixed = torch.empty_like(keep)
+        rewrite_ptr = rewrite.untyped_storage().data_ptr()
+        keep_ptr = keep.untyped_storage().data_ptr()
+        mixed_ptr = rewrite_mixed.untyped_storage().data_ptr()
+        (mixed_segment,) = allocator.allocator_and_pools["weights"][-1][0].snapshot()
+        self.assertIn(keep_ptr, {block["address"] for block in mixed_segment["blocks"]})
+        self.assertIn(
+            mixed_ptr, {block["address"] for block in mixed_segment["blocks"]}
+        )
+        self.assertNotEqual(rewrite_ptr, mixed_segment["address"])
+        rewrite_data = allocator.pointer_to_data[rewrite_ptr]
+        mixed_data = allocator.pointer_to_data[mixed_segment["address"]]
+        expected = keep.cpu()
+
+        before = torch.cuda.mem_get_info()[0]
+        backend.suspend(discardable={rewrite_ptr, mixed_ptr})
+        asleep = torch.cuda.mem_get_info()[0]
+        print(f"vLLM Level 2 recovered_bytes={asleep - before}")
+        self.assertGreaterEqual(
+            asleep - before, rewrite_data.handle[1] + mixed_data.handle[1] - 2 * MIB
+        )
+        self.assertTrue(rewrite_data.is_asleep)
+        self.assertIsNone(rewrite_data.cpu_backup_tensor)
+        self.assertTrue(mixed_data.is_asleep)
+        self.assertIsNotNone(mixed_data.cpu_backup_tensor)
+
+        backend.resume()
+        self.assertEqual(rewrite.data_ptr(), rewrite_ptr)
+        self.assertEqual(keep.data_ptr(), keep_ptr)
+        self.assertEqual(rewrite_mixed.data_ptr(), mixed_ptr)
+        self.assertTrue(torch.equal(keep.cpu(), expected))
+        rewrite.fill_(0x5B)
+        rewrite_mixed.fill_(0xC3)
+        self.assertTrue(bool(torch.all(rewrite == 0x5B)))
+        self.assertTrue(bool(torch.all(rewrite_mixed == 0xC3)))
+        del rewrite, keep, rewrite_mixed
         allocator.release_pools()
         self.assertEqual(allocator.get_current_usage(), 0)
 

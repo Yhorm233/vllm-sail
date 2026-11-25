@@ -11,6 +11,14 @@ from pathlib import Path
 
 import pytest
 
+
+@dataclass(frozen=True)
+class LayerConfig:
+    spec: object
+    manager_config: object = object()
+    is_draft: bool = True
+
+
 ROOT = Path(__file__).parents[2]
 BASE = "vllm.models.deepseek_v41"
 PLUGIN = "vllm_sail.models.deepseek_v41"
@@ -111,7 +119,7 @@ def installed(monkeypatch, patch_utils_module):
     )
     module(
         "vllm.triton_utils",
-        tl=types.SimpleNamespace(constexpr=object()),
+        tl=types.SimpleNamespace(constexpr=object(), uint8="uint8"),
         triton=types.SimpleNamespace(jit=lambda **kw: lambda fn: fn),
     )
 
@@ -131,8 +139,8 @@ def installed(monkeypatch, patch_utils_module):
         n_head = 64
         q_head_dim = 128
 
-        def get_kv_cache_spec(self, config):
-            return Spec()
+        def get_kv_cache_config(self, config):
+            return LayerConfig(Spec())
 
     class Indexer:
         def __init__(self, cache):
@@ -694,8 +702,8 @@ def test_indexer_spec_preserves_geometry_without_quantization_queries(installed,
     installed.platform.capability = cap
     config = UnavailableModelConfig()
     cache = installed.modules[BASE + ".attention"].DeepseekV4IndexerCache()
-    before = installed.indexer._cache_spec(cache, config)
-    spec = cache.get_kv_cache_spec(config)
+    before = installed.indexer._cache_spec(cache, config).spec
+    spec = cache.get_kv_cache_config(config).spec
     assert (
         (spec.indexer_n_head, spec.indexer_q_head_dim)
         == (before.indexer_n_head, before.indexer_q_head_dim)
@@ -705,7 +713,7 @@ def test_indexer_spec_preserves_geometry_without_quantization_queries(installed,
     assert spec.block_size == 128 and spec.page_size_padded is None
     assert not hasattr(installed.indexer, "uses_int8_w8a8")
     installed.platform.ppu = False
-    assert cache.get_kv_cache_spec(config) == before
+    assert cache.get_kv_cache_config(config).spec == before
 
 
 @pytest.mark.upstream_source
@@ -724,6 +732,7 @@ def test_real_indexer_spec_and_kernel_selection(
     class Spec:
         block_size: int
         num_kv_heads: int
+        max_tp_shards: int
         head_size: int
         dtype: object
         tokens_per_state: int
@@ -749,9 +758,10 @@ def test_real_indexer_spec_and_kernel_selection(
     )
     state.indexer._cache_spec = function(
         upstream_source_root / "vllm/models/deepseek_v41/attention.py",
-        "DeepseekV4IndexerCache.get_kv_cache_spec",
+        "DeepseekV4IndexerCache.get_kv_cache_config",
         {
             "MLAAttentionSpec": Spec,
+            "FullAttentionManager": types.SimpleNamespace(layer_config=LayerConfig),
             "_use_v41_mxfp8_kv_record": lambda: capability == (10, 0),
         },
     )
@@ -769,8 +779,8 @@ def test_real_indexer_spec_and_kernel_selection(
     )
     config = state.config
     config.cache_config = types.SimpleNamespace(cache_dtype="fp8_ds_mla")
-    before = state.indexer._cache_spec(cache, config)
-    spec = state.indexer.get_kv_cache_spec(cache, config)
+    before = state.indexer._cache_spec(cache, config).spec
+    spec = state.indexer.get_kv_cache_config(cache, config).spec
     backend = state.modules[
         "vllm.v1.attention.backends.mla.indexer"
     ].DeepseekV41IndexerBackend
@@ -928,6 +938,7 @@ def sparse_indexer(installed):
     path = "vllm_sail/patch/enhancement/attention/sparse_attn_indexer.py"
     namespace = dict(
         SparseAttnIndexer=Indexer,
+        get_indexer_topk=lambda backend: object(),
         STR_DTYPE_TO_TORCH_DTYPE={"float32": "fp32", "bfloat16": "bf16"},
         torch=state.modules["torch"],
         current_platform=state.platform,
@@ -1104,6 +1115,16 @@ def test_complete_dense_constructor_preserves_upstream_outside_ppu_regions(
                 == "self.dcp_world_size > 1 and (not current_platform.is_ppu()) and current_platform.is_cuda() and has_cutedsl()"
             )
             warmup.test = original.body[-1].body[-1].test
+        if isinstance(node, ast.If) and "_get_direct_dcp_topk_workspace" in ast.unparse(
+            node
+        ):
+            assert isinstance(node.test, ast.BoolOp)
+            guard = next(
+                v
+                for v in node.test.values
+                if ast.unparse(v) == "not current_platform.is_ppu()"
+            )
+            node.test.values.remove(guard)
         kept.append(node)
     assert len(ppu_conditions) == 2
     assert "self.weights_dtype" in ast.unparse(ppu_conditions[0])

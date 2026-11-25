@@ -276,6 +276,7 @@ def test_int8_initialization_uses_only_int8_registry(
             "current_platform": platform,
             "is_supported_and_can_implement_kernel": supported,
             "_resolve_backend_kernels": resolve,
+            "_check_activation_fallback": lambda cls, key: None,
         },
     )
     init = function(
@@ -283,10 +284,18 @@ def test_int8_initialization_uses_only_int8_registry(
         "init_int8_linear_kernel",
         {
             "Int8ScaledMMLinearLayerConfig": SimpleNamespace,
+            "LinearKernelOracle": SimpleNamespace(
+                maybe_skip_for_requantization_source=lambda: False
+            ),
+            "_int8_activation_quant_key": function(
+                upstream,
+                "_int8_activation_quant_key",
+                {"kInt8StaticTensorSym": "static", "kInt8DynamicTokenSym": "dynamic"},
+            ),
             "choose_scaled_mm_linear_kernel": choose,
             "_POSSIBLE_INT8_KERNELS": {"cuda": plan["int8"]},
             "_POSSIBLE_FP8_KERNELS": {"cuda": plan["fp8"]},
-            "logger": SimpleNamespace(info_once=lambda *args, **kwargs: None),
+            "logger": SimpleNamespace(debug_once=lambda *args, **kwargs: None),
         },
     )
     instance = init(channelwise, static_input, True, "CompressedTensorsW8A8Int8")

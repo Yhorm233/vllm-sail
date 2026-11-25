@@ -108,13 +108,14 @@ def selection(
         "kMxfp8Dynamic": "mxfp8",
         "kFp8StaticTensorSym": "fp8",
         "kMxfp4Dynamic": "mxfp4",
-        "envs": NS(VLLM_B12X_MOE_FP4_FORCE_A16=False),
+        "envs": NS(VLLM_B12X_MOE_FP4_FORCE_A16=False, VLLM_STRICT_QUANT_SCHEME=False),
         "oracle": NS(kMxfp4Dynamic="mxfp4"),
         "map_mxfp4_backend": map_backend,
         "backend_to_kernel_cls": lambda backend: [kernel(backend)],
         # The auto path reads the patched priority list; expanding the
         # requested candidates keeps one candidate source for both paths.
         "_get_priority_backends_for_gpt_oss": lambda: map_backend(None),
+        "_user_moe_activation_override": lambda: None,
         "_resolve_activation_key": lambda key: key,
         "_make_log_backend": lambda backend: f"Using '{backend.value}' Mxfp4 MoE.",
         "_make_log_unsupported": lambda backend, reason: reason or backend.value,
@@ -146,6 +147,7 @@ def selection(
         "_filter_by_activation",
         "_get_requested_backends",
         "_warn_on_bf16_fallback",
+        "_applies_requested_activation",
         "_requested_kernel_cls",
     ):
         if helper != "_requested_kernel_cls" or any(
@@ -398,7 +400,11 @@ def test_ppu_candidates_do_not_treat_padded_standard_as_standard(
 
 
 @pytest.fixture
-def real_oracle_source(monkeypatch, upstream_source_root):
+def real_oracle_source(monkeypatch, upstream_source_root, modules):
+    modules(
+        "vllm.model_executor.layers.quantization.online.requantization",
+        is_requantization_source=lambda: False,
+    )
     path = upstream_source_root / "vllm/model_executor/layers/fused_moe/oracle/mxfp4.py"
     node = definition(path, "Mxfp4MoeBackend")
     namespace = {"Enum": Enum}

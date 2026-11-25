@@ -378,7 +378,7 @@ def registry_alias_hooks(providers: list[Hook] | None = None) -> list[Hook]:
 
 
 def dispatcher_hooks(path: Path) -> list[Hook]:
-    """Read the two existing bind_body installers' actual invocation arguments.
+    """Read the bind_body installer's actual invocation arguments.
 
     This is a feature-specific source contract, not an interpreter for installer
     bodies. Their forwarding, platform choice and aliases have behavior tests.
@@ -402,41 +402,15 @@ def dispatcher_hooks(path: Path) -> list[Hook]:
         if not isinstance(call.func, ast.Name) or call.func.id != "_install":
             continue
         module = _value(call.args[0], env)
-        if path.name == "runtime.py":
-            owner, name, body = (_value(arg, env) for arg in call.args[1:])
-            attribute = (
-                name
-                if owner == module
-                else owner.removeprefix(module + ".") + "." + name
-            )
-        else:
-            name, body = (_value(arg, env) for arg in call.args[1:])
-            attribute = next(
-                (
-                    _value(kw.value, env)
-                    for kw in call.keywords
-                    if kw.arg == "target_name"
-                ),
-                name,
-            )
-        if not isinstance(body, ast.FunctionDef):
-            # Imported pilot bodies are resolved from their real definition.
-            if not isinstance(body, str) or not body.startswith(
-                "vllm_sail.patch._upstream.runtime."
-            ):
-                raise Unknown(f"unresolved dispatcher body at {path}:{call.lineno}")
-            from tests.support.source import definition
-
-            body = definition(
-                PATCH_ROOT / "_upstream/runtime.py", body.rsplit(".", 1)[-1]
-            )
-        found.append(Hook(f"{module}.{attribute}", False, body, path, call.lineno))
-        consumers = env["_CONSUMERS"]
-        consumers = (
-            consumers.get(name, ())
-            if isinstance(consumers, dict)
-            else (consumers if owner == module else ())
+        name, body = (_value(arg, env) for arg in call.args[1:])
+        attribute = next(
+            (_value(kw.value, env) for kw in call.keywords if kw.arg == "target_name"),
+            name,
         )
+        if not isinstance(body, ast.FunctionDef):
+            raise Unknown(f"unresolved dispatcher body at {path}:{call.lineno}")
+        found.append(Hook(f"{module}.{attribute}", False, body, path, call.lineno))
+        consumers = env["_CONSUMERS"].get(name, ())
         for consumer in consumers:
             found.append(Hook(f"{consumer}.{name}", False, body, path, call.lineno))
     if not found:

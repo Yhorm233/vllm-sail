@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 # These globals are supplied by bind_body; keep imports static-only.
 if TYPE_CHECKING:
     from vllm.model_executor.warmup.kernel_warmup import (
+        KVCacheBlockCopy,
+        _outside_kv_cache_transient_window,
         _rocm_aiter_gemm_warmup,
         _warmup_bf16x3_router_gemm,
         _warmup_flashinfer_attention,
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
         _warmup_ll_bf16_router_gemm,
         _warmup_skinny_gemm,
         b12x_warmup,
+        copy_kv_cache_blocks_inplace,
         current_platform,
         cutedsl_warmup,
         deep_gemm_warmup,
@@ -30,12 +33,12 @@ if TYPE_CHECKING:
         is_deep_gemm_supported,
         kimi_k3_triton_warmup,
         logger,
-        mamba_triton_warmup,
         qwen4_exp_qsa_triton_warmup,
         qwen_triton_warmup,
         qwen_vl_triton_warmup,
         replayssm_lifecycle_warmup,
         time,
+        torch,
         watermark_sample_warmup,
     )
     from vllm.v1.worker.gpu_worker import Worker
@@ -44,22 +47,12 @@ if TYPE_CHECKING:
 def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
     from vllm.model_executor.warmup.step5_dsa_warmup import step5_dsa_warmup
 
-    if not worker.use_v2_model_runner:
-        # The KV-block zeroing kernel is driven by the scheduler's
-        # `new_block_ids_to_zero`, so no dummy run ever reaches it.
-        zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
-        if zeroer is not None:
-            zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
-
     enable_jit_warmup = worker.vllm_config.kernel_config.enable_jit_warmup
     if enable_jit_warmup:
         logger.info("JIT kernel warmup starting.")
         jit_warmup_start = time.perf_counter()
         try:
-            registry = (
-                worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
-            )
-            registry.warmup()
+            worker.model_runner.jit_warmup_registry.warmup()
         except Exception:
             logger.exception(
                 "JIT kernel warmup failed after %.2fs.",
@@ -73,8 +66,11 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
     qwen_vl_triton_warmup(worker.model_runner)
-    mamba_triton_warmup(worker.model_runner)
     replayssm_lifecycle_warmup(worker.model_runner)
+    if enable_jit_warmup and worker.vllm_config.cache_config.enable_prefix_caching:
+        # Copy-on-write first copies blocks mid-serving.
+        blocks = torch.zeros(2, 1, dtype=torch.int64, device=worker.device)
+        copy_kv_cache_blocks_inplace([blocks], 2, [KVCacheBlockCopy(0, 1)])
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
@@ -127,9 +123,12 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
         is_deep_gemm_supported() and envs.VLLM_DEEP_GEMM_WARMUP != "skip"
     )
     if do_deep_gemm_warmup:
-        model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
-        deep_gemm_warmup(model, max_tokens)
+        # The drafter is outside the target's module tree and its o_proj can
+        # land on a different einsum kernel than the target's.
+        for model in (worker.get_model(), worker.get_draft_model()):
+            if model is not None:
+                deep_gemm_warmup(model, max_tokens)
 
     b12x_warmup(worker, cudagraph_capture_sizes)
 
@@ -161,6 +160,7 @@ def kernel_warmup(worker: Worker, *, process_local_only: bool = False):
     if enable_flashinfer_autotune is False:
         logger.info_once("Skipping FlashInfer autotune because it is disabled.")
     elif has_flashinfer() and current_platform.has_device_capability(90):
-        flashinfer_autotune(worker.model_runner)
+        with _outside_kv_cache_transient_window(worker):
+            flashinfer_autotune(worker.model_runner)
 
     _warmup_flashinfer_attention(worker)

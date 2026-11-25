@@ -151,6 +151,11 @@ def select_unquantized_moe_backend(
         moe_config.moe_backend == "ppu_deep_gemm"
         and moe_config.activation_format.is_batched
     ):
+        source = (
+            oracle.UnquantizedMoEKernelOracle.maybe_skip_for_requantization_source()
+        )
+        if source is not None:
+            return source
         backend = UnquantizedMoeBackend.BATCHED_PPU_DEEPGEMM
         for kernel_cls in backend_to_kernel_cls(backend):
             supported, reason = kernel_cls.is_supported_config(

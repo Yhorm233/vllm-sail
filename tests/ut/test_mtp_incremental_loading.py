@@ -1,59 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MTP keeps unfinished FP8 pairs across public load_weights calls."""
+"""Checkpoint ownership and reload for the DeepSeek indexer used by MTP."""
 
-from __future__ import annotations
-
-import importlib.util
-import sys
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from uuid import uuid4
+from types import SimpleNamespace
 
 import pytest
 
-from vllm_sail.patch.utils import PATCH_REGISTRY
+from tests.support.source import function
 
 
 @pytest.fixture
-def install_loader(monkeypatch):
-    before = len(PATCH_REGISTRY)
-
+def install_loader(upstream_source_root):
     def install(
-        helper,
         *,
-        torch=None,
-        completeness=lambda: False,
         spec_layer=lambda config, name: 0,
         resolved_shared=False,
         global_shared=False,
-        expert_mapping=lambda *a, **k: [],
+        expert_mapping=lambda *a, **kw: [],
         remap_scale=lambda name, parameters: name,
     ):
-        modules = {}
-
-        def register(name, **attributes):
-            parts = name.split(".")
-            for depth in range(1, len(parts) + 1):
-                full = ".".join(parts[:depth])
-                if full not in modules:
-                    module = ModuleType(full)
-                    module.__path__ = []
-                    modules[full] = module
-                    monkeypatch.setitem(sys.modules, full, module)
-                    if depth > 1:
-                        setattr(
-                            modules[".".join(parts[: depth - 1])],
-                            parts[depth - 1],
-                            module,
-                        )
-            for key, value in attributes.items():
-                setattr(modules[name], key, value)
-
         class Target:
-            def __init__(self, *, vllm_config, prefix=""):
-                self.quant_config = SimpleNamespace(
-                    get_name=lambda: "modelopt_fp4" if vllm_config.fp4 else "fp8"
-                )
+            def __init__(self, *, vllm_config):
                 self.config = SimpleNamespace(n_routed_experts=0, n_shared_experts=0)
                 self.model = SimpleNamespace(mtp_start_layer_idx=0, num_mtp_layers=1)
                 self.parameters = vllm_config.parameters
@@ -66,107 +32,97 @@ def install_loader(monkeypatch):
                 assert index == 0
                 return name
 
-            def load_weights(self, weights):
-                raise AssertionError("the real plugin loader must replace this target")
-
-        monkeypatch.setitem(sys.modules, "torch", torch or ModuleType("torch"))
-        register(
-            "vllm._aiter_ops",
-            rocm_aiter_ops=SimpleNamespace(
-                is_fusion_moe_shared_experts_enabled=lambda: global_shared
+        Target.load_weights = function(
+            upstream_source_root / "vllm/model_executor/models/deepseek_mtp.py",
+            "DeepSeekMTP.load_weights",
+            dict(
+                get_spec_layer_idx_from_weight_name=spec_layer,
+                extract_layer_index=lambda name: int(
+                    name.split(".layers.")[1].split(".")[0]
+                ),
+                rocm_aiter_ops=SimpleNamespace(
+                    is_fusion_moe_shared_experts_enabled=lambda: global_shared
+                ),
+                fused_moe_make_expert_params_mapping=expert_mapping,
+                maybe_remap_kv_scale_name=remap_scale,
+                default_weight_loader=lambda *a: pytest.fail(
+                    "use the checkpoint parameter's own loader"
+                ),
             ),
         )
-        register(
-            "vllm.model_executor.layers.fused_moe",
-            fused_moe_make_expert_params_mapping=expert_mapping,
-        )
-        register(
-            "vllm.model_executor.model_loader.mtp_validation",
-            is_mtp_completeness_check_enabled=completeness,
-        )
-        register(
-            "vllm.model_executor.model_loader.weight_utils",
-            default_weight_loader=lambda *a: pytest.fail(
-                "use the parameter's registered loader"
-            ),
-            maybe_remap_kv_scale_name=remap_scale,
-        )
-        register("vllm.model_executor.models.deepseek_mtp", DeepSeekMTP=Target)
-        register(
-            "vllm.model_executor.models.deepseek_v2", _try_load_fp8_indexer_wk=helper
-        )
-        register(
-            "vllm.model_executor.models.utils",
-            extract_layer_index=lambda name: int(
-                name.split(".layers.")[1].split(".")[0]
-            ),
-            get_pp_missing_layer_names=lambda model: [],
-            get_spec_layer_idx_from_weight_name=spec_layer,
-        )
-        name = "_sail_incremental_mtp_" + uuid4().hex
-        source = (
-            Path(__file__).parents[2]
-            / "vllm_sail/patch/enhancement/models/deepseek_mtp.py"
-        )
-        spec = importlib.util.spec_from_file_location(name, source)
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, module)
-        spec.loader.exec_module(module)
         return Target
 
-    yield install
-    del PATCH_REGISTRY[before:]
+    return install
 
 
-def test_loader_preserves_external_buffer_state_across_calls(install_loader):
-    buffers = []
-
-    def helper(name, tensor, pending, parameters, loaded, missing):
-        buffers.append(pending)
-        return True
-
-    target = install_loader(helper)
-    model = target(vllm_config=SimpleNamespace(fp4=True, parameters={}))
-    model.load_weights([("model.layers.0.indexer.wk.weight", object())])
-    marker = object()
-    buffers[0]["unfinished"] = marker
-    model.load_weights([("model.layers.0.indexer.wk.weight_scale_inv", object())])
-    assert buffers[0] is buffers[1]
-    assert buffers[1]["unfinished"] is marker
-
-
-def test_loader_buffers_belong_to_each_model(install_loader):
-    buffers = []
-
-    def helper(name, tensor, pending, parameters, loaded, missing):
-        buffers.append(pending)
-        return True
-
-    target = install_loader(helper)
-    for _ in range(2):
-        model = target(vllm_config=SimpleNamespace(fp4=True, parameters={}))
-        model.load_weights([("model.layers.0.indexer.wk.weight", object())])
-    assert buffers[0] is not buffers[1]
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("reverse", [False, True])
+def test_scale_and_weight_load_into_separate_parameters_across_calls(
+    install_loader, reverse
+):
+    prefix = "model.layers.0.indexer.wk."
+    records = []
+    weights = {
+        prefix + name: SimpleNamespace(
+            weight_loader=lambda param, value: records.append((param, value))
+        )
+        for name in ("weight", "weight_scale_inv")
+    }
+    model = install_loader()(vllm_config=SimpleNamespace(parameters=weights))
+    for name in sorted(weights, reverse=reverse):
+        value = object()
+        assert model.load_weights([(name, value)]) == {name}
+        assert records[-1] == (weights[name], value)
 
 
-def test_non_fp4_loader_preserves_separate_weight_ownership(install_loader):
-    calls = []
+@pytest.mark.parametrize(
+    "ppu, scheme, split",
+    [
+        (True, "channelwise", True),
+        (True, None, True),
+        (True, "modelopt_fp4", False),
+        (False, "channelwise", False),
+    ],
+)
+def test_ppu_projection_ownership_survives_reload(ppu, scheme, split):
+    path = "vllm_sail/patch/enhancement/models/deepseek_v2.py"
+    owner = SimpleNamespace(head_dim=128, n_head=32)
+    cfg = SimpleNamespace(get_name=lambda: scheme) if scheme else None
+    native = []
 
-    def forbidden(*args):
-        pytest.fail("non-FP4 weights must not enter the fused indexer helper")
+    def linear(hidden, width, **kwargs):
+        return SimpleNamespace(width=width, **kwargs)
 
-    weight = object()
-    parameter = SimpleNamespace(
-        weight_loader=lambda param, value: calls.append((param, value))
+    scope = dict(
+        current_platform=SimpleNamespace(is_ppu=lambda: ppu),
+        ReplicatedLinear=linear,
+        _upstream_init=lambda *args, **kw: native.append("build"),
+        _upstream_finish=lambda layer: native.append("refresh"),
     )
-    name = "model.layers.0.indexer.wk.weight"
-    target = install_loader(forbidden)
-    model = target(vllm_config=SimpleNamespace(fp4=False, parameters={name: parameter}))
-    assert model.load_weights([(name, weight)]) == {name}
-    assert calls == [(parameter, weight)]
+    function(path, "init_projections", scope)(owner, 256, cfg, "indexer")
+    finish = function(path, "process_weights_after_loading", scope)
+    finish(owner)
+    finish(owner)
+    assert owner.use_ppu_split_indexer is split
+    if split:
+        assert native == []
+        assert (owner.wk.width, owner.wk.quant_config, owner.wk.prefix) == (
+            128,
+            cfg,
+            "indexer.wk",
+        )
+        assert (
+            owner.weights_proj.width,
+            owner.weights_proj.quant_config,
+            owner.weights_proj.prefix,
+        ) == (32, None, "indexer.weights_proj")
+        assert not hasattr(owner, "wk_weights_proj")
+    else:
+        assert native == ["build", "refresh", "refresh"]
 
 
 @pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.upstream_source
 def test_tied_top_level_embedding_loads_without_rewriting(install_loader, fp4):
     writes = []
     embedding_name = "model.embed_tokens.weight"
@@ -177,7 +133,6 @@ def test_tied_top_level_embedding_loads_without_rewriting(install_loader, fp4):
     ordinary = SimpleNamespace(weight_loader=lambda param, value: None)
     value = object()
     target = install_loader(
-        lambda *a: False,
         spec_layer=lambda config, name: 0 if ".layers.0." in name else None,
     )
     model = target(
@@ -198,6 +153,7 @@ def test_tied_top_level_embedding_loads_without_rewriting(install_loader, fp4):
 
 @pytest.mark.parametrize("resolved_shared", [False, True])
 @pytest.mark.parametrize("global_shared", [False, True])
+@pytest.mark.upstream_source
 def test_expert_mapping_uses_the_models_resolved_shared_flag(
     install_loader, resolved_shared, global_shared
 ):
@@ -209,7 +165,6 @@ def test_expert_mapping_uses_the_models_resolved_shared_flag(
 
     name = "model.layers.0.norm.weight"
     target = install_loader(
-        lambda *a: False,
         resolved_shared=resolved_shared,
         global_shared=global_shared,
         expert_mapping=mapping,
@@ -226,13 +181,14 @@ def test_expert_mapping_uses_the_models_resolved_shared_flag(
     assert observed == [5 if resolved_shared else 3]
 
 
+@pytest.mark.upstream_source
 def test_disabled_model_fusion_keeps_shared_projection_whole(install_loader):
     writes = []
     name = "model.layers.0.mlp.shared_experts.gate_up_proj.weight"
     parameter = SimpleNamespace(
         weight_loader=lambda param, value, shard: writes.append((param, value, shard))
     )
-    target = install_loader(lambda *a: False, resolved_shared=False, global_shared=True)
+    target = install_loader(resolved_shared=False, global_shared=True)
     model = target(vllm_config=SimpleNamespace(fp4=False, parameters={name: parameter}))
     model.config.n_shared_experts = 2
     value = object()
@@ -242,13 +198,14 @@ def test_disabled_model_fusion_keeps_shared_projection_whole(install_loader):
     assert writes == [(parameter, value, 0)]
 
 
+@pytest.mark.upstream_source
 def test_another_layers_fusion_keeps_this_shared_projection_whole(install_loader):
     writes = []
     name = "model.layers.0.mlp.shared_experts.gate_up_proj.weight"
     parameter = SimpleNamespace(
         weight_loader=lambda param, value, shard: writes.append((param, value, shard))
     )
-    target = install_loader(lambda *a: False, resolved_shared=True, global_shared=True)
+    target = install_loader(resolved_shared=True, global_shared=True)
     model = target(vllm_config=SimpleNamespace(fp4=False, parameters={name: parameter}))
     model.fused_shared_expert_layers = {1}
     model.config.n_shared_experts = 2
@@ -259,7 +216,8 @@ def test_another_layers_fusion_keeps_this_shared_projection_whole(install_loader
     assert writes == [(parameter, value, 0)]
 
 
-def test_ignored_kv_scale_preserves_string_name_for_layer_validation(install_loader):
+@pytest.mark.upstream_source
+def test_ignored_kv_scale_preserves_string_name(install_loader):
     classified = []
     ordinary_name = "model.layers.0.norm.weight"
     ignored_name = "model.layers.0.self_attn.k_scale"
@@ -270,7 +228,6 @@ def test_ignored_kv_scale_preserves_string_name_for_layer_validation(install_loa
         return 0
 
     target = install_loader(
-        lambda *a: False,
         spec_layer=layer,
         remap_scale=lambda name, parameters: None if name == ignored_name else name,
     )
@@ -286,87 +243,4 @@ def test_ignored_kv_scale_preserves_string_name_for_layer_validation(install_loa
         ignored_name,
         ordinary_name,
     }
-    assert classified.count(ignored_name) == 2
-
-
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize(
-    "layout", ["tensor", "row-vector", "row-matrix", "block", "e8m0"]
-)
-@pytest.mark.requires_runtime
-def test_real_fp8_helper_pairs_split_calls_and_preserves_fused_padding(
-    install_loader, reverse, layout
-):
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("vllm")
-    from vllm.model_executor.model_loader.mtp_validation import (
-        disable_mtp_completeness_check,
-        is_mtp_completeness_check_enabled,
-    )
-    from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
-
-    target = install_loader(
-        _try_load_fp8_indexer_wk,
-        torch=torch,
-        completeness=is_mtp_completeness_check_enabled,
-    )
-    prefix = "model.layers.0.self_attn.indexer"
-    fused_name = prefix + ".wk_weights_proj.weight"
-    parameter = torch.nn.Parameter(
-        torch.full((5, 4), -777.0, dtype=torch.bfloat16), requires_grad=False
-    )
-    writes = []
-
-    def load_shard(param, value, shard):
-        assert param is parameter and shard == 0
-        writes.append(value.clone())
-        param[:4].copy_(value)
-
-    parameter.weight_loader = load_shard
-    interleaved = []
-    ordinary_name = "model.layers.0.norm.weight"
-    ordinary = SimpleNamespace(
-        weight_loader=lambda param, value: interleaved.append(value)
-    )
-    model = target(
-        vllm_config=SimpleNamespace(
-            fp4=True, parameters={fused_name: parameter, ordinary_name: ordinary}
-        )
-    )
-    weight = torch.arange(1, 17, dtype=torch.float32).view(4, 4).to(torch.float8_e4m3fn)
-    if layout == "tensor":
-        scale, expanded = torch.tensor([[2.0]]), torch.full((4, 4), 2.0)
-    elif layout in ("row-vector", "row-matrix", "e8m0"):
-        scale = torch.tensor([1.0, 2.0, 4.0, 8.0])
-        expanded = scale[:, None].expand(4, 4)
-        if layout == "row-matrix":
-            scale = scale[:, None]
-        elif layout == "e8m0":
-            scale = torch.tensor([[127], [128], [129], [130]], dtype=torch.uint8)
-    else:
-        scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
-        expanded = scale.repeat_interleave(2, 0).repeat_interleave(2, 1)
-    pair = [(prefix + ".wk.weight", weight), (prefix + ".wk.weight_scale_inv", scale)]
-    if reverse:
-        pair.reverse()
-    with torch.inference_mode(), disable_mtp_completeness_check():
-        assert model.load_weights(pair[:1]) == set()
-        assert not writes
-        token = object()
-        assert model.load_weights([(ordinary_name, token)]) == {ordinary_name}
-        assert interleaved == [token]
-    with torch.inference_mode():
-        assert model.load_weights(pair[1:]) == {fused_name}
-    expected = (weight.float() * expanded).to(torch.bfloat16)
-    assert len(writes) == 1
-    torch.testing.assert_close(parameter[:4], expected, rtol=0, atol=0)
-    torch.testing.assert_close(
-        parameter[4], torch.full((4,), -777.0, dtype=torch.bfloat16), rtol=0, atol=0
-    )
-    # A completed pair must not be reused by the next incremental load.
-    with torch.inference_mode(), disable_mtp_completeness_check():
-        assert model.load_weights(pair[:1]) == set()
-        assert len(writes) == 1
-    with torch.inference_mode():
-        assert model.load_weights(pair[1:]) == {fused_name}
-    assert len(writes) == 2
+    assert classified.count(ignored_name) == 1

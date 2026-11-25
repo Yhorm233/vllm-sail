@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Complete V1/V2 Layer NVTX and draft/MTP module traversal in the plugin.
+"""Complete V2 Layer NVTX and draft/MTP module traversal in the plugin.
 
-Reuses --enable-layerwise-nvtx-tracing and upstream's PytHooks labels and does
+Reuses --enable-layerwise-nvtx-tracing and upstream's tensor marker format and does
 not depend on VLLM_SAIL_NVTX_PROFILE or PyPI nvtx. Hooks register only after
 the first target/draft tracing finishes and change no model, sampling,
 compilation or CUDA Graph configuration.
@@ -19,16 +19,33 @@ from vllm_sail.patch.utils import patch
 logger = init_logger(__name__)
 
 _AFFECTED = ">=0.32.0,<0.33.0"
-_REMOVE_WHEN = "Upstream V1/V2 natively support draft/MTP Layer NVTX and deduplicate shared modules."
+_REMOVE_WHEN = (
+    "Upstream V2 natively supports draft/MTP Layer NVTX and deduplicate shared modules."
+)
 _INSTALLED: set[str] = set()
 
 
 def _make_hooks():
     """Reuse v1 input/output labels; only dedupe registration and close on errors."""
     import torch
-    from vllm.utils.nvtx_pytorch_hooks import PytHooks
+    from vllm.utils.nvtx_pytorch_hooks import construct_marker_dict_and_push
 
-    class SharedModuleHooks(PytHooks):
+    class SharedModuleHooks:
+        def __init__(self):
+            self.module_to_name_map = {}
+
+        def module_fwd_pre_hook(self, module, args, kwargs):
+            construct_marker_dict_and_push(
+                self.module_to_name_map[module], module, args, kwargs=kwargs
+            )
+
+        def module_fwd_hook(self, module, args, output):
+            torch.cuda.nvtx.range_pop()
+            construct_marker_dict_and_push(
+                self.module_to_name_map[module], module, None, out_tensor=output
+            )
+            torch.cuda.nvtx.range_pop()
+
         def register_hooks(self, network_model, module_prefix="top"):
             skip_types = (
                 torch.nn.Identity,
@@ -80,28 +97,10 @@ def register_layerwise_nvtx_hooks(self) -> None:
     # Resolve the draft type before registering so a failed optional import does
     # not leave half of the target hooks. Only the last PP rank holds the
     # drafter/speculator; other ranks register target only.
-    if hasattr(self, "speculator"):
-        from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
-        proposer = self.speculator
-        draft = proposer.model if isinstance(proposer, DraftModelSpeculator) else None
-    elif config.speculative_config:
-        from vllm.v1.spec_decode.dflash import DFlashProposer
-        from vllm.v1.spec_decode.draft_model import DraftModelProposer
-        from vllm.v1.spec_decode.eagle import EagleProposer
-        from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
-
-        proposer = getattr(self, "drafter", None)
-        draft = (
-            proposer.model
-            if isinstance(
-                proposer,
-                EagleProposer | DraftModelProposer | DFlashProposer | Gemma4Proposer,
-            )
-            else None
-        )
-    else:
-        draft = None
+    proposer = self.speculator
+    draft = proposer.model if isinstance(proposer, DraftModelSpeculator) else None
     hooks = _make_hooks()
     hooks.register_hooks(self.model, self.model.__class__.__name__)
     if draft is not None:
@@ -114,42 +113,31 @@ def install() -> None:
     """Install the config-gated compat entries; idempotent, independent of the
     outer profiling env var.
     """
-    for module_path, is_v2 in (
-        ("vllm.v1.worker.gpu_model_runner", False),
-        ("vllm.v1.worker.gpu.model_runner", True),
-    ):
-        if module_path in _INSTALLED:
-            continue
-        try:
-            module = importlib.import_module(module_path)
-            runner = module.GPUModelRunner
-            # Validate every entry before installing; the V1 call site already
-            # follows the draft dummy_run.
-            original_dummy_run = runner._dummy_run if is_v2 else None
-            if not is_v2:
-                runner._register_layerwise_nvtx_hooks  # noqa: B018
+    module_path = "vllm.v1.worker.gpu.model_runner"
+    if module_path in _INSTALLED:
+        return
+    try:
+        runner = importlib.import_module(module_path).GPUModelRunner
+        original_dummy_run = runner._dummy_run
 
-            @functools.wraps(register_layerwise_nvtx_hooks)
-            def register(self):
-                return register_layerwise_nvtx_hooks(self)
+        @functools.wraps(register_layerwise_nvtx_hooks)
+        def register(self):
+            return register_layerwise_nvtx_hooks(self)
 
-            patch(
-                module_path,
-                "GPUModelRunner._register_layerwise_nvtx_hooks",
-                reason="[profiling, config-gated] Per-layer markers for V1/V2 target and draft/MTP with shared-module dedup.",
-                affected_versions=_AFFECTED,
-                remove_when=_REMOVE_WHEN,
-                allow_missing=is_v2,
-            )(register)
-            if is_v2:
-                _install_v2_dummy_run(module_path, original_dummy_run)
-            _INSTALLED.add(module_path)
-        except Exception as exc:
-            # A missing optional dependency or upstream API drift must not block
-            # engine startup.
-            logger.warning(
-                "Layer NVTX compat entry not installed on %s: %s", module_path, exc
-            )
+        patch(
+            "vllm.v1.worker.gpu.model_runner",
+            "GPUModelRunner._register_layerwise_nvtx_hooks",
+            reason="[profiling, config-gated] Per-layer markers for target and draft with shared-module deduplication.",
+            affected_versions=_AFFECTED,
+            remove_when=_REMOVE_WHEN,
+            allow_missing=True,
+        )(register)
+        _install_v2_dummy_run(module_path, original_dummy_run)
+        _INSTALLED.add(module_path)
+    except Exception as exc:
+        logger.warning(
+            "Layer NVTX compat entry not installed on %s: %s", module_path, exc
+        )
 
 
 def _install_v2_dummy_run(module_path, original):

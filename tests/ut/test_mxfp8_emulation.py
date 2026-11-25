@@ -75,6 +75,11 @@ def test_upstream_selection_preserves_dense_bmm_and_cuda_paths(
         def __init__(self, config):
             self.config = config
 
+        _supports_quant_scheme = staticmethod(
+            lambda weight, activation: weight == "mxfp8w" and activation == "mxfp8a"
+        )
+        executed_activation_key = staticmethod(lambda key: key)
+
         @classmethod
         def is_supported(cls):
             return True, None
@@ -117,7 +122,9 @@ def test_upstream_selection_preserves_dense_bmm_and_cuda_paths(
         },
     )
     logger = SimpleNamespace(
-        info_once=lambda *a: None, warning_once=lambda *a, **k: None
+        info_once=lambda *a: None,
+        debug_once=lambda *a: None,
+        warning_once=lambda *a, **k: None,
     )
     namespace = {
         "current_platform": platform,
@@ -127,7 +134,19 @@ def test_upstream_selection_preserves_dense_bmm_and_cuda_paths(
         "_get_linear_backend": lambda **kw: backend,
         "DeepGemmMxfp8BmmLinearKernel": native_bmm,
         "EmulationMxfp8LinearKernel": Emulation,
-        "envs": SimpleNamespace(VLLM_DISABLED_KERNELS=[]),
+        "envs": SimpleNamespace(VLLM_DISABLED_KERNELS=[], VLLM_BATCH_INVARIANT=False),
+        "kMxfp8Dynamic": "mxfp8a",
+        "kMxfp8Static": "mxfp8w",
+        "LinearKernelOracle": SimpleNamespace(
+            maybe_skip_for_requantization_source=lambda: False
+        ),
+        "_resolve_linear_activation_key": lambda key: key,
+        "check_activation_quant_fallback": function(
+            upstream_source_root
+            / "vllm/model_executor/layers/quantization/utils/quant_utils.py",
+            "check_activation_quant_fallback",
+            {},
+        ),
         "logger": logger,
     }
     priority = runpy.run_path(
@@ -141,6 +160,9 @@ def test_upstream_selection_preserves_dense_bmm_and_cuda_paths(
     for name in (
         "_filter_kernels_by_backend",
         "_resolve_backend_kernels",
+        "_quant_scheme_check",
+        "_first_usable_kernel",
+        "_check_activation_fallback",
         "init_mxfp8_linear_kernel",
     ):
         function(path, name, namespace)

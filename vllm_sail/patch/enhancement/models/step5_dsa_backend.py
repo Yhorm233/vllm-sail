@@ -248,7 +248,7 @@ def _prefill_pair_inputs(self, indexer):
     ),
 )
 def _select_regions(
-    self, scores, current, topk, *, topk_lengths=None, paged_prefill=None, sort=True
+    self, scores, current, topk, *, topk_lengths=None, paged_prefill=None, sort=True, out=None, history_only=False
 ):
     if not current_platform.is_ppu():
         return _upstream_select_regions(
@@ -258,7 +258,7 @@ def _select_regions(
             topk,
             topk_lengths=topk_lengths,
             paged_prefill=paged_prefill,
-            sort=sort,
+            sort=sort, out=out, history_only=history_only,
         )
     backend = self._topk_backend
     if scores.shape[1] > topk and backend in ("auto", "deep_select"):
@@ -279,5 +279,5 @@ def _select_regions(
         backend,
         topk_lengths=topk_lengths,
         paged_prefill=paged_prefill,
-        sort=sort,
+        sort=sort, out=out, history_only=history_only,
     )

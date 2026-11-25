@@ -56,6 +56,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
+            num_redundant_experts=first_layer.ffn.n_redundant_experts,
         )
     # PPU MODIFICATION: begin
     # Expert scale suffix: FP4/INT8/INT4 experts use .weight_scale;
@@ -138,7 +139,6 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
                 self.quant_config, name, loaded_weight
             )
 
-        # PPU MODIFICATION: begin
         # ``context_wkv_proj`` is a MergedColumnParallelLinear whose shards are
         # produced by ``_duplicate_context_wkv_weights``; the destination shard
         # rides on the tensor as ``loaded_weight.shard_id``. Falling through to
@@ -148,7 +148,6 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             param.weight_loader(param, loaded_weight, loaded_weight.shard_id)
             loaded_params.add(name)
             continue
-        # PPU MODIFICATION: end
 
         # E8M0 expert scales: keep raw exponent bytes.
         if ".experts." in name:
@@ -197,6 +196,10 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     # PPU MODIFICATION: begin
     # The checkpoint may not ship confidence-head weights; drop the randomly
     # initialised module so acceptance estimation never consumes garbage.
+    # Upstream removed this fallback in #49459 (config-driven
+    # enable_confidence_head instead); PPU keeps it because the speculator
+    # still gates on ``confidence_head is not None`` and PPU checkpoints may
+    # lack the weights.
     if self.model.confidence_head is not None and not loaded_confidence_head:
         self.model.confidence_head = None
     # PPU MODIFICATION: end

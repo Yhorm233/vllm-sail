@@ -208,6 +208,7 @@ def test_real_output_loop_distinguishes_shutdown_from_engine_failure(
 
         class Core:
             def __init__(self):
+                self.resources = NS(engine_dead=unexpected_death, stop_requested=False)
                 self.future = loop.create_future()
 
             async def get_output_async(self):
@@ -215,6 +216,7 @@ def test_real_output_loop_distinguishes_shutdown_from_engine_failure(
 
             def shutdown(self, timeout=None):
                 assert timeout == 0
+                self.resources.stop_requested = not self.resources.engine_dead
                 settled = threading.Event()
 
                 def close():

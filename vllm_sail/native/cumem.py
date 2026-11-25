@@ -7,6 +7,7 @@ import atexit
 import gc
 import importlib
 import logging
+from collections.abc import Collection
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,15 @@ def get_instance():
 
 def _create_allocator(base, native):
     import torch
-    from vllm.device_allocator import DEFERRABLE_TAGS
+    from vllm.device_allocator import DEFERRABLE_TAGS, discardable_allocations
     from vllm.device_allocator.cumem import PIN_MEMORY
 
     class HggcAllocator(base):
+        def _get_pluggable_allocator(self):
+            return get_pluggable_allocator(
+                self.python_malloc_callback, self.python_free_callback
+            )
+
         def _python_free_callback(self, ptr):
             # PyTorch also frees segments whose Python records were trimmed.
             self.pointer_to_data.pop(ptr, None)
@@ -77,14 +83,21 @@ def _create_allocator(base, native):
                     data.cpu_backup_tensor = backup
                     data.is_asleep = True
 
-        def sleep(self, offload_tags=None):
+        def sleep(
+            self,
+            offload_tags: tuple[str, ...] | str | None = None,
+            discardable: Collection[int] = (),
+        ) -> None:
             if offload_tags is None:
                 offload_tags = (self.default_tag,)
             elif isinstance(offload_tags, str):
                 offload_tags = (offload_tags,)
+            discarded = discardable_allocations(self.allocator_and_pools, discardable)
             for ptr in tuple(self.pointer_to_data):
                 if (data := self.pointer_to_data.get(ptr)) is not None:
-                    self._suspend(ptr, data, data.tag in offload_tags)
+                    self._suspend(
+                        ptr, data, data.tag in offload_tags and ptr not in discarded
+                    )
             gc.collect()
             torch.accelerator.empty_cache()
 

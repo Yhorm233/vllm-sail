@@ -17,7 +17,7 @@ Registered architectures (cross-checked against the PPU fork):
 * ``DSparkDraftModel`` -> ``vllm_sail.models.deepseek_v4.dspark`` — injects
   the target model's quantization mappings into DSpark's fresh quant config.
 * ``GlmMoeDsaForCausalLM`` / ``DeepseekV32MTPModel`` -> legacy upstream models
-  retaining PPU INT8 indexer and checkpoint-loader patches.
+  retaining the PPU INT8 indexer with upstream checkpoint loading.
 * ``MiniMaxM3SparseForCausalLM`` / ``MiniMaxM3SparseForConditionalGeneration``
   -> ``vllm_sail.models.minimax_m3`` — upstream classes plus the
   ``SupportsQuant`` interface the fork adds (its only minimax_m3 change).

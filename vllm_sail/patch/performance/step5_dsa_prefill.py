@@ -165,10 +165,10 @@ def install():
 
     @functools.wraps(original_prepare)
     def prepare(self, query_shape, dtype, device, block_size, positions,
-                region_count, scale, *, contiguous_query=True):
+                region_count, scale, *, contiguous_query=True, request_offsets=None, num_kv_groups=1):
         # Accept only the planner's one-shot decision; a fallback replan must not pick
         # native again.
-        if _NATIVE_PLAN.get() and not _REFERENCE.get():
+        if _NATIVE_PLAN.get() and not _REFERENCE.get() and request_offsets is None and num_kv_groups == 1:
             reason = modern.candidate_reason(query_shape, dtype, device, block_size,
                                              region_count, scale)
             if reason is None:
@@ -178,7 +178,8 @@ def install():
             modern.reject(reason)
         return original_prepare(self, query_shape, dtype, device, block_size,
                                 positions, region_count, scale,
-                                contiguous_query=contiguous_query)
+                                contiguous_query=contiguous_query, request_offsets=request_offsets,
+                                num_kv_groups=num_kv_groups)
 
     @functools.wraps(original_plan)
     def plan(self, attn_metadata, n, lengths, layout, positions=None):

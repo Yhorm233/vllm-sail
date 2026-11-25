@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVTX profiling instrumentation for PPU — strictly opt-in.
 
-The in-tree PPU fork threads NVTX ranges through
-``v1/worker/gpu_model_runner.py`` (+86 lines / 14 hunks),
+The in-tree PPU fork threads NVTX ranges through the model runner,
 ``v1/engine/core.py`` (+59), ``v1/core/sched/scheduler.py`` (+34) and
 ``vllm/benchmarks/serve.py`` (+28). Phase-0 triage established that **all** of
 those changes are instrumentation: not one line is needed for PPU to compute
@@ -77,15 +76,10 @@ def install() -> None:
     # decorations on import, so a failure here means the instrumentation drifted
     # from upstream; observability must never block engine startup, so degrade
     # to a warning instead of propagating.
-    #
-    # Both model runners are patched: vLLM 0.31 defaults to V2 while some
-    # configs fall back to V1, and which class runs is only known once the
-    # engine config exists. The unused one costs nothing.
     try:
         from vllm_sail.profiling import (  # noqa: F401
             engine_core,
             linear,
-            model_runner,
             model_runner_v2,
             modular_moe,
             scheduler,

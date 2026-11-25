@@ -253,6 +253,7 @@ def test_real_specialized_decode_config_rejects_ppu_capability(
         upstream_source_root
         / "vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py"
     )
+    namespace["decode_backend"] = function(path, "decode_backend", namespace)
     namespace["unsupported"] = function(path, "unsupported", namespace)
     resolve = function(path, "specialized_decode_config", namespace)
     if backend == "auto":
@@ -894,6 +895,7 @@ def test_v41_draft_loads_scales_from_actual_destinations(
             SimpleNamespace(
                 ffn=SimpleNamespace(
                     use_native_mega_moe=mega,
+                    n_redundant_experts=0,
                     experts=SimpleNamespace(has_fused_shared_experts=False),
                 )
             )
@@ -928,9 +930,8 @@ def test_v41_draft_loads_scales_from_actual_destinations(
     assert model.load_weights(iter(stream)) == set(params)
     assert counts == [draft_experts or 384]
     assert processed == []  # The main loader defers processing to the model runner.
-    assert model.model.confidence_head is (
-        None if completeness_check else confidence_head
-    )
+    # The target constructs optional confidence heads from config; loading must not remove one.
+    assert model.model.confidence_head is confidence_head
     assert len(calls) == len(pairs)
     for call, (_, target, shard), weight in zip(calls, pairs, weights, strict=False):
         assert call[:2] == (target, weight)

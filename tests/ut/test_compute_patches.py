@@ -220,7 +220,6 @@ def test_kernel_warmup_delegates_off_ppu_and_runs_ppu_warmup_on_ppu(
     )
     for name in (
         "qwen_vl_triton_warmup",
-        "mamba_triton_warmup",
         "replayssm_lifecycle_warmup",
         "_warmup_gemm_rs_ar",
         "_warmup_flashinfer_attention",
