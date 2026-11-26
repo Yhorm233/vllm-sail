@@ -152,6 +152,12 @@ class PPUPlatform(NvmlCudaPlatform):
         return True
 
     @classmethod
+    def is_cumem_allocator_available(cls) -> bool:
+        from vllm_sail.native.cumem import is_available
+
+        return is_available()
+
+    @classmethod
     def get_hisparse_backend_cls(cls) -> str | None:
         """HiSparse compute kernels are excluded from the PPU native corpus."""
         return None

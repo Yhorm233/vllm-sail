@@ -13,6 +13,7 @@ reroute that the attention `forward_ppu` additions rely on).
 """
 
 from vllm_sail.patch.enhancement import platform_predicates  # noqa: F401  (must be first)
+from vllm_sail.patch.enhancement import cumem
 from vllm_sail.patch.enhancement import pynccl  # noqa: F401  (before communicators)
 from vllm_sail.patch.enhancement import import_gates  # noqa: F401  (before kernel consumers)
 from vllm_sail.patch.enhancement import custom_op_dispatch  # noqa: F401
@@ -42,6 +43,7 @@ from vllm_sail.patch.enhancement import residual  # noqa: F401
 # Leaf-style modules (like residual/): define their replacements without vLLM
 # imports at module scope, so installation is explicit.
 compressed_tensors_ppu.install()
+cumem.install()
 triton_warmup.install()
 fused_moe_ppu.install()
 mega_moe.install()

@@ -158,3 +158,8 @@ ppu_add_extension(_C
 ppu_add_extension(_moe_C
   INCLUDE_ROOT csrc/plugin
   SOURCES ${PPU_PLUGIN_MOE_EXT_SRC})
+
+Python_add_library(_cumem_allocator MODULE WITH_SOABI ${PPU_PLUGIN_CUMEM_EXT_SRC})
+target_link_libraries(_cumem_allocator PRIVATE HGGC::hggc HGGC::hggcrt)
+set_target_properties(_cumem_allocator PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${PPU_EXT_OUTPUT_DIR}")

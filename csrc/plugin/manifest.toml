@@ -11,3 +11,7 @@ bindings = ["csrc/plugin/ppu_bindings.cpp", "csrc/plugin/step5/step5_dsa_selecto
 name = "_moe_C"
 device_sources = ["csrc/plugin/libtorch_stable/moe/ep_scatter_kernels.hg"]
 bindings = ["csrc/plugin/libtorch_stable/moe/ppu_moe_bindings.cpp"]
+
+[[extension]]
+name = "_cumem_allocator"
+bindings = ["csrc/plugin/cumem_allocator.cpp"]

@@ -140,14 +140,14 @@ import vllm_sail
 from vllm_sail.native.extensions import import_kernels
 
 print('Plugin:', vllm_sail.__file__)
-for name in ('_upstream_C', '_upstream_moe_C', '_C', '_moe_C'):
+for name in ('_upstream_C', '_upstream_moe_C', '_C', '_moe_C', '_cumem_allocator'):
     extension = importlib.import_module(f'vllm_sail.{name}')
     print(name, extension.__file__)
 print('Native preflight:', import_kernels(strict=True))
 PY
 ```
 
-The four libraries must load from the intended installation. Strict preflight
+The five libraries must load from the intended installation. Strict preflight
 also checks representative operation registrations. These checks do not execute
 a model; continue with the [quickstart](quickstart.md) and
 [device verification](../user_guide/verification_guide.md).

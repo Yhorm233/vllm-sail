@@ -689,7 +689,7 @@ def fake_install(site):
         "triton/__init__.py": "__version__='1'\n",
         "pla/__init__.py": "__version__='1'\n",
     }
-    for name in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C"):
+    for name in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C", "_cumem_allocator"):
         contents[f"vllm_sail/{name}.py"] = ""
     for name, text in contents.items():
         path = site / name

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-EXTENSIONS = ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C")
+EXTENSIONS = ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C", "_cumem_allocator")
 BENCHMARKS = {"test_packed_decode_perf", "test_update_perf", "test_prefill_perf"}
 RUNTIME_MODULES = {
     "torch",

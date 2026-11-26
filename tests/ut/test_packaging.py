@@ -354,7 +354,13 @@ def test_prebuilt_extension_mode_repackages_current_python_without_cmake(
     prebuilt.mkdir()
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     expected = {}
-    for module in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C"):
+    for module in (
+        "_C",
+        "_moe_C",
+        "_upstream_C",
+        "_upstream_moe_C",
+        "_cumem_allocator",
+    ):
         payload = f"donor:{module}".encode()
         expected[f"vllm_sail/{module}{suffix}"] = payload
         (prebuilt / f"{module}{suffix}").write_bytes(payload)
@@ -401,7 +407,7 @@ def test_prebuilt_extension_mode_requires_every_exact_extension(tmp_path: Path) 
     prebuilt = tmp_path / "prebuilt"
     prebuilt.mkdir()
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    for module in ("_C", "_moe_C", "_upstream_C"):
+    for module in ("_C", "_moe_C", "_upstream_C", "_upstream_moe_C"):
         (prebuilt / f"{module}{suffix}").write_bytes(b"native")
     result = subprocess.run(
         [sys.executable, "setup.py", "build_ext"],
@@ -415,4 +421,4 @@ def test_prebuilt_extension_mode_requires_every_exact_extension(tmp_path: Path) 
         text=True,
     )
     assert result.returncode != 0
-    assert "expected exactly one non-empty prebuilt" in result.stderr
+    assert "expected exactly one non-empty prebuilt _cumem_allocator" in result.stderr
