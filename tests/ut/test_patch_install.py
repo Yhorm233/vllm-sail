@@ -135,6 +135,13 @@ def test_patches_actually_land(installed_patches) -> None:
 
 
 @pytest.mark.requires_runtime
+def test_auto_numa_binding_is_disabled(installed_patches) -> None:
+    from vllm.utils import numa_utils
+
+    assert numa_utils._can_auto_bind(None, 0) is False
+
+
+@pytest.mark.requires_runtime
 def test_every_patch_has_metadata(installed_patches) -> None:
     for record in installed_patches:
         assert record.reason.strip(), record.target

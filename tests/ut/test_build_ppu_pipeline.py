@@ -1034,7 +1034,8 @@ def test_runtime_lanes_upgrade_transformers_before_verifying_image_stack(
                 installed.extend(requirements(Path(args[index + 1])))
     transformers = [req for req in installed if req.name == "transformers"]
     assert len(transformers) == 1, "runtime must upgrade the image's transformers"
-    assert "5.16.1" in transformers[0].specifier
+    assert "5.18.0" in transformers[0].specifier
+    assert "5.17.0" not in transformers[0].specifier
     assert "5.15.0" not in transformers[0].specifier
     assert "5.20.0" not in transformers[0].specifier
     for filename in ("dev.txt", "ppu.txt"):

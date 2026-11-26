@@ -11,4 +11,4 @@ wheel
 pydantic>=2
 tomli; python_version < "3.11"
 # Match the runtime's Glm5NextTextConfig requirement.
-transformers>=5.16.1,<5.20.0
+transformers>=5.18.0,<5.20.0

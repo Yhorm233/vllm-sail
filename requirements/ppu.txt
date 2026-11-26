@@ -4,16 +4,18 @@
 # but not binary-compatible: a PyPI vllm wheel ships compiled CUDA binaries
 # (_C, _moe_C, vllm_flash_attn, ...) that cannot run on PPU. vLLM must be
 # PPU-built from source (or a PPU wheel); vllm_sail/compat.py validates the
-# exact source pin or release version (>=0.32.0,<0.33.0) at runtime instead.
-apache-tvm-ffi==0.1.9
+# exact source pin or release version (>=0.34.0,<0.35.0) at runtime instead.
+# Match the TileLang FFI version shipped in the SDK 2.2.1 runtime image.
+apache-tvm-ffi==0.1.11
 fastsafetensors>=0.3.2
 tokenspeed-mla==0.1.2
 # The upstream glm5next model imports Glm5NextTextConfig, which older
 # transformers releases do not ship; the plugin loads that model at install().
-# Range matches the vLLM 0.32 pin and the validated PPU runtime (5.16.1).
-transformers>=5.16.1,<5.20.0
-# SAIL DeepGEMM wheel from the PPU package index.
-deep_gemm==1.1.0+v1.1.0.ppu2.2.0
+# vLLM 0.34 requires huggingface-hub>=2.0, which transformers<5.18 caps at <2.0.
+# Validated PPU runtime: 5.19.0.
+transformers>=5.18.0,<5.20.0
+# SAIL DeepGEMM wheel from the PPU package index (SDK 2.2.1 flavor).
+deep_gemm==1.1.0+v1.1.0.ppu2.2.1
 # SAIL DeepSelect wheel from the PPU package index.
 deep_select==1.0.0
 
